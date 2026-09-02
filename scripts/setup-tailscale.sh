@@ -8,10 +8,19 @@
 
 set -euo pipefail
 
-AUTHKEY="${1:?usage: sudo bash setup-tailscale.sh <authkey>}"
+AUTHKEY="${1:-}"
 
-curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up --authkey="$AUTHKEY" --ssh --hostname="$(hostname)"
+if ! command -v tailscale >/dev/null; then
+    curl -fsSL https://tailscale.com/install.sh | sh
+fi
+
+if tailscale status >/dev/null 2>&1; then
+    echo "already connected, skipping tailscale up"
+else
+    : "${AUTHKEY:?usage: sudo bash setup-tailscale.sh <authkey>}"
+    tailscale up --authkey="$AUTHKEY" --ssh --hostname="$(hostname)"
+fi
+
 systemctl enable --now ssh
 
 echo "done. tailnet IP:"

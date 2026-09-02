@@ -5,11 +5,13 @@
 #   sudo bash scripts/install.sh [tailscale-authkey]
 #
 # Then, after the reboot it asks for:
-#   sudo systemctl start thermal-matrix     # run it
-#   sudo systemctl enable thermal-matrix    # run it on every boot
+#   sudo systemctl enable --now thermal-matrix thermal-status
 #   sudo systemctl status thermal-matrix    # is it running
 #   journalctl -u thermal-matrix -f         # live logs / --stats output
 #   sudo systemctl stop thermal-matrix      # stop it
+#
+# thermal-status runs a status page on :8787 (Tailscale IP only) --
+# see scripts/dashboard.html for a one-page links list across all Pis.
 #
 # Flags (--colorwise, --rotate, calibration, ...) live in
 # /etc/default/thermal-matrix -- edit that file, then
@@ -57,6 +59,21 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/thermal-status.service <<EOF
+[Unit]
+Description=Thermal matrix status page
+After=network.target tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 $REPO_DIR/scripts/status_server.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 
 echo "== tailscale (remote access) =="
@@ -68,4 +85,5 @@ fi
 
 echo
 echo "done. i2c0 needs a reboot to take effect: sudo reboot"
-echo "then: sudo systemctl enable --now thermal-matrix"
+echo "then: sudo systemctl enable --now thermal-matrix thermal-status"
+echo "status page: http://\$(tailscale ip -4):8787/  (add it to scripts/dashboard.html)"

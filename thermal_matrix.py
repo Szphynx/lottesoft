@@ -301,11 +301,12 @@ class Capture(threading.Thread):
 
 class Pipeline:
     def __init__(self, lut, fit, blend, period, mode="agc",
-                 fixed_lo=BODYHEAT_LUT_MIN_C, fixed_hi=BODYHEAT_LUT_MAX_C):
+                 fixed_lo=BODYHEAT_LUT_MIN_C, fixed_hi=BODYHEAT_LUT_MAX_C, rotate=0):
         self.lut = lut
         self.fit = fit
         self.blend = blend
         self.period = period
+        self.rotate_k = (rotate // 90) % 4
         self.mode = mode              # "agc" (relative, default) or "fixed"
         self.fixed_lo = fixed_lo
         self.fixed_hi = fixed_hi
@@ -344,6 +345,10 @@ class Pipeline:
         out[8:56, :] = scaled
         return out
 
+    def rotate(self, square):
+        """Rotate the (already square) 64x64 frame; k=1 is 90 deg CCW."""
+        return np.rot90(square, self.rotate_k) if self.rotate_k else square
+
     def render(self, prev, curr, t_curr, now):
         if self.blend:
             # Interpolate between the last two frames. Costs one frame period
@@ -369,6 +374,7 @@ class Pipeline:
             norm = np.clip((frame - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
 
         up = self.resize(norm)
+        up = self.rotate(up)
 
         if SHARPEN_AMOUNT > 0:
             blur = cv2.GaussianBlur(up, (0, 0), SHARPEN_RADIUS)
@@ -414,6 +420,8 @@ def main():
                    help="sensor subpage rate; complete images arrive at half this")
     p.add_argument("--i2c-freq", type=int, default=I2C_FREQ)
     p.add_argument("--fit", default="letterbox", choices=["letterbox", "fill"])
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                   help="rotate the panel image, e.g. 180 if it's upside down")
     p.add_argument("--gamma", type=float, default=GAMMA)
     p.add_argument("--brightness", type=int, default=50)
     p.add_argument("--pwm-bits", type=int, default=8)
@@ -477,7 +485,8 @@ def main():
     canvas = matrix.CreateFrameCanvas()
     pipeline = Pipeline(lut, args.fit, not args.no_blend, 1.0 / args.subpage_hz,
                          mode="fixed" if fixed_thresholds else "agc",
-                         fixed_lo=args.lut_min, fixed_hi=args.lut_max)
+                         fixed_lo=args.lut_min, fixed_hi=args.lut_max,
+                         rotate=args.rotate)
 
     frame_budget = 1.0 / RENDER_FPS_CAP if RENDER_FPS_CAP else 0.0
     rendered = 0

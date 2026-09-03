@@ -794,9 +794,29 @@ def _queue_item_row(item):
 </div>"""
 
 
+class Preview:
+    """The exact frame just sent to the strip, for the control page's live
+    pixel-grid emulator. A plain copy-under-lock -- this is a debug/preview
+    aid, not the render loop's hot path, so simplicity wins over avoiding
+    the small per-frame copy."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame = None
+
+    def update(self, frame):
+        with self.lock:
+            self.frame = frame
+
+    def snapshot(self):
+        with self.lock:
+            return self.frame
+
+
 class ControlHandler(http.server.BaseHTTPRequestHandler):
     state = None  # bound per-instance by make_control_server
     panel_w = panel_h = upload_dir = None
+    preview = None
 
     def _send(self, body, content_type, code=200, extra_headers=None):
         body = body if isinstance(body, bytes) else body.encode()
@@ -839,6 +859,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 "Content-Disposition": 'attachment; filename="led-config.json"'})
         elif path == "/autoupdate":
             self._send(json.dumps({"enabled": autoupdate_status()}), "application/json")
+        elif path == "/frame.json":
+            frame = self.preview.snapshot() if self.preview else None
+            if frame is None:
+                body = json.dumps({"w": 0, "h": 0, "pixels": []})
+            else:
+                h, w = frame.shape[:2]
+                body = json.dumps({"w": w, "h": h, "pixels": frame.reshape(-1, 3).tolist()})
+            self._send(body, "application/json")
         else:
             self.send_response(404)
             self.end_headers()
@@ -913,6 +941,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <body style="font:16px monospace;background:#111;color:#eee;
              max-width:32rem;margin:2rem auto;padding:0 1rem">
 <h1 style="font-size:1.1rem">LED matrix control</h1>
+
+<p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
+  Live preview -- the actual pixels being sent to the strip right now:
+</p>
+<div id="preview" style="background:#000;border:1px solid #444;display:inline-block"></div>
 
 <div id="diagram">{self._diagram_html()}</div>
 <p style="color:#888;font-size:.85rem">
@@ -1068,6 +1101,32 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     }});
     input.value = '';
   }}
+  const PREVIEW_CELL_PX = 14;
+  function pollPreview() {{
+    fetch('/frame.json').then(r => r.json()).then(data => {{
+      const el = document.getElementById('preview');
+      if (!data.w || !data.h) return;
+      if (el.dataset.w != data.w || el.dataset.h != data.h) {{
+        el.innerHTML = '';
+        el.style.display = 'grid';
+        el.style.gridTemplateColumns = `repeat(${{data.w}}, ${{PREVIEW_CELL_PX}}px)`;
+        el.style.gap = '1px';
+        for (let i = 0; i < data.w * data.h; i++) {{
+          const cell = document.createElement('div');
+          cell.style.width = cell.style.height = PREVIEW_CELL_PX + 'px';
+          el.appendChild(cell);
+        }}
+        el.dataset.w = data.w;
+        el.dataset.h = data.h;
+      }}
+      const cells = el.children;
+      for (let i = 0; i < data.pixels.length; i++) {{
+        const [r, g, b] = data.pixels[i];
+        cells[i].style.background = `rgb(${{r}},${{g}},${{b}})`;
+      }}
+    }}).catch(() => {{}}).finally(() => setTimeout(pollPreview, 150));
+  }}
+  pollPreview();
 </script>
 </body>"""
 
@@ -1110,10 +1169,10 @@ def local_ip():
         s.close()
 
 
-def make_control_server(state, port, panel_w, panel_h, upload_dir):
+def make_control_server(state, port, panel_w, panel_h, upload_dir, preview):
     handler = type("BoundControlHandler", (ControlHandler,), {
         "state": state, "panel_w": panel_w, "panel_h": panel_h,
-        "upload_dir": upload_dir,
+        "upload_dir": upload_dir, "preview": preview,
     })
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1227,10 +1286,11 @@ def main():
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]
 
+    preview = Preview()
     server = None
     if args.web_port:
         server = make_control_server(state, args.web_port, args.panel_width,
-                                      args.panel_height, upload_dir)
+                                      args.panel_height, upload_dir, preview)
         print(f"control panel: http://{local_ip()}:{args.web_port}/")
         if text_h <= 0:
             print("note: no text region reserved yet (no --text/no room), so "
@@ -1276,6 +1336,7 @@ def main():
                 scroll_offset += sign * dt * snap["scroll_speed"]
                 frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)
 
+            preview.update(frame)
             strip.setBrightness(snap["brightness"])
             flat_rgb = frame.reshape(-1, 3)
             for pixel_pos, led_idx in enumerate(flat_idx):

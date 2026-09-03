@@ -425,15 +425,27 @@ class TextScroller:
                 glyph = Image.new("RGB", (cw, chh), (0, 0, 0))
                 ImageDraw.Draw(glyph).text((-bbox[0], -bbox[1]), ch, font=font, fill=color)
                 glyphs.append(glyph.rotate(glyph_rotate, expand=True) if glyph_rotate else glyph)
-            block_w = max(g.width for g in glyphs)
-            block_h = line_h * len(glyphs)
-            content_w, content_h = (block_w, out_h) if horizontal else (out_w, block_h)
-            img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
-            v_center = (out_h - block_h) // 2 if horizontal else 0
-            for i, g in enumerate(glyphs):
-                gx = (block_w - g.width) // 2 if horizontal else (out_w - g.width) // 2
-                gy = i * line_h + (line_h - g.height) // 2 + v_center
-                img.paste(g, (gx, gy))
+            if horizontal:
+                # Characters march one after another along the travel axis
+                # (width); each gets a fixed-width cell and is centered in
+                # the fixed cross-axis (out_h, the panel height).
+                cell = max(g.width for g in glyphs)
+                content_w, content_h = cell * len(glyphs), out_h
+                img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
+                for i, g in enumerate(glyphs):
+                    gx = i * cell + (cell - g.width) // 2
+                    gy = (out_h - g.height) // 2
+                    img.paste(g, (gx, gy))
+            else:
+                # Same idea, but characters march down the height (travel
+                # axis) and are centered in the fixed cross-axis (out_w).
+                cell = line_h
+                content_w, content_h = out_w, cell * len(glyphs)
+                img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
+                for i, g in enumerate(glyphs):
+                    gx = (out_w - g.width) // 2
+                    gy = i * cell + (cell - g.height) // 2
+                    img.paste(g, (gx, gy))
 
         gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         self.loop = np.concatenate([np.array(img), gap], axis=1 if horizontal else 0)

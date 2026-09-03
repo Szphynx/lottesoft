@@ -65,7 +65,13 @@ FONT_CANDIDATES = [
 LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 NUMBERS = [str(n) for n in range(10)]
 SYMBOLS = list("☺☹★♥☀☁☂✓⚡♪")  # ☺☹★♥☀☁☂✓⚡♪
-CATEGORIES = [("L", LETTERS), ("N", NUMBERS), ("S", SYMBOLS)]
+
+# each screen gets its own dedicated content + on-screen ID tag
+SCREEN_CONTENT = {
+    "OLED-1": ("O1", LETTERS),
+    "OLED-2": ("O2", NUMBERS),
+    "TFT": ("TFT", SYMBOLS),
+}
 
 
 def load_font(size):
@@ -197,14 +203,14 @@ def main():
     if not screens:
         sys.exit("no displays requested/detected -- check --displays and wiring")
 
-    sequence = [(tag, glyph) for tag, glyphs in CATEGORIES for glyph in glyphs]
     print(f"running with {len(screens)} display(s): " + ", ".join(n for n, _ in screens))
 
     try:
         i = 0
         while True:
-            tag, glyph = sequence[i % len(sequence)]
             for name, screen in screens:
+                tag, glyphs = SCREEN_CONTENT[name]
+                glyph = glyphs[i % len(glyphs)]
                 try:
                     screen.show(build_frame(screen.size, glyph, tag))
                 except Exception as e:

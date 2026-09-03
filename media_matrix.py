@@ -72,8 +72,15 @@ Useful flags:
     anything, no page reload, no restart. Panel count/size stay CLI-only.
 
     --led-pin (BCM, default 18) / --led-freq-hz / --led-dma / --led-invert
-    --brightness N                      0-255, default 80 -- start low,
-                                       these draw a lot of current at 255
+    --brightness N                      0-255, default 80 -- LED hardware
+                                       level, start low, these draw a lot
+                                       of current at 255
+    --media-brightness / --media-contrast   percent, 100=neutral -- global
+                                       software adjustment applied to the
+                                       whole media queue on top of each
+                                       item's own (set per-item from the
+                                       control panel, next to its start/
+                                       end/loop controls)
     --media PATH             video file to seed the playback queue with
                                 (anything OpenCV can decode); more items --
                                 images too -- are added from the control
@@ -98,12 +105,14 @@ Useful flags:
     --text-color R,G,B
     --bold / --italic
     --scroll-speed N            pixels/second
-    --text-direction left|right|up|down   which way the text travels.
-                                left/right always work (sideways marquee);
-                                up/down need real vertical room to look
-                                right -- best in text-only mode where text
-                                gets the full canvas height, cramped in a
-                                thin strip alongside video.
+    --text-direction left|right|up|down   left/right render one normal
+                                horizontal line and slide it sideways (the
+                                marquee). up/down stack the text one upright
+                                character per row and slide that column
+                                vertically -- needs real vertical room to
+                                look right, best in text-only mode where
+                                text gets the full canvas height, cramped
+                                in a thin strip alongside video.
     --fit letterbox|fill        how the video fills its area (default fill)
     --web-port N                 live control panel at http://<pi>:N/ --
                                 edit everything above (except panel count/
@@ -176,6 +185,16 @@ def fit_frame(frame, fit, out_w, out_h):
     x0, y0 = (out_w - nw) // 2, (out_h - nh) // 2
     canvas[y0:y0 + nh, x0:x0 + nw] = resized
     return canvas
+
+
+def adjust_frame(frame, brightness_pct, contrast_pct):
+    """brightness/contrast as percent, 100 = neutral. Brightness is a
+    straight gain; contrast scales around the 128 midpoint."""
+    if brightness_pct == 100 and contrast_pct == 100:
+        return frame
+    f = frame.astype(np.float32) * (brightness_pct / 100.0)
+    f = (f - 128.0) * (contrast_pct / 100.0) + 128.0
+    return np.clip(f, 0, 255).astype(np.uint8)
 
 
 class ClipSource:
@@ -265,7 +284,11 @@ class QueuePlayer:
             return queue[(ids.index(after_id) + 1) % len(queue)]
         return queue[0]
 
-    def next_frame(self, dt, canvas_w, out_h):
+    @staticmethod
+    def _find(queue, iid):
+        return next((it for it in queue if it["id"] == iid), None)
+
+    def next_frame(self, dt, canvas_w, out_h, media_brightness=100.0, media_contrast=100.0):
         queue = self.queue_getter()
         if not queue:
             self._reset()
@@ -290,14 +313,23 @@ class QueuePlayer:
             if self.current_clip else (blank, False)
         done = eof_a or (self.current_clip and self.elapsed >= self.current_clip.total_s)
 
+        cur_item = self._find(queue, self.current_id)
+        frame_a = adjust_frame(frame_a, cur_item.get("brightness", 100) if cur_item else 100,
+                                cur_item.get("contrast", 100) if cur_item else 100)
+
         if self.transitioning and self.next_clip:
             t = 1.0 - max(0.0, min(1.0, remaining / self.transition_s)) if self.transition_s else 1.0
             t = t * t * (3 - 2 * t)  # smoothstep ease in/out
             frame_b, _ = self.next_clip.get_frame(self.fit, canvas_w, out_h)
+            next_item = self._find(queue, self.next_id)
+            frame_b = adjust_frame(frame_b, next_item.get("brightness", 100) if next_item else 100,
+                                    next_item.get("contrast", 100) if next_item else 100)
             frame = (frame_a.astype(np.float32) * (1 - t)
                      + frame_b.astype(np.float32) * t).astype(np.uint8)
         else:
             frame = frame_a
+
+        frame = adjust_frame(frame, media_brightness, media_contrast)
 
         if done:
             if self.transitioning and self.next_clip:
@@ -337,29 +369,44 @@ class QueuePlayer:
 class TextScroller:
     """Renders `text` once, then hands back an out_w x out_h sliding window
     of it (with a gap before it repeats) for any pixel offset. `direction`
-    picks the travel axis and way: left/right slide horizontally (the
-    classic marquee, entering from the trailing edge); up/down slide
-    vertically -- only meaningful when out_h gives it real room to travel,
-    i.e. text-only mode, not a thin strip alongside video."""
+    picks the layout and travel: left/right render the text as one normal
+    horizontal line and slide it sideways (the classic marquee). up/down
+    stack the text one upright character per row --
+
+        t
+        e
+        x
+        t
+
+    -- and slide that column vertically. Vertical only has real room to
+    work when out_h gives it space to travel, i.e. text-only mode, not a
+    thin strip alongside video."""
 
     def __init__(self, text, font, out_w, out_h, color, direction="left"):
         self.direction = direction
         self.out_w, self.out_h = out_w, out_h
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-        bbox = dummy.textbbox((0, 0), text, font=font)
-        text_w = max(1, bbox[2] - bbox[0])
-        text_h = max(1, bbox[3] - bbox[1])
 
         if direction in ("left", "right"):
+            bbox = dummy.textbbox((0, 0), text, font=font)
+            text_w = max(1, bbox[2] - bbox[0])
+            text_h = max(1, bbox[3] - bbox[1])
             img = Image.new("RGB", (text_w, out_h), (0, 0, 0))
             draw = ImageDraw.Draw(img)
             draw.text((-bbox[0], (out_h - text_h) // 2 - bbox[1]), text, font=font, fill=color)
             gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
             self.loop = np.concatenate([np.array(img), gap], axis=1)
         else:
-            img = Image.new("RGB", (out_w, text_h), (0, 0, 0))
+            chars = list(text) if text else [" "]
+            ascent, descent = font.getmetrics()
+            line_h = max(1, ascent + descent)
+            img = Image.new("RGB", (out_w, line_h * len(chars)), (0, 0, 0))
             draw = ImageDraw.Draw(img)
-            draw.text(((out_w - text_w) // 2 - bbox[0], -bbox[1]), text, font=font, fill=color)
+            for i, ch in enumerate(chars):
+                bbox = dummy.textbbox((0, 0), ch, font=font)
+                cw = bbox[2] - bbox[0]
+                draw.text(((out_w - cw) // 2 - bbox[0], i * line_h - bbox[1]),
+                          ch, font=font, fill=color)
             gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
             self.loop = np.concatenate([np.array(img), gap], axis=0)
         self.axis_len = self.loop.shape[1 if direction in ("left", "right") else 0]
@@ -442,6 +489,8 @@ class State:
         self.scroll_speed = args.scroll_speed
         self.text_direction = args.text_direction
         self.brightness = args.brightness
+        self.media_brightness = args.media_brightness
+        self.media_contrast = args.media_contrast
         self.layout = args.layout
         self.panels = [
             {"serpentine": args.serpentine, "serpentine_axis": args.serpentine_axis,
@@ -454,6 +503,7 @@ class State:
                 "id": uuid.uuid4().hex[:8], "path": args.media, "kind": "video",
                 "name": os.path.basename(args.media),
                 "start": 0.0, "end": None, "loop": False,
+                "brightness": 100.0, "contrast": 100.0,
             })
         self.version = 0
 
@@ -463,7 +513,9 @@ class State:
             return dict(text=self.text, color=self.color, bold=self.bold,
                         italic=self.italic, scroll_speed=self.scroll_speed,
                         text_direction=self.text_direction,
-                        brightness=self.brightness, layout=self.layout,
+                        brightness=self.brightness,
+                        media_brightness=self.media_brightness,
+                        media_contrast=self.media_contrast, layout=self.layout,
                         panels=[dict(p) for p in self.panels],
                         queue=[dict(q) for q in self.queue], version=self.version)
 
@@ -479,6 +531,7 @@ class State:
             self.queue.append({
                 "id": uuid.uuid4().hex[:8], "path": path, "kind": kind, "name": name,
                 "start": 0.0, "end": None, "loop": False,
+                "brightness": 100.0, "contrast": 100.0,
             })
             self.version += 1
 
@@ -511,6 +564,16 @@ class State:
                 rebuild = True
             if "brightness" in data:
                 self.brightness = max(0, min(255, int(data["brightness"])))
+            if "media_brightness" in data:
+                try:
+                    self.media_brightness = max(0.0, min(200.0, float(data["media_brightness"])))
+                except (TypeError, ValueError):
+                    pass
+            if "media_contrast" in data:
+                try:
+                    self.media_contrast = max(0.0, min(200.0, float(data["media_contrast"])))
+                except (TypeError, ValueError):
+                    pass
             if "layout" in data and data["layout"] in ("horizontal", "vertical") \
                     and data["layout"] != self.layout:
                 self.layout = data["layout"]
@@ -554,6 +617,16 @@ class State:
                             pass
                     if "loop" in entry:
                         updated["loop"] = bool(entry["loop"])
+                    if "brightness" in entry:
+                        try:
+                            updated["brightness"] = max(0.0, min(200.0, float(entry["brightness"])))
+                        except (TypeError, ValueError):
+                            pass
+                    if "contrast" in entry:
+                        try:
+                            updated["contrast"] = max(0.0, min(200.0, float(entry["contrast"])))
+                        except (TypeError, ValueError):
+                            pass
                     if updated != cur:
                         rebuild = True
                     new_queue.append(updated)
@@ -684,6 +757,8 @@ def _panel_row(index, cfg, panel_w, panel_h):
 
 def _queue_item_row(item):
     end_val = "" if item["end"] is None else f"{item['end']:g}"
+    brightness = item.get("brightness", 100)
+    contrast = item.get("contrast", 100)
     return f"""
 <div id="qi-{item['id']}" style="border:1px solid #333;border-radius:6px;padding:.6rem;margin-bottom:.5rem">
   <div style="display:flex;justify-content:space-between;align-items:center">
@@ -698,6 +773,11 @@ def _queue_item_row(item):
     onchange="setItem('{item['id']}','end',this.value===''?null:parseFloat(this.value))"></label>
   &nbsp; <label><input type="checkbox" {"checked" if item['loop'] else ""}
     onchange="setItem('{item['id']}','loop',this.checked)"> Loop</label>
+  <br>
+  <label>Brightness (%) <input type="number" min="0" max="200" step="5" value="{brightness:g}" style="width:5rem"
+    onchange="setItem('{item['id']}','brightness',parseFloat(this.value))"></label>
+  &nbsp; <label>Contrast (%) <input type="number" min="0" max="200" step="5" value="{contrast:g}" style="width:5rem"
+    onchange="setItem('{item['id']}','contrast',parseFloat(this.value))"></label>
 </div>"""
 
 
@@ -836,9 +916,22 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 </label>
 <span style="color:#888;font-size:.8rem">(up/down need the full canvas -- text-only mode)</span>
 <br><br>
-<label>Brightness: <span id="bval">{snap['brightness']}</span> / 255<br>
+<label>LED brightness: <span id="bval">{snap['brightness']}</span> / 255<br>
   <input type="range" min="0" max="255" value="{snap['brightness']}" style="width:100%"
     oninput="state.brightness=parseInt(this.value); bval.textContent=this.value; sendDebounced();">
+</label><br><br>
+
+<p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
+  Media brightness/contrast (global, software -- applies on top of each
+  item's own, below):
+</p>
+<label>Brightness: <span id="mbval">{snap['media_brightness']:g}</span>%<br>
+  <input type="range" min="0" max="200" value="{snap['media_brightness']:g}" style="width:100%"
+    oninput="state.media_brightness=parseFloat(this.value); mbval.textContent=this.value; sendDebounced();">
+</label><br>
+<label>Contrast: <span id="mcval">{snap['media_contrast']:g}</span>%<br>
+  <input type="range" min="0" max="200" value="{snap['media_contrast']:g}" style="width:100%"
+    oninput="state.media_contrast=parseFloat(this.value); mcval.textContent=this.value; sendDebounced();">
 </label><br><br>
 
 <hr style="border-color:#333">
@@ -971,9 +1064,10 @@ def parse_args():
                    help="pixels/second")
     p.add_argument("--text-direction", default="left",
                    choices=["left", "right", "up", "down"],
-                   help="which way the text travels -- left/right scroll "
-                        "sideways (the default marquee); up/down need real "
-                        "vertical room, i.e. text-only mode, to look right")
+                   help="left/right: one line, slides sideways (marquee). "
+                        "up/down: one upright character per row, slides "
+                        "vertically -- needs real vertical room (text-only "
+                        "mode) to look right")
     p.add_argument("--rotate", type=int, default=0, choices=[0, 180],
                    help="per-panel startup seed: flip a panel mounted upside down")
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
@@ -999,7 +1093,13 @@ def parse_args():
     p.add_argument("--led-dma", type=int, default=10)
     p.add_argument("--led-invert", action="store_true")
     p.add_argument("--led-channel", type=int, default=0)
-    p.add_argument("--brightness", type=int, default=80, help="0-255")
+    p.add_argument("--brightness", type=int, default=80, help="0-255, LED hardware level")
+    p.add_argument("--media-brightness", type=float, default=100.0,
+                   help="global software brightness for the media queue, "
+                        "percent, 100=neutral")
+    p.add_argument("--media-contrast", type=float, default=100.0,
+                   help="global software contrast for the media queue, "
+                        "percent, 100=neutral")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
@@ -1093,7 +1193,8 @@ def main():
 
             frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
             if video_h > 0:
-                frame[0:video_h] = player.next_frame(dt, canvas_w, video_h)
+                frame[0:video_h] = player.next_frame(
+                    dt, canvas_w, video_h, snap["media_brightness"], snap["media_contrast"])
             if scroller:
                 sign = -1.0 if snap["text_direction"] in ("right", "down") else 1.0
                 scroll_offset += sign * dt * snap["scroll_speed"]

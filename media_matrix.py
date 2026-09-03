@@ -74,6 +74,7 @@ Useful flags:
 
 import argparse
 import http.server
+import socket
 import sys
 import threading
 import time
@@ -327,6 +328,20 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def local_ip():
+    """Best-guess LAN IP: ask the OS which interface it'd use to reach the
+    internet, without actually sending anything (UDP connect doesn't need
+    the address to be reachable)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 def make_control_server(state, port):
     handler = type("BoundControlHandler", (ControlHandler,), {"state": state})
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
@@ -412,7 +427,7 @@ def main():
     server = None
     if args.web_port:
         server = make_control_server(state, args.web_port)
-        print(f"control panel: http://<this-pi's-address>:{args.web_port}/")
+        print(f"control panel: http://{local_ip()}:{args.web_port}/")
         if text_h <= 0:
             print("note: no text region reserved (no --text at startup), so "
                   "the text/color/style fields won't do anything -- "

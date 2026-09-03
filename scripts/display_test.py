@@ -42,6 +42,8 @@ Run with (needs root for /dev/fb1 and GPIO):
 
 import argparse
 import glob
+import math
+import random
 import os
 import sys
 import time
@@ -73,6 +75,9 @@ SCREEN_CONTENT = {
     "TFT": ("TFT", SYMBOLS),
 }
 
+FADE_STEPS = 12
+FADE_STEP_SLEEP = 0.03  # ~0.36s crossfade between slides
+
 
 def load_font(size):
     for path in FONT_CANDIDATES:
@@ -81,16 +86,32 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-def build_frame(size, glyph, tag):
-    """One big centered glyph plus a small category tag in the corner."""
+def random_gradient(size):
+    """Random-angle linear gradient between two random colors."""
     w, h = size
-    img = Image.new("RGB", size, "black")
+    angle = random.uniform(0, 2 * math.pi)
+    c1 = [random.randint(0, 255) for _ in range(3)]
+    c2 = [random.randint(0, 255) for _ in range(3)]
+    yy, xx = np.mgrid[0:h, 0:w]
+    proj = xx * math.cos(angle) + yy * math.sin(angle)
+    proj = (proj - proj.min()) / max(np.ptp(proj), 1e-6)
+    arr = np.empty((h, w, 3), dtype=np.uint8)
+    for ch in range(3):
+        arr[..., ch] = c1[ch] + (c2[ch] - c1[ch]) * proj
+    return Image.fromarray(arr, "RGB")
+
+
+def build_frame(size, glyph, tag):
+    """One big centered glyph plus a small ID tag, on a fresh random gradient."""
+    w, h = size
+    img = random_gradient(size)
     draw = ImageDraw.Draw(img)
+    fg = "white" if np.asarray(img).mean() < 128 else "black"
 
     font = load_font(int(min(w, h) * 0.7))
     x0, y0, x1, y1 = draw.textbbox((0, 0), glyph, font=font)
-    draw.text(((w - (x1 - x0)) / 2 - x0, (h - (y1 - y0)) / 2 - y0), glyph, font=font, fill="white")
-    draw.text((4, 2), tag, font=ImageFont.load_default(), fill="white")
+    draw.text(((w - (x1 - x0)) / 2 - x0, (h - (y1 - y0)) / 2 - y0), glyph, font=font, fill=fg)
+    draw.text((4, 2), tag, font=ImageFont.load_default(), fill=fg)
     return img
 
 
@@ -207,16 +228,32 @@ def main():
 
     try:
         i = 0
+        frames = {}
         while True:
+            next_frames = {}
             for name, screen in screens:
                 tag, glyphs = SCREEN_CONTENT[name]
-                glyph = glyphs[i % len(glyphs)]
-                try:
-                    screen.show(build_frame(screen.size, glyph, tag))
-                except Exception as e:
-                    print(f"{name}: write failed ({e})")
+                next_frames[name] = build_frame(screen.size, glyphs[i % len(glyphs)], tag)
+
+            if i == 0:
+                for name, screen in screens:
+                    try:
+                        screen.show(next_frames[name])
+                    except Exception as e:
+                        print(f"{name}: write failed ({e})")
+            else:
+                for step in range(1, FADE_STEPS + 1):
+                    alpha = step / FADE_STEPS
+                    for name, screen in screens:
+                        try:
+                            screen.show(Image.blend(frames[name], next_frames[name], alpha))
+                        except Exception as e:
+                            print(f"{name}: write failed ({e})")
+                    time.sleep(FADE_STEP_SLEEP)
+
+            frames = next_frames
             i += 1
-            time.sleep(args.interval)
+            time.sleep(max(args.interval - FADE_STEPS * FADE_STEP_SLEEP, 0))
     except KeyboardInterrupt:
         print("\nstopped")
 

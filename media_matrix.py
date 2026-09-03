@@ -231,7 +231,7 @@ def main():
     else:
         text_h, video_h = canvas_h, 0
 
-    if video_h <= 0:
+    if args.media and video_h <= 0:
         sys.exit("--text-height leaves no room for video -- "
                   "shrink it or use a taller panel chain")
 

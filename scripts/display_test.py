@@ -2,8 +2,16 @@
 """
 Cycle test patterns (letters -> numbers -> symbols) across up to three
 displays: the RB-TFT3.2-V3 (via its kernel framebuffer, /dev/fb1) and two
-Joy-IT SBC-OLED01.3 units sitting behind a TCA9548A I2C mux on channels 0
-and 1.
+Joy-IT SBC-OLED01.3 units. Both OLEDs are the same part at the same fixed
+address (0x3C), so instead of a mux, OLED #2 lives on a second, software
+("bit-banged") I2C bus on two spare GPIO pins -- no extra hardware needed.
+Add this to config.txt and reboot:
+
+    dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=22
+
+That gives OLED #2 its own /dev/i2c-3, wired to pins 16 (SDA/GPIO23) and
+15 (SCL/GPIO22) -- both free, neither claimed by the TFT HAT. OLED #1
+stays on the Pi's normal hardware bus, /dev/i2c-1 (pins 3/5).
 
 Each display is probed independently at startup. Any display that isn't
 wired up yet, or doesn't answer, is skipped -- the rest keep cycling. This
@@ -11,9 +19,9 @@ is meant to be run as-is right after wiring one more screen on, with no
 code changes needed to "turn off" the ones that aren't there yet.
 
 Dependencies:
-    pip install pillow numpy luma.oled smbus2
+    pip install pillow numpy luma.oled
 
-Run with (needs root for /dev/fb1 and /dev/i2c-1):
+Run with (needs root for /dev/fb1 and /dev/i2c-*):
     sudo python3 display_test.py
     sudo python3 display_test.py --interval 1.5 --rotate 90
 """
@@ -27,9 +35,8 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-MUX_ADDR = 0x70
 OLED_ADDR = 0x3C
-OLED_CHANNELS = {"OLED-1": 0, "OLED-2": 1}
+OLED_BUSES = {"OLED-1": 1, "OLED-2": 3}
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -106,47 +113,32 @@ class TFTScreen:
 
 
 # ----------------------------------------------------------------------------
-# OLEDs: both are the same part at the same fixed I2C address (0x3C), so
-# each one only exists on the bus for as long as its mux channel is
-# selected. Select-then-talk, every time -- the mux is a dumb hardware
-# switch with no memory of who selected what.
+# OLEDs: same part, same fixed address (0x3C) on both -- kept apart by
+# living on two different I2C bus devices (/dev/i2c-1 hardware, /dev/i2c-3
+# bit-banged) rather than by address, so there's no collision to arbitrate.
 # ----------------------------------------------------------------------------
 
-class MuxedOLED:
-    def __init__(self, bus, channel, width=128, height=64):
+class OLEDScreen:
+    def __init__(self, bus_port, width=128, height=64):
         from luma.core.interface.serial import i2c
         from luma.oled.device import sh1106
 
-        self.bus = bus
-        self.channel = channel
-        self._select()
-        self.device = sh1106(i2c(port=1, address=OLED_ADDR), width=width, height=height)
+        self.device = sh1106(i2c(port=bus_port, address=OLED_ADDR), width=width, height=height)
         self.size = (width, height)
 
-    def _select(self):
-        self.bus.write_byte(MUX_ADDR, 1 << self.channel)
-
     def show(self, img):
-        self._select()
         self.device.display(img.convert("1").resize(self.size))
 
 
 def find_oleds():
     screens = []
-    try:
-        import smbus2
-        bus = smbus2.SMBus(1)
-    except Exception as e:
-        print(f"I2C bus unavailable ({e}) -- both OLEDs skipped")
-        return screens
-
-    for name, channel in OLED_CHANNELS.items():
+    for name, bus_port in OLED_BUSES.items():
         try:
-            oled = MuxedOLED(bus, channel)
-            print(f"{name} detected on mux channel {channel}")
+            oled = OLEDScreen(bus_port)
+            print(f"{name} detected on /dev/i2c-{bus_port}")
             screens.append((name, oled))
         except Exception as e:
-            print(f"{name} not detected on mux channel {channel} ({e}) -- skipping")
+            print(f"{name} not detected on /dev/i2c-{bus_port} ({e}) -- skipping")
     return screens
 
 

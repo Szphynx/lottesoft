@@ -16,11 +16,15 @@ Wiring (BCM GPIO numbers; physical header pin in parentheses):
 
                VCC      GND      CLK        MOSI       RES        DC         CS
     OLED #1    1        9        29 (GPIO5) 31 (GPIO6) 33 (GPIO13) 35 (GPIO19) 36 (GPIO16)
-    OLED #2    17       14       37 (GPIO26) 38 (GPIO20) 40 (GPIO21) 15 (GPIO22) 16 (GPIO23)
+    OLED #2    17       14       37 (GPIO26) 38 (GPIO20) 40 (GPIO21) 15 (GPIO22) 32 (GPIO12)
 
-All eight GPIO above are free on a standard TFT HAT (which only claims
-SPI0's MOSI/MISO/SCLK/CE0/CE1 plus a handful of control pins -- see
-docs/rpi3-multi-display-wiring.md for the full table).
+OLED #2's CS originally sat on physical pin 16 (GPIO23). Joy-IT's own docs
+for the RB-TFT3.2-V3 assign GPIO23/24/25 to its three onboard buttons and
+GPIO18 to backlight -- GPIO23 collided directly with that CS line, so it
+was moved to GPIO12 (physical pin 32), which sits outside the TFT's 26-pin
+(13x2) header footprint entirely and is free either way. Every other OLED
+GPIO above is untouched by the TFT.
+
 
 Caveat: SPI is a write-only bus for these modules (no MISO), so an OLED
 that isn't physically wired doesn't raise an error -- the script just
@@ -47,7 +51,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 OLED_PINS = {
     "OLED-1": dict(SCLK=5, SDA=6, CE=16, DC=19, RST=13),
-    "OLED-2": dict(SCLK=26, SDA=20, CE=23, DC=22, RST=21),
+    # CE moved off GPIO23 (physical pin 16) -- that's one of the TFT's
+    # three onboard buttons, not free.
+    "OLED-2": dict(SCLK=26, SDA=20, CE=12, DC=22, RST=21),
 }
 ALL_DISPLAYS = ["tft", "oled-1", "oled-2"]
 

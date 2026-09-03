@@ -31,6 +31,42 @@ set of 5 GPIO, bit-banged in software via `luma.core`'s `bitbang` serial
 interface — no overlay, no `/dev/spidev` device, no config.txt change
 beyond what the TFT already needs.
 
+## The TFT is a real Joy-IT RB-TFT3.2-V3, not a generic clone
+
+The board is a **13×2 (26-pin)** female-header HAT — physical pins 1–26
+only, not the full 40. Seated directly on the Pi it blocks jumper access to
+everything in that span, including the 3V3/GND taps the OLEDs need (pins 1,
+9, 14, 17) and, as it turns out, one of OLED #2's own signal pins (see
+below) — which is why this build runs off a GPIO ribbon breakout into a
+breadboard instead: it mirrors all 40 pins 1:1 onto rows that stay reachable
+with the HAT seated.
+
+Joy-IT's own product docs for the RB-TFT3.2-V3 (SSD1289 display driver +
+XPT2046 touch controller) confirm:
+- **Backlight** — GPIO18 (physical pin 12)
+- **Three onboard buttons** — GPIO23, GPIO24, GPIO25 (physical pins 16, 18, 22), active-low
+
+That supersedes an earlier, wrong guess in this doc that treated GPIO24/25
+as DC/RST for a generic ILI9341 clone — this display is SSD1289-based, and
+those two pins are actually buttons. LCD DC/RST for the real SSD1289 panel
+aren't confirmed from what's available here (see caveat below).
+
+## Pin conflict found — and fixed
+
+**GPIO23 (physical pin 16) was double-booked.** It's one of the TFT's three
+buttons *and* it was OLED #2's CS line in the original plan. Since OLED #2
+is already physically wired per that original plan, its **CS line moves to
+GPIO12 (physical pin 32)** instead — that pin sits outside the TFT's 26-pin
+footprint entirely, so it was never contested by anything. This is a
+one-wire change on the breadboard (move the OLED #2 CS jumper from pin 16
+to pin 32) and is already reflected in `scripts/display_test.py`.
+
+If the TFT's buttons aren't going to be wired/used, GPIO23 sitting idle on
+the TFT's silkscreen is harmless on its own — but any driver or overlay
+that configures GPIO23 as a button input would still collide with OLED #2's
+software-SPI code driving that same physical pin, so the CS move is the
+safe fix either way, not just a precaution.
+
 ## Pin plan
 
 | Consumer | Signal | Physical pin | BCM GPIO |
@@ -40,10 +76,12 @@ beyond what the TFT already needs.
 | TFT (SPI0, shared) | SCLK | 23 | GPIO11 |
 | TFT | LCD CS (CE0) | 24 | GPIO8 |
 | TFT | Touch CS (CE1) | 26 | GPIO7 |
-| TFT | LCD DC | 18 | GPIO24 |
-| TFT | LCD RST | 22 | GPIO25 |
-| TFT | Touch IRQ | 11 | GPIO17 |
 | TFT | Backlight | 12 | GPIO18 |
+| TFT | Button 1 | 16 | GPIO23 |
+| TFT | Button 2 | 18 | GPIO24 |
+| TFT | Button 3 | 22 | GPIO25 |
+| TFT | LCD DC | — | not confirmed, see caveat |
+| TFT | LCD RST | — | not confirmed, see caveat |
 | OLED #1 | VCC | 1 | 3V3 |
 | OLED #1 | GND | 9 | GND |
 | OLED #1 | CLK | 29 | GPIO5 |
@@ -57,17 +95,20 @@ beyond what the TFT already needs.
 | OLED #2 | MOSI | 38 | GPIO20 |
 | OLED #2 | RES | 40 | GPIO21 |
 | OLED #2 | DC | 15 | GPIO22 |
-| OLED #2 | CS | 16 | GPIO23 |
+| OLED #2 | CS | 32 | GPIO12 |
 
-All ten OLED GPIO are pulled from pins the TFT HAT leaves free.
-
-**Caveat (unverified, flagged to the user already):** "RB-TFT3.2-V3" is a
-generic clone name; the DC/RST/IRQ/backlight GPIO assignments above are the
-mapping used by most ILI9341+XPT2046 3.2" clone HATs, but they vary a
-little by seller/batch. SPI0 itself (MOSI/MISO/SCLK/CE0/CE1) is fixed in
-silicon and never varies. **Before wiring anything new, check the board's
-own silkscreen or the install script it shipped with** rather than trusting
-this table blindly for those four TFT control pins.
+**Caveat:** SPI0 itself (MOSI/MISO/SCLK/CE0/CE1) is fixed in silicon and
+never varies — those five rows are as solid as this table gets. Backlight
+and the three buttons are confirmed from Joy-IT's own docs. **LCD DC/RST
+are not confirmed** — this session couldn't reach Joy-IT's manual PDF or
+any mirror of it to read the rest of the pin table (network egress to those
+hosts was blocked). If the display came with its own install script,
+check the `dtoverlay=flexfb,...` (or similar) line it wrote into
+`config.txt` — the `dc-gpio=` and `reset-gpio=` (or `rst-gpio=`) parameters
+on that line are the authoritative answer. Whatever they turn out to be,
+they'll land on two of the still-free pins (GPIO2, GPIO3, GPIO4, GPIO14,
+GPIO15, or GPIO27 — physical pins 3, 5, 7, 8, 10, 13) since nothing else in
+this plan claims them.
 
 ## config.txt
 
@@ -120,15 +161,22 @@ Key implementation details for whoever picks this up:
   (Joy-IT has sold both SSD1306 and SH1106 variants under similar naming;
   wrong controller choice shows as extra column/row offset, not a crash).
 
+## Status
+
+Both OLEDs are physically wired per the pin plan above (OLED #2's CS on the
+new pin 32/GPIO12, not the original pin 16). The TFT's 26-pin footprint
+blocks direct jumper access to pins 1–26 wherever it's seated, so this
+build runs everything through a GPIO ribbon breakout to a breadboard
+instead.
+
 ## Suggested next steps
 
-1. Physically wire OLED #1 per the pin table above.
-2. Run `sudo python3 scripts/display_test.py --displays tft,oled-1` and
-   confirm it draws.
-3. Wire OLED #2, then run with `--displays tft,oled-1,oled-2` and confirm
-   all three cycle in sync.
-4. If the TFT's DC/RST/IRQ pins turn out to differ from the table above,
-   update this doc accordingly — that mapping is the least certain part of
-   this plan.
-5. If the OLED controller isn't actually SH1106 (image looks shifted),
+1. Run `sudo python3 scripts/display_test.py --displays oled-1,oled-2` and
+   confirm both OLEDs draw correctly off their current wiring, including
+   OLED #2 on its moved CS pin.
+2. Confirm the TFT's actual DC/RST GPIO (install script's `dtoverlay=`
+   line, or the manual) and fill them into the pin plan above.
+3. Run `sudo python3 scripts/display_test.py --displays tft,oled-1,oled-2`
+   and confirm all three cycle in sync.
+4. If the OLED controller isn't actually SH1106 (image looks shifted),
    swap `sh1106` for `ssd1306` in `scripts/display_test.py`.

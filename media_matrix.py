@@ -37,11 +37,15 @@ Useful flags:
     --layout horizontal|vertical       how the chain forms one image: side
                                        by side (wider) or stacked (taller).
                                        Default horizontal.
-    --serpentine / --no-serpentine    most cheap matrix panels wire rows
-                                       back and forth rather than all
-                                       left-to-right; default on. If the
-                                       image comes out torn into diagonal
-                                       strips, try --no-serpentine.
+    --serpentine / --no-serpentine    most cheap matrix panels wire rows (or
+                                       columns, see below) back and forth
+                                       rather than all in one direction;
+                                       default on.
+    --serpentine-axis row|column      row snakes across each row (default);
+                                       column snakes down each column, common
+                                       on narrow tall-pixel-count panels. If a
+                                       horizontal scroll bounces vertically,
+                                       try column.
     --led-pin (BCM, default 18) / --led-freq-hz / --led-dma / --led-invert
     --brightness N                      0-255, default 80 -- start low,
                                        these draw a lot of current at 255
@@ -159,10 +163,12 @@ class TextScroller:
         return np.concatenate([self.loop[:, start:], self.loop[:, :wrap]], axis=1)
 
 
-def build_index_map(panel_w, panel_h, num_panels, layout, serpentine):
-    """canvas (y, x) -> pixel index in the chain. One panel's local index is
-    row-major, snaking left-right-left if `serpentine` (how these boards are
-    normally wired); panels then extend the chain side by side or stacked."""
+def build_index_map(panel_w, panel_h, num_panels, layout, serpentine, serpentine_axis):
+    """canvas (y, x) -> pixel index in the chain. One panel's local index
+    snakes along rows (0,0 -> right along row 0 -> down -> left along row 1 --
+    most panels) or along columns (0,0 -> down column 0 -> right -> up column 1
+    -- common on narrow tall-pixel-count panels) if `serpentine`; panels then
+    extend the chain side by side or stacked."""
     if layout == "horizontal":
         canvas_w, canvas_h = panel_w * num_panels, panel_h
     else:
@@ -175,8 +181,13 @@ def build_index_map(panel_w, panel_h, num_panels, layout, serpentine):
                 panel_idx, lx, ly = x // panel_w, x % panel_w, y
             else:
                 panel_idx, lx, ly = y // panel_h, x, y % panel_h
-            row_x = (panel_w - 1 - lx) if (serpentine and ly % 2 == 1) else lx
-            idx_map[y, x] = panel_idx * panel_w * panel_h + ly * panel_w + row_x
+            if serpentine_axis == "column":
+                yy = (panel_h - 1 - ly) if (serpentine and lx % 2 == 1) else ly
+                local = lx * panel_h + yy
+            else:
+                xx = (panel_w - 1 - lx) if (serpentine and ly % 2 == 1) else lx
+                local = ly * panel_w + xx
+            idx_map[y, x] = panel_idx * panel_w * panel_h + local
     return idx_map, canvas_w, canvas_h
 
 
@@ -204,6 +215,9 @@ def parse_args():
     p.add_argument("--num-panels", type=int, default=2)
     p.add_argument("--layout", default="horizontal", choices=["horizontal", "vertical"])
     p.add_argument("--serpentine", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--serpentine-axis", default="row", choices=["row", "column"],
+                   help="which direction the panel's wiring snakes in -- try "
+                        "'column' if a horizontal scroll bounces vertically")
     p.add_argument("--led-pin", type=int, default=18, help="BCM GPIO number")
     p.add_argument("--led-freq-hz", type=int, default=800000)
     p.add_argument("--led-dma", type=int, default=10)
@@ -222,7 +236,7 @@ def main():
     args = parse_args()
     idx_map, canvas_w, canvas_h = build_index_map(
         args.panel_width, args.panel_height, args.num_panels,
-        args.layout, args.serpentine)
+        args.layout, args.serpentine, args.serpentine_axis)
 
     if args.media and args.text:
         text_h, video_h = args.text_height, canvas_h - args.text_height

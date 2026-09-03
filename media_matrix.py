@@ -105,14 +105,18 @@ Useful flags:
     --text-color R,G,B
     --bold / --italic
     --scroll-speed N            pixels/second
-    --text-direction left|right|up|down   left/right render one normal
-                                horizontal line and slide it sideways (the
-                                marquee). up/down stack the text one upright
-                                character per row and slide that column
-                                vertically -- needs real vertical room to
-                                look right, best in text-only mode where
-                                text gets the full canvas height, cramped
-                                in a thin strip alongside video.
+    --text-direction left|right|up|down   which axis it travels on and
+                                which way -- independent of how it's drawn
+                                (see --text-stacked below). Vertical travel
+                                needs real room, best in text-only mode
+                                where text gets the full canvas height,
+                                cramped in a thin strip alongside video.
+    --text-stacked              one character per row instead of one
+                                normal line -- independent of direction, so
+                                a stacked column can still travel sideways
+                                if that's what a panel's orientation needs.
+                                Needs out_h tall enough to show more than
+                                one row, i.e. text-only mode.
     --fit letterbox|fill        how the video fills its area (default fill)
     --web-port N                 live control panel at http://<pi>:N/ --
                                 edit everything above (except panel count/
@@ -369,54 +373,71 @@ class QueuePlayer:
 
 class TextScroller:
     """Renders `text` once, then hands back an out_w x out_h sliding window
-    of it (with a gap before it repeats) for any pixel offset. `direction`
-    picks the layout and travel: left/right render the text as one normal
-    horizontal line and slide it sideways (the classic marquee). up/down
-    stack the text one upright character per row --
+    of it (with a gap before it repeats) for any pixel offset. Two
+    independent choices:
+
+    `direction` (left/right/up/down) is purely which axis the content
+    slides along and which way -- left/right slide horizontally, up/down
+    vertically. It has nothing to do with how the text is drawn.
+
+    `stacked` picks the drawing: False is one normal horizontal line
+    (the usual case); True stacks it one upright character per row --
 
         t
         e
         x
         t
 
-    -- and slide that column vertically. Vertical only has real room to
-    work when out_h gives it space to travel, i.e. text-only mode, not a
-    thin strip alongside video. `glyph_rotate` (0/90/270, up/down only)
-    additionally rotates each character in place -- e.g. 270 turns upright
-    "t" on its side facing right, for panels where that reads correctly."""
+    -- with `glyph_rotate` (0/90/270) additionally rotating each character
+    in place, e.g. 270 turns an upright "t" on its side facing right.
 
-    def __init__(self, text, font, out_w, out_h, color, direction="left", glyph_rotate=0):
+    So e.g. stacked text can still travel left/right (the whole rotated
+    column marching sideways) if that's what a given panel's physical
+    orientation needs -- pick whichever combination actually looks right
+    on the hardware, there's no wrong answer here. Vertical travel only
+    has real room to work when out_h gives it space, i.e. text-only mode,
+    not a thin strip alongside video; likewise stacked text needs out_h
+    tall enough to show more than one character."""
+
+    def __init__(self, text, font, out_w, out_h, color, direction="left",
+                 stacked=False, glyph_rotate=0):
         self.direction = direction
         self.out_w, self.out_h = out_w, out_h
+        horizontal = direction in ("left", "right")
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
 
-        if direction in ("left", "right"):
+        if not stacked:
             bbox = dummy.textbbox((0, 0), text, font=font)
-            text_w = max(1, bbox[2] - bbox[0])
-            text_h = max(1, bbox[3] - bbox[1])
-            img = Image.new("RGB", (text_w, out_h), (0, 0, 0))
-            draw = ImageDraw.Draw(img)
-            draw.text((-bbox[0], (out_h - text_h) // 2 - bbox[1]), text, font=font, fill=color)
-            gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-            self.loop = np.concatenate([np.array(img), gap], axis=1)
+            text_w, text_h = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+            content_w, content_h = (text_w, out_h) if horizontal else (out_w, text_h)
+            img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
+            x = -bbox[0] if horizontal else (out_w - text_w) // 2 - bbox[0]
+            y = (out_h - text_h) // 2 - bbox[1] if horizontal else -bbox[1]
+            ImageDraw.Draw(img).text((x, y), text, font=font, fill=color)
         else:
             chars = list(text) if text else [" "]
             ascent, descent = font.getmetrics()
             line_h = max(1, ascent + descent)
-            img = Image.new("RGB", (out_w, line_h * len(chars)), (0, 0, 0))
-            for i, ch in enumerate(chars):
+            glyphs = []
+            for ch in chars:
                 bbox = dummy.textbbox((0, 0), ch, font=font)
                 cw, chh = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
                 glyph = Image.new("RGB", (cw, chh), (0, 0, 0))
                 ImageDraw.Draw(glyph).text((-bbox[0], -bbox[1]), ch, font=font, fill=color)
-                if glyph_rotate:
-                    glyph = glyph.rotate(glyph_rotate, expand=True)
-                gx = (out_w - glyph.width) // 2
-                gy = i * line_h + (line_h - glyph.height) // 2
-                img.paste(glyph, (gx, gy))
-            gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-            self.loop = np.concatenate([np.array(img), gap], axis=0)
-        self.axis_len = self.loop.shape[1 if direction in ("left", "right") else 0]
+                glyphs.append(glyph.rotate(glyph_rotate, expand=True) if glyph_rotate else glyph)
+            block_w = max(g.width for g in glyphs)
+            block_h = line_h * len(glyphs)
+            content_w, content_h = (block_w, out_h) if horizontal else (out_w, block_h)
+            img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
+            v_center = (out_h - block_h) // 2 if horizontal else 0
+            for i, g in enumerate(glyphs):
+                gx = (block_w - g.width) // 2 if horizontal else (out_w - g.width) // 2
+                gy = i * line_h + (line_h - g.height) // 2 + v_center
+                img.paste(g, (gx, gy))
+
+        gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        self.loop = np.concatenate([np.array(img), gap], axis=1 if horizontal else 0)
+        self.axis_len = self.loop.shape[1 if horizontal else 0]
 
     def frame(self, offset_px):
         start = int(offset_px) % self.axis_len
@@ -495,6 +516,7 @@ class State:
         self.italic = args.italic
         self.scroll_speed = args.scroll_speed
         self.text_direction = args.text_direction
+        self.text_stacked = args.text_stacked
         self.text_glyph_rotate = args.text_glyph_rotate
         self.brightness = args.brightness
         self.media_brightness = args.media_brightness
@@ -521,6 +543,7 @@ class State:
             return dict(text=self.text, color=self.color, bold=self.bold,
                         italic=self.italic, scroll_speed=self.scroll_speed,
                         text_direction=self.text_direction,
+                        text_stacked=self.text_stacked,
                         text_glyph_rotate=self.text_glyph_rotate,
                         brightness=self.brightness,
                         media_brightness=self.media_brightness,
@@ -570,6 +593,9 @@ class State:
             if "text_direction" in data and data["text_direction"] in \
                     ("left", "right", "up", "down") and data["text_direction"] != self.text_direction:
                 self.text_direction = data["text_direction"]
+                rebuild = True
+            if "text_stacked" in data and bool(data["text_stacked"]) != self.text_stacked:
+                self.text_stacked = bool(data["text_stacked"])
                 rebuild = True
             if "text_glyph_rotate" in data and str(data["text_glyph_rotate"]) in ("0", "90", "270") \
                     and int(data["text_glyph_rotate"]) != self.text_glyph_rotate:
@@ -977,6 +1003,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     {_opt("up", snap["text_direction"])}{_opt("down", snap["text_direction"])}
   </select>
 </label>
+&nbsp; <label><input type="checkbox" {"checked" if snap['text_stacked'] else ""}
+  onchange="state.text_stacked=this.checked; send();"> Stack letters</label>
 &nbsp; <label>Rotate letters
   <select onchange="state.text_glyph_rotate=parseInt(this.value); send();">
     {_opt("0", str(snap["text_glyph_rotate"]))}
@@ -984,7 +1012,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     {_opt("270", str(snap["text_glyph_rotate"]))}
   </select>
 </label>
-<br><span style="color:#888;font-size:.8rem">(up/down need the full canvas -- text-only mode. "Rotate letters" only applies to up/down: 270 faces right, 90 faces left)</span>
+<br><span style="color:#888;font-size:.8rem">
+  Direction is purely which axis it travels on; Stack letters is purely how
+  it's drawn (one line vs one character per row) -- mix and match. Vertical
+  travel and stacked text both need the full canvas, i.e. text-only mode.
+  Rotate letters only applies when stacked: 270 faces right, 90 faces left.
+</span>
 <br><br>
 <label>LED brightness: <span id="bval">{snap['brightness']}</span> / 255<br>
   <input type="range" min="0" max="255" value="{snap['brightness']}" style="width:100%"
@@ -1198,11 +1231,16 @@ def parse_args():
                         "up/down: one upright character per row, slides "
                         "vertically -- needs real vertical room (text-only "
                         "mode) to look right")
+    p.add_argument("--text-stacked", action="store_true",
+                   help="one character per row (upright, or rotated with "
+                        "--text-glyph-rotate) instead of one normal line -- "
+                        "independent of --text-direction, which is purely "
+                        "which axis it travels on")
     p.add_argument("--text-glyph-rotate", type=int, default=0, choices=[0, 90, 270],
-                   help="up/down mode only: rotate each character in place "
-                        "-- 270 turns an upright letter to face right, 90 "
-                        "to face left. Try both, whichever reads correctly "
-                        "on your panel")
+                   help="--text-stacked only: rotate each character in "
+                        "place -- 270 turns an upright letter to face "
+                        "right, 90 to face left. Try both, whichever reads "
+                        "correctly on your panel")
     p.add_argument("--rotate", type=int, default=0, choices=[0, 180],
                    help="per-panel startup seed: flip a panel mounted upside down")
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
@@ -1281,7 +1319,8 @@ def main():
         font = load_font(args.font, args.font_size or max(8, text_h - 2),
                           bold=snap["bold"], italic=snap["italic"])
         return TextScroller(snap["text"], font, canvas_w, text_h, snap["color"],
-                             snap["text_direction"], snap["text_glyph_rotate"])
+                             snap["text_direction"], snap["text_stacked"],
+                             snap["text_glyph_rotate"])
 
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]

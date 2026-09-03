@@ -32,11 +32,18 @@ Run with:
 
 Useful flags:
     --panel-width / --panel-height   pixels per panel -- defaults (32x8)
-                                       match the WS2812ECO 8x32 panel
-    --num-panels                       panels chained together (default 2)
+                                       match the WS2812ECO 8x32 panel. Fixed
+                                       at startup (physical wiring), not
+                                       editable from the control panel.
+    --num-panels                       panels chained together (default 2).
+                                       Also fixed at startup.
     --layout horizontal|vertical       how the chain forms one image: side
                                        by side (wider) or stacked (taller).
-                                       Default horizontal.
+                                       Default horizontal. Live-editable from
+                                       the control panel, along with the
+                                       three flags below -- it shows a
+                                       diagram of the actual LED chain order
+                                       so you can see the effect immediately.
     --serpentine / --no-serpentine    most cheap matrix panels wire rows (or
                                        columns, see below) back and forth
                                        rather than all in one direction;
@@ -220,8 +227,9 @@ def build_strip(args, num_pixels):
 
 class State:
     """Live-editable display settings, shared between the render loop and
-    the web control server. `version` bumps only on changes that require
-    re-rendering the text bitmap (rebuilding a TextScroller is not free)."""
+    the web control server. `version` bumps only on changes that require a
+    rebuild -- of the text bitmap, or of the whole panel-geometry pipeline
+    (index map, canvas size, video/text split) for layout/serpentine changes."""
 
     def __init__(self, args):
         self.lock = threading.Lock()
@@ -231,16 +239,24 @@ class State:
         self.italic = args.italic
         self.scroll_speed = args.scroll_speed
         self.brightness = args.brightness
+        self.layout = args.layout
+        self.serpentine = args.serpentine
+        self.serpentine_axis = args.serpentine_axis
+        self.rotate = args.rotate
         self.version = 0
 
     def snapshot(self):
         with self.lock:
             return dict(text=self.text, color=self.color, bold=self.bold,
                         italic=self.italic, scroll_speed=self.scroll_speed,
-                        brightness=self.brightness, version=self.version)
+                        brightness=self.brightness, layout=self.layout,
+                        serpentine=self.serpentine,
+                        serpentine_axis=self.serpentine_axis,
+                        rotate=self.rotate, version=self.version)
 
     def update(self, **fields):
-        rebuild_keys = {"text", "color", "bold", "italic"}
+        rebuild_keys = {"text", "color", "bold", "italic",
+                         "layout", "serpentine", "serpentine_axis"}
         with self.lock:
             for key, value in fields.items():
                 setattr(self, key, value)
@@ -257,8 +273,52 @@ def rgb_to_hex(rgb):
     return "#%02x%02x%02x" % rgb
 
 
+def render_wiring_svg(panel_w, panel_h, num_panels, layout, serpentine,
+                       serpentine_axis, cell=14):
+    """Connect-the-dots diagram of the actual LED chain order for the
+    current settings -- literally traces build_index_map's output, so it
+    can't drift out of sync with what's actually being rendered."""
+    idx_map, canvas_w, canvas_h = build_index_map(
+        panel_w, panel_h, num_panels, layout, serpentine, serpentine_axis)
+    num_pixels = panel_w * panel_h * num_panels
+    pos = [None] * num_pixels
+    for y in range(canvas_h):
+        for x in range(canvas_w):
+            pos[int(idx_map[y, x])] = (x, y)
+
+    w, h = canvas_w * cell, canvas_h * cell
+    cells = "".join(
+        f'<rect x="{x * cell}" y="{y * cell}" width="{cell}" height="{cell}" '
+        f'fill="none" stroke="#333"/>'
+        for y in range(canvas_h) for x in range(canvas_w)
+    )
+    if layout == "horizontal":
+        boundaries = "".join(
+            f'<line x1="{i * panel_w * cell}" y1="0" x2="{i * panel_w * cell}" '
+            f'y2="{h}" stroke="#888" stroke-width="2"/>'
+            for i in range(1, num_panels)
+        )
+    else:
+        boundaries = "".join(
+            f'<line x1="0" y1="{i * panel_h * cell}" x2="{w}" '
+            f'y2="{i * panel_h * cell}" stroke="#888" stroke-width="2"/>'
+            for i in range(1, num_panels)
+        )
+    points = " ".join(f"{(x + 0.5) * cell:.1f},{(y + 0.5) * cell:.1f}" for x, y in pos)
+    (sx, sy), (ex, ey) = pos[0], pos[-1]
+
+    return f"""<svg viewBox="0 0 {w} {h}" role="img" aria-label="LED chain order for the current layout and serpentine settings"
+     style="width:100%;max-width:420px;height:auto;background:#000;border:1px solid #444;display:block">
+  {cells}{boundaries}
+  <polyline points="{points}" fill="none" stroke="#6cf" stroke-width="2"/>
+  <circle cx="{(sx + 0.5) * cell:.1f}" cy="{(sy + 0.5) * cell:.1f}" r="4" fill="#3f6"/>
+  <circle cx="{(ex + 0.5) * cell:.1f}" cy="{(ey + 0.5) * cell:.1f}" r="4" fill="#f63"/>
+</svg>"""
+
+
 class ControlHandler(http.server.BaseHTTPRequestHandler):
     state = None  # bound per-instance by make_control_server
+    panel_w = panel_h = num_panels = None
 
     def _send_html(self, body, code=200):
         body = body.encode()
@@ -274,11 +334,28 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         snap = self.state.snapshot()
+        diagram = render_wiring_svg(self.panel_w, self.panel_h, self.num_panels,
+                                     snap["layout"], snap["serpentine"],
+                                     snap["serpentine_axis"])
+
+        def opt(value, current):
+            return f'<option value="{value}" {"selected" if value == current else ""}>{value}</option>'
+
         html = f"""<!doctype html><meta charset="utf-8">
 <title>LED matrix control</title>
 <body style="font:16px monospace;background:#111;color:#eee;
              max-width:32rem;margin:2rem auto;padding:0 1rem">
 <h1 style="font-size:1.1rem">LED matrix control</h1>
+
+<div>{diagram}</div>
+<p style="color:#888;font-size:.85rem">
+  Blue line traces the actual LED chain order for the settings below --
+  green dot is where data comes in (DIN), orange is the end of the chain.
+  {self.num_panels} panel(s), {self.panel_w}x{self.panel_h} each (panel
+  count/size are set with --panel-width/--panel-height/--num-panels at
+  startup, not here).
+</p>
+
 <form method="POST">
   <label>Text<br>
     <input name="text" value="{escape(snap['text'])}" style="width:100%;padding:.4rem">
@@ -293,6 +370,25 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   <label>Brightness (0-255)
     <input type="number" name="brightness" min="0" max="255" value="{snap['brightness']}" style="width:6rem">
   </label><br><br>
+
+  <hr style="border-color:#333">
+  <label>Layout
+    <select name="layout">
+      {opt("horizontal", snap["layout"])}{opt("vertical", snap["layout"])}
+    </select>
+  </label>
+  &nbsp; <label><input type="checkbox" name="serpentine" {"checked" if snap['serpentine'] else ""}> Serpentine</label>
+  &nbsp; <label>Axis
+    <select name="serpentine_axis">
+      {opt("row", snap["serpentine_axis"])}{opt("column", snap["serpentine_axis"])}
+    </select>
+  </label>
+  &nbsp; <label>Rotate
+    <select name="rotate">
+      {opt("0", str(snap["rotate"]))}{opt("180", str(snap["rotate"]))}
+    </select>
+  </label><br><br>
+
   <button type="submit" style="padding:.5rem 1rem">Apply</button>
 </form>
 </body>"""
@@ -301,7 +397,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode())
-        updates = {"bold": "bold" in fields, "italic": "italic" in fields}
+        updates = {"bold": "bold" in fields, "italic": "italic" in fields,
+                   "serpentine": "serpentine" in fields}
         if "text" in fields:
             updates["text"] = fields["text"][0]
         if "color" in fields:
@@ -319,6 +416,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 updates["brightness"] = max(0, min(255, int(fields["brightness"][0])))
             except ValueError:
                 pass
+        if fields.get("layout", [""])[0] in ("horizontal", "vertical"):
+            updates["layout"] = fields["layout"][0]
+        if fields.get("serpentine_axis", [""])[0] in ("row", "column"):
+            updates["serpentine_axis"] = fields["serpentine_axis"][0]
+        if fields.get("rotate", [""])[0] in ("0", "180"):
+            updates["rotate"] = int(fields["rotate"][0])
         self.state.update(**updates)
         self.send_response(303)
         self.send_header("Location", "/")
@@ -342,8 +445,11 @@ def local_ip():
         s.close()
 
 
-def make_control_server(state, port):
-    handler = type("BoundControlHandler", (ControlHandler,), {"state": state})
+def make_control_server(state, port, panel_w, panel_h, num_panels):
+    handler = type("BoundControlHandler", (ControlHandler,), {
+        "state": state, "panel_w": panel_w, "panel_h": panel_h,
+        "num_panels": num_panels,
+    })
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -391,24 +497,28 @@ def parse_args():
 
 def main():
     args = parse_args()
-    idx_map, canvas_w, canvas_h = build_index_map(
-        args.panel_width, args.panel_height, args.num_panels,
-        args.layout, args.serpentine, args.serpentine_axis)
 
-    if args.media and args.text:
-        text_h, video_h = args.text_height, canvas_h - args.text_height
-    elif args.media:
-        text_h, video_h = 0, canvas_h
-    else:
-        text_h, video_h = canvas_h, 0
+    def compute_geometry(snap):
+        idx_map, canvas_w, canvas_h = build_index_map(
+            args.panel_width, args.panel_height, args.num_panels,
+            snap["layout"], snap["serpentine"], snap["serpentine_axis"])
+        if args.media and args.text:
+            text_h, video_h = args.text_height, canvas_h - args.text_height
+        elif args.media:
+            text_h, video_h = 0, canvas_h
+        else:
+            text_h, video_h = canvas_h, 0
+        return idx_map, canvas_w, canvas_h, text_h, video_h
+
+    state = State(args)
+    snap0 = state.snapshot()
+    idx_map, canvas_w, canvas_h, text_h, video_h = compute_geometry(snap0)
 
     if args.media and video_h <= 0:
         sys.exit("--text-height leaves no room for video -- "
                   "shrink it or use a taller panel chain")
 
     video = VideoSource(args.media, args.fit, canvas_w, video_h) if args.media else None
-
-    state = State(args)
 
     def rebuild_scroller(snap):
         if text_h <= 0 or not snap["text"]:
@@ -417,21 +527,18 @@ def main():
                           bold=snap["bold"], italic=snap["italic"])
         return TextScroller(snap["text"], font, text_h, snap["color"], canvas_w)
 
-    scroller = None
-    built_version = None
-    if text_h > 0:
-        snap0 = state.snapshot()
-        scroller = rebuild_scroller(snap0)
-        built_version = snap0["version"]
+    scroller = rebuild_scroller(snap0)
+    built_version = snap0["version"]
 
     server = None
     if args.web_port:
-        server = make_control_server(state, args.web_port)
+        server = make_control_server(state, args.web_port, args.panel_width,
+                                      args.panel_height, args.num_panels)
         print(f"control panel: http://{local_ip()}:{args.web_port}/")
         if text_h <= 0:
             print("note: no text region reserved (no --text at startup), so "
                   "the text/color/style fields won't do anything -- "
-                  "brightness still works")
+                  "brightness, layout and serpentine still work")
 
     num_pixels = args.panel_width * args.panel_height * args.num_panels
     strip = build_strip(args, num_pixels)
@@ -452,7 +559,17 @@ def main():
             last_t = t0
 
             snap = state.snapshot()
-            if text_h > 0 and snap["version"] != built_version:
+            if snap["version"] != built_version:
+                new_idx_map, new_cw, new_ch, new_text_h, new_video_h = compute_geometry(snap)
+                if args.media and new_video_h <= 0:
+                    print("layout/serpentine change rejected -- leaves no "
+                          "room for video at this panel size")
+                else:
+                    idx_map, canvas_w, canvas_h = new_idx_map, new_cw, new_ch
+                    text_h, video_h = new_text_h, new_video_h
+                    flat_idx = idx_map.reshape(-1)
+                    if video:
+                        video.out_w, video.out_h = canvas_w, video_h
                 scroller = rebuild_scroller(snap)
                 built_version = snap["version"]
 
@@ -463,7 +580,7 @@ def main():
                 scroll_offset += dt * snap["scroll_speed"]
                 frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)
 
-            if args.rotate == 180:
+            if snap["rotate"] == 180:
                 frame = np.rot90(frame, 2)
 
             strip.setBrightness(snap["brightness"])

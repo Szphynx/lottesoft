@@ -4,13 +4,18 @@
 Binds to the Tailscale IP only (falls back to localhost if Tailscale isn't
 up) -- reachable from your tailnet, not the open LAN or internet.
 """
+import base64
+import hmac
 import http.server
 import json
+import os
 import subprocess
 import time
 
 SERVICE = "thermal-matrix"
 PORT = 8787
+USER = os.environ.get("STATUS_USER", "")
+PASS = os.environ.get("STATUS_PASS", "")
 
 
 def run(*cmd):
@@ -37,6 +42,11 @@ def service_info():
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="thermal-status"')
+            self.end_headers()
+            return
         info = service_info()
         if self.path == "/status.json":
             self._send(json.dumps(info).encode(), "application/json")
@@ -50,6 +60,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <p>mode: {info['flags'] or '(not set)'}</p>
 </body>"""
         self._send(html.encode(), "text/html")
+
+    def _authorized(self):
+        if not USER:
+            return True
+        expected = "Basic " + base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+        return hmac.compare_digest(self.headers.get("Authorization", ""), expected)
 
     def _send(self, body, content_type):
         self.send_response(200)

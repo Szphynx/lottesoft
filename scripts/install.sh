@@ -10,8 +10,10 @@
 #   journalctl -u thermal-matrix -f         # live logs / --stats output
 #   sudo systemctl stop thermal-matrix      # stop it
 #
-# thermal-status runs a status page on :8787 (Tailscale IP only) --
-# see scripts/dashboard.html for a one-page links list across all Pis.
+# thermal-status runs a status page on :8787 (Tailscale IP only,
+# password-protected -- login is auto-generated in
+# /etc/default/thermal-status, `sudo cat` it to see it).
+# See scripts/dashboard.html for a one-page links list across all Pis.
 #
 # Flags (--colorwise, --rotate, calibration, ...) live in
 # /etc/default/thermal-matrix -- edit that file, then
@@ -59,6 +61,13 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+STATUS_ENV=/etc/default/thermal-status
+if [ ! -f "$STATUS_ENV" ]; then
+    GENERATED_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(9))')"
+    printf 'STATUS_USER=admin\nSTATUS_PASS=%s\n' "$GENERATED_PASS" > "$STATUS_ENV"
+    chmod 600 "$STATUS_ENV"
+fi
+
 cat > /etc/systemd/system/thermal-status.service <<EOF
 [Unit]
 Description=Thermal matrix status page
@@ -66,6 +75,7 @@ After=network.target tailscaled.service
 
 [Service]
 Type=simple
+EnvironmentFile=$STATUS_ENV
 ExecStart=/usr/bin/python3 $REPO_DIR/scripts/status_server.py
 Restart=on-failure
 RestartSec=2
@@ -87,3 +97,4 @@ echo
 echo "done. i2c0 needs a reboot to take effect: sudo reboot"
 echo "then: sudo systemctl enable --now thermal-matrix thermal-status"
 echo "status page: http://\$(tailscale ip -4):8787/  (add it to scripts/dashboard.html)"
+echo "status page login: cat $STATUS_ENV"

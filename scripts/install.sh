@@ -27,7 +27,7 @@ AUTHKEY="${1:-}"
 
 echo "== system packages =="
 apt update
-apt install -y python3-opencv python3-pip python3-numpy python3-pil git i2c-tools fonts-dejavu-core
+apt install -y python3-opencv python3-pip python3-numpy python3-pil git i2c-tools
 
 echo "== python packages =="
 pip3 install --break-system-packages adafruit-circuitpython-mlx90640

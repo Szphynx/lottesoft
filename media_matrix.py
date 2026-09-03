@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-Video + scrolling text on one or two HUB75 RGB LED matrices, on a Raspberry Pi 3.
+Video + scrolling text on a pair of daisy-chained WS2812B ("NeoPixel") LED
+matrix panels, on a Raspberry Pi 3.
 
-Wiring -- daisy chain (easiest option, recommended default):
-    Pi 40-pin header -> Panel 1 IN    (identical to a single-panel setup)
-    Panel 1 OUT       -> Panel 2 IN    (a second ribbon cable between the panels)
-    5V+GND to EACH panel's power input from your PSU -- the ribbon only
-    carries data/clock signals, never rely on it to pass power between panels.
-This is --chain-length 2 (the default below), and turns the pair into one
-wide canvas twice the width of a single panel. Refresh rate roughly halves
-versus a single panel since the same GPIO pins now shift out twice the
-pixels, but that's unnoticeable for video/text (unlike a fast camera feed).
+These are addressable-LED panels -- a single DIN/DOUT data line plus 5V/GND,
+not HUB75 -- so this is unrelated to thermal_matrix.py in this repo, which
+drives a HUB75 panel over a completely different wiring scheme and library.
 
-Wiring -- parallel chains (more wiring, keeps full refresh rate per panel):
-    Each panel gets its own ribbon back to the Pi (a Pi 3 can drive up to
-    3 independent chains this way), or use a breakout board (e.g. an
-    Adafruit RGB Matrix Bonnet/HAT) to route it cleanly by hand. Pass
-    --parallel 2 --chain-length 1 instead if you wire it this way.
+Wiring:
+    Pi GPIO18 (physical pin 12) -- through a 3.3V->5V level shifter
+    (74AHCT125 / 74HCT245; WS2812B wants ~5V logic and the Pi's 3.3V GPIO is
+    out of spec on its own -- works sometimes, flickers/misfires once wires
+    warm up or get longer) -- to Panel 1's DIN.
+
+    Panel 1 DOUT -> Panel 2 DIN (daisy chain, same idea as an LED strip).
+
+    Ground: tie together -- a Pi GND pin (e.g. physical pin 14), the 5V/60A
+    supply's GND/- terminal, and both panels' GND. Required as the signal
+    reference even though the panels are powered from the supply, not the Pi.
+
+    Power: from the external 5V/60A supply, not the Pi. Each panel has its
+    own separate 5V/GND solder pads (apart from the DIN/DOUT connectors) --
+    feed those straight from the supply's terminal block, one pair per
+    panel, so the thin DIN/DOUT wires only carry data. Fuse each panel's
+    power leads near the supply, sized to that panel's max current.
 
 Run with:
     sudo python3 media_matrix.py --media clip.mp4 --text "hello world"
@@ -24,24 +31,32 @@ Run with:
     sudo python3 media_matrix.py --media clip.mp4                # video only
 
 Useful flags:
+    --panel-width / --panel-height   pixels per panel -- check yours,
+                                       defaults (16x16) are a guess
+    --num-panels                       panels chained together (default 2)
+    --layout horizontal|vertical       how the chain forms one image: side
+                                       by side (wider) or stacked (taller).
+                                       Default horizontal.
+    --serpentine / --no-serpentine    most cheap matrix panels wire rows
+                                       back and forth rather than all
+                                       left-to-right; default on. If the
+                                       image comes out torn into diagonal
+                                       strips, try --no-serpentine.
+    --led-pin (BCM, default 18) / --led-freq-hz / --led-dma / --led-invert
+    --brightness N                      0-255, default 80 -- start low,
+                                       these draw a lot of current at 255
     --media PATH             video file to loop (anything OpenCV can decode)
     --text STRING             text to scroll; with --media it scrolls in a
                                 strip along the bottom, otherwise it fills
                                 the whole canvas
     --text-height N            rows reserved for the strip when --media is
-                                also given (default 8)
+                                also given (default 4)
     --font PATH                 .ttf/.otf font (default: DejaVu Sans Bold --
                                 `sudo apt install fonts-dejavu-core`)
     --font-size N
     --text-color R,G,B
     --scroll-speed N            pixels/second
     --fit letterbox|fill        how the video fills its area (default fill)
-    --panel-rows / --panel-cols default 32x64, set to your panels' size
-    --chain-length / --parallel see wiring notes above (default 2 / 1)
-    --brightness / --pwm-bits / --gpio-slowdown / --gpio-mapping
-    --no-hardware-pulse         workaround if snd_bcm2835 audio is still
-                                 loaded; causes more flicker, fix the module
-                                 instead (see scripts/install.sh)
     --stats
 """
 
@@ -53,7 +68,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from rgbmatrix import RGBMatrix, RGBMatrixOptions
+from rpi_ws281x import PixelStrip, Color
 
 
 DEFAULT_FONT_CANDIDATES = [
@@ -144,26 +159,39 @@ class TextScroller:
         return np.concatenate([self.loop[:, start:], self.loop[:, :wrap]], axis=1)
 
 
-def build_matrix(args):
-    opts = RGBMatrixOptions()
-    opts.rows = args.panel_rows
-    opts.cols = args.panel_cols
-    opts.chain_length = args.chain_length
-    opts.parallel = args.parallel
-    opts.hardware_mapping = args.gpio_mapping
-    opts.gpio_slowdown = args.gpio_slowdown
-    opts.pwm_bits = args.pwm_bits
-    opts.brightness = args.brightness
-    opts.pwm_lsb_nanoseconds = 130
-    opts.disable_hardware_pulsing = args.no_hardware_pulse
-    return RGBMatrix(options=opts)
+def build_index_map(panel_w, panel_h, num_panels, layout, serpentine):
+    """canvas (y, x) -> pixel index in the chain. One panel's local index is
+    row-major, snaking left-right-left if `serpentine` (how these boards are
+    normally wired); panels then extend the chain side by side or stacked."""
+    if layout == "horizontal":
+        canvas_w, canvas_h = panel_w * num_panels, panel_h
+    else:
+        canvas_w, canvas_h = panel_w, panel_h * num_panels
+
+    idx_map = np.zeros((canvas_h, canvas_w), dtype=np.int32)
+    for y in range(canvas_h):
+        for x in range(canvas_w):
+            if layout == "horizontal":
+                panel_idx, lx, ly = x // panel_w, x % panel_w, y
+            else:
+                panel_idx, lx, ly = y // panel_h, x, y % panel_h
+            row_x = (panel_w - 1 - lx) if (serpentine and ly % 2 == 1) else lx
+            idx_map[y, x] = panel_idx * panel_w * panel_h + ly * panel_w + row_x
+    return idx_map, canvas_w, canvas_h
+
+
+def build_strip(args, num_pixels):
+    strip = PixelStrip(num_pixels, args.led_pin, args.led_freq_hz, args.led_dma,
+                        args.led_invert, args.brightness, args.led_channel)
+    strip.begin()
+    return strip
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--media", help="video file to loop")
     p.add_argument("--text", help="text to scroll")
-    p.add_argument("--text-height", type=int, default=8,
+    p.add_argument("--text-height", type=int, default=4,
                    help="rows for the text strip when --media is also given")
     p.add_argument("--font")
     p.add_argument("--font-size", type=int)
@@ -171,16 +199,17 @@ def parse_args():
     p.add_argument("--scroll-speed", type=float, default=40.0,
                    help="pixels/second")
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
-    p.add_argument("--panel-rows", type=int, default=32)
-    p.add_argument("--panel-cols", type=int, default=64)
-    p.add_argument("--chain-length", type=int, default=2)
-    p.add_argument("--parallel", type=int, default=1)
-    p.add_argument("--brightness", type=int, default=60)
-    p.add_argument("--pwm-bits", type=int, default=8)
-    p.add_argument("--gpio-slowdown", type=int, default=4)
-    p.add_argument("--gpio-mapping", default="regular",
-                   help="'regular' for direct wiring, 'adafruit-hat' for a bonnet")
-    p.add_argument("--no-hardware-pulse", action="store_true")
+    p.add_argument("--panel-width", type=int, default=16)
+    p.add_argument("--panel-height", type=int, default=16)
+    p.add_argument("--num-panels", type=int, default=2)
+    p.add_argument("--layout", default="horizontal", choices=["horizontal", "vertical"])
+    p.add_argument("--serpentine", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--led-pin", type=int, default=18, help="BCM GPIO number")
+    p.add_argument("--led-freq-hz", type=int, default=800000)
+    p.add_argument("--led-dma", type=int, default=10)
+    p.add_argument("--led-invert", action="store_true")
+    p.add_argument("--led-channel", type=int, default=0)
+    p.add_argument("--brightness", type=int, default=80, help="0-255")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
@@ -191,8 +220,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    canvas_w = args.panel_cols * args.chain_length
-    canvas_h = args.panel_rows * args.parallel
+    idx_map, canvas_w, canvas_h = build_index_map(
+        args.panel_width, args.panel_height, args.num_panels,
+        args.layout, args.serpentine)
 
     if args.media and args.text:
         text_h, video_h = args.text_height, canvas_h - args.text_height
@@ -212,8 +242,9 @@ def main():
         color = tuple(int(c) for c in args.text_color.split(","))
         scroller = TextScroller(args.text, font, text_h, color, canvas_w)
 
-    matrix = build_matrix(args)
-    canvas = matrix.CreateFrameCanvas()
+    num_pixels = args.panel_width * args.panel_height * args.num_panels
+    strip = build_strip(args, num_pixels)
+    flat_idx = idx_map.reshape(-1)
 
     render_fps_cap = video.fps if video else 30.0
     frame_budget = 1.0 / render_fps_cap
@@ -236,8 +267,11 @@ def main():
                 scroll_offset += dt * args.scroll_speed
                 frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)
 
-            canvas.SetImage(Image.fromarray(frame, "RGB"))
-            canvas = matrix.SwapOnVSync(canvas)
+            flat_rgb = frame.reshape(-1, 3)
+            for pixel_pos, led_idx in enumerate(flat_idx):
+                r, g, b = flat_rgb[pixel_pos]
+                strip.setPixelColor(int(led_idx), Color(int(r), int(g), int(b)))
+            strip.show()
             rendered += 1
 
             if args.stats and t0 - last_report >= 1.0:
@@ -251,7 +285,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        matrix.Clear()
+        for i in range(num_pixels):
+            strip.setPixelColor(i, Color(0, 0, 0))
+        strip.show()
         print("\nstopped")
 
 

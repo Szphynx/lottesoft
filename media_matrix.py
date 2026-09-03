@@ -31,8 +31,8 @@ Run with:
     sudo python3 media_matrix.py --media clip.mp4                # video only
 
 Useful flags:
-    --panel-width / --panel-height   pixels per panel -- check yours,
-                                       defaults (16x16) are a guess
+    --panel-width / --panel-height   pixels per panel -- defaults (32x8)
+                                       match the WS2812ECO 8x32 panel
     --num-panels                       panels chained together (default 2)
     --layout horizontal|vertical       how the chain forms one image: side
                                        by side (wider) or stacked (taller).
@@ -199,8 +199,8 @@ def parse_args():
     p.add_argument("--scroll-speed", type=float, default=40.0,
                    help="pixels/second")
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
-    p.add_argument("--panel-width", type=int, default=16)
-    p.add_argument("--panel-height", type=int, default=16)
+    p.add_argument("--panel-width", type=int, default=32)
+    p.add_argument("--panel-height", type=int, default=8)
     p.add_argument("--num-panels", type=int, default=2)
     p.add_argument("--layout", default="horizontal", choices=["horizontal", "vertical"])
     p.add_argument("--serpentine", action=argparse.BooleanOptionalAction, default=True)

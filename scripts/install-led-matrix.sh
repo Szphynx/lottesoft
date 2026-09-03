@@ -7,7 +7,7 @@
 #
 # Then:
 #   sudo reboot                     # the audio-disable config needs this
-#   sudo python3 media_matrix.py --text "hello" --panel-width 16 --panel-height 16
+#   sudo python3 media_matrix.py --text "hello" --panel-width 32 --panel-height 8
 
 set -euo pipefail
 
@@ -28,4 +28,4 @@ echo "blacklist snd_bcm2835" > /etc/modprobe.d/blacklist-ws2812.conf
 
 echo
 echo "done. reboot for the audio change to take effect: sudo reboot"
-echo "then: sudo python3 $REPO_DIR/media_matrix.py --text \"hello\" --panel-width 16 --panel-height 16"
+echo "then: sudo python3 $REPO_DIR/media_matrix.py --text \"hello\" --panel-width 32 --panel-height 8"

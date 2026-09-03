@@ -202,6 +202,17 @@ def adjust_frame(frame, brightness_pct, contrast_pct):
     return np.clip(f, 0, 255).astype(np.uint8)
 
 
+def transform_frame(frame, rotation_deg, scale_pct, offset_x, offset_y):
+    """Rotate (about center) + scale + translate, in one affine warp."""
+    if rotation_deg == 0 and scale_pct == 100 and offset_x == 0 and offset_y == 0:
+        return frame
+    h, w = frame.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), rotation_deg, scale_pct / 100.0)
+    m[0, 2] += offset_x
+    m[1, 2] += offset_y
+    return cv2.warpAffine(frame, m, (w, h))
+
+
 class ClipSource:
     """One playlist item's decoder. `start`/`end` trim a video (seconds);
     with `loop` on, `end` instead means how long to keep looping before the
@@ -293,7 +304,8 @@ class QueuePlayer:
     def _find(queue, iid):
         return next((it for it in queue if it["id"] == iid), None)
 
-    def next_frame(self, dt, canvas_w, out_h, media_brightness=100.0, media_contrast=100.0):
+    def next_frame(self, dt, canvas_w, out_h, media_brightness=100.0, media_contrast=100.0,
+                   media_rotation=0.0, media_scale=100.0, media_pos_x=0, media_pos_y=0):
         queue = self.queue_getter()
         if not queue:
             self._reset()
@@ -335,6 +347,7 @@ class QueuePlayer:
             frame = frame_a
 
         frame = adjust_frame(frame, media_brightness, media_contrast)
+        frame = transform_frame(frame, media_rotation, media_scale, media_pos_x, media_pos_y)
 
         if done:
             if self.transitioning and self.next_clip:
@@ -533,6 +546,10 @@ class State:
         self.brightness = args.brightness
         self.media_brightness = args.media_brightness
         self.media_contrast = args.media_contrast
+        self.media_rotation = 0.0
+        self.media_scale = 100.0
+        self.media_pos_x = 0
+        self.media_pos_y = 0
         self.layout = args.layout
         self.panels = [
             {"serpentine": args.serpentine, "serpentine_axis": args.serpentine_axis,
@@ -559,7 +576,11 @@ class State:
                         text_glyph_rotate=self.text_glyph_rotate,
                         brightness=self.brightness,
                         media_brightness=self.media_brightness,
-                        media_contrast=self.media_contrast, layout=self.layout,
+                        media_contrast=self.media_contrast,
+                        media_rotation=self.media_rotation,
+                        media_scale=self.media_scale,
+                        media_pos_x=self.media_pos_x, media_pos_y=self.media_pos_y,
+                        layout=self.layout,
                         panels=[dict(p) for p in self.panels],
                         queue=[dict(q) for q in self.queue], version=self.version)
 
@@ -623,6 +644,26 @@ class State:
             if "media_contrast" in data:
                 try:
                     self.media_contrast = max(0.0, min(200.0, float(data["media_contrast"])))
+                except (TypeError, ValueError):
+                    pass
+            if "media_rotation" in data:
+                try:
+                    self.media_rotation = max(-180.0, min(180.0, float(data["media_rotation"])))
+                except (TypeError, ValueError):
+                    pass
+            if "media_scale" in data:
+                try:
+                    self.media_scale = max(10.0, min(400.0, float(data["media_scale"])))
+                except (TypeError, ValueError):
+                    pass
+            if "media_pos_x" in data:
+                try:
+                    self.media_pos_x = int(data["media_pos_x"])
+                except (TypeError, ValueError):
+                    pass
+            if "media_pos_y" in data:
+                try:
+                    self.media_pos_y = int(data["media_pos_y"])
                 except (TypeError, ValueError):
                     pass
             if "layout" in data and data["layout"] in ("horizontal", "vertical") \
@@ -1047,6 +1088,22 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <label>Contrast: <span id="mcval">{snap['media_contrast']:g}</span>%<br>
   <input type="range" min="0" max="200" value="{snap['media_contrast']:g}" style="width:100%"
     oninput="state.media_contrast=parseFloat(this.value); mcval.textContent=this.value; sendDebounced();">
+</label><br>
+<label>Rotation: <span id="mrval">{snap['media_rotation']:g}</span>&deg;<br>
+  <input type="range" min="-180" max="180" value="{snap['media_rotation']:g}" style="width:100%"
+    oninput="state.media_rotation=parseFloat(this.value); mrval.textContent=this.value; sendDebounced();">
+</label><br>
+<label>Scale: <span id="msval">{snap['media_scale']:g}</span>%<br>
+  <input type="range" min="10" max="400" value="{snap['media_scale']:g}" style="width:100%"
+    oninput="state.media_scale=parseFloat(this.value); msval.textContent=this.value; sendDebounced();">
+</label><br>
+<label>Position X: <span id="mxval">{snap['media_pos_x']}</span>px<br>
+  <input type="range" min="-{self.panel_w}" max="{self.panel_w}" value="{snap['media_pos_x']}" style="width:100%"
+    oninput="state.media_pos_x=parseInt(this.value); mxval.textContent=this.value; sendDebounced();">
+</label><br>
+<label>Position Y: <span id="myval">{snap['media_pos_y']}</span>px<br>
+  <input type="range" min="-{self.panel_h}" max="{self.panel_h}" value="{snap['media_pos_y']}" style="width:100%"
+    oninput="state.media_pos_y=parseInt(this.value); myval.textContent=this.value; sendDebounced();">
 </label><br><br>
 
 <hr style="border-color:#333">
@@ -1381,7 +1438,9 @@ def main():
             frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
             if video_h > 0:
                 frame[0:video_h] = player.next_frame(
-                    dt, canvas_w, video_h, snap["media_brightness"], snap["media_contrast"])
+                    dt, canvas_w, video_h, snap["media_brightness"], snap["media_contrast"],
+                    snap["media_rotation"], snap["media_scale"],
+                    snap["media_pos_x"], snap["media_pos_y"])
             if scroller:
                 sign = -1.0 if snap["text_direction"] in ("right", "down") else 1.0
                 scroll_offset += sign * dt * snap["scroll_speed"]

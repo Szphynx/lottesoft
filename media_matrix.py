@@ -127,6 +127,7 @@ import http.server
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -380,9 +381,11 @@ class TextScroller:
 
     -- and slide that column vertically. Vertical only has real room to
     work when out_h gives it space to travel, i.e. text-only mode, not a
-    thin strip alongside video."""
+    thin strip alongside video. `glyph_rotate` (0/90/270, up/down only)
+    additionally rotates each character in place -- e.g. 270 turns upright
+    "t" on its side facing right, for panels where that reads correctly."""
 
-    def __init__(self, text, font, out_w, out_h, color, direction="left"):
+    def __init__(self, text, font, out_w, out_h, color, direction="left", glyph_rotate=0):
         self.direction = direction
         self.out_w, self.out_h = out_w, out_h
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
@@ -401,12 +404,16 @@ class TextScroller:
             ascent, descent = font.getmetrics()
             line_h = max(1, ascent + descent)
             img = Image.new("RGB", (out_w, line_h * len(chars)), (0, 0, 0))
-            draw = ImageDraw.Draw(img)
             for i, ch in enumerate(chars):
                 bbox = dummy.textbbox((0, 0), ch, font=font)
-                cw = bbox[2] - bbox[0]
-                draw.text(((out_w - cw) // 2 - bbox[0], i * line_h - bbox[1]),
-                          ch, font=font, fill=color)
+                cw, chh = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+                glyph = Image.new("RGB", (cw, chh), (0, 0, 0))
+                ImageDraw.Draw(glyph).text((-bbox[0], -bbox[1]), ch, font=font, fill=color)
+                if glyph_rotate:
+                    glyph = glyph.rotate(glyph_rotate, expand=True)
+                gx = (out_w - glyph.width) // 2
+                gy = i * line_h + (line_h - glyph.height) // 2
+                img.paste(glyph, (gx, gy))
             gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
             self.loop = np.concatenate([np.array(img), gap], axis=0)
         self.axis_len = self.loop.shape[1 if direction in ("left", "right") else 0]
@@ -488,6 +495,7 @@ class State:
         self.italic = args.italic
         self.scroll_speed = args.scroll_speed
         self.text_direction = args.text_direction
+        self.text_glyph_rotate = args.text_glyph_rotate
         self.brightness = args.brightness
         self.media_brightness = args.media_brightness
         self.media_contrast = args.media_contrast
@@ -513,6 +521,7 @@ class State:
             return dict(text=self.text, color=self.color, bold=self.bold,
                         italic=self.italic, scroll_speed=self.scroll_speed,
                         text_direction=self.text_direction,
+                        text_glyph_rotate=self.text_glyph_rotate,
                         brightness=self.brightness,
                         media_brightness=self.media_brightness,
                         media_contrast=self.media_contrast, layout=self.layout,
@@ -561,6 +570,10 @@ class State:
             if "text_direction" in data and data["text_direction"] in \
                     ("left", "right", "up", "down") and data["text_direction"] != self.text_direction:
                 self.text_direction = data["text_direction"]
+                rebuild = True
+            if "text_glyph_rotate" in data and str(data["text_glyph_rotate"]) in ("0", "90", "270") \
+                    and int(data["text_glyph_rotate"]) != self.text_glyph_rotate:
+                self.text_glyph_rotate = int(data["text_glyph_rotate"])
                 rebuild = True
             if "brightness" in data:
                 self.brightness = max(0, min(255, int(data["brightness"])))
@@ -824,6 +837,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(self.state.to_wire(), indent=2)
             self._send(body, "application/json", extra_headers={
                 "Content-Disposition": 'attachment; filename="led-config.json"'})
+        elif path == "/autoupdate":
+            self._send(json.dumps({"enabled": autoupdate_status()}), "application/json")
         else:
             self.send_response(404)
             self.end_headers()
@@ -840,6 +855,16 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self._send("ok", "text/plain")
         elif self.path == "/upload":
             self._handle_upload()
+        elif self.path == "/autoupdate":
+            try:
+                data = self._read_json()
+            except (ValueError, TypeError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            ok = set_autoupdate(bool(data.get("enabled")))
+            self._send(json.dumps({"ok": ok, "enabled": autoupdate_status()}),
+                       "application/json")
         else:
             self.send_response(404)
             self.end_headers()
@@ -877,6 +902,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         panel_rows = "".join(_panel_row(i, p, self.panel_w, self.panel_h)
                              for i, p in enumerate(snap["panels"]))
         queue_rows = "".join(_queue_item_row(item) for item in snap["queue"])
+        au_status = autoupdate_status()
+        au_html = ('<span style="color:#888">not installed -- see '
+                   'scripts/install-led-matrix.sh</span>' if au_status is None else
+                   f'<label><input type="checkbox" {"checked" if au_status else ""} '
+                   f'onchange="toggleAutoupdate(this.checked)"> Auto-update from GitHub</label>')
 
         return f"""<!doctype html><meta charset="utf-8">
 <title>LED matrix control</title>
@@ -914,7 +944,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     {_opt("up", snap["text_direction"])}{_opt("down", snap["text_direction"])}
   </select>
 </label>
-<span style="color:#888;font-size:.8rem">(up/down need the full canvas -- text-only mode)</span>
+&nbsp; <label>Rotate letters
+  <select onchange="state.text_glyph_rotate=parseInt(this.value); send();">
+    {_opt("0", str(snap["text_glyph_rotate"]))}
+    {_opt("90", str(snap["text_glyph_rotate"]))}
+    {_opt("270", str(snap["text_glyph_rotate"]))}
+  </select>
+</label>
+<br><span style="color:#888;font-size:.8rem">(up/down need the full canvas -- text-only mode. "Rotate letters" only applies to up/down: 270 faces right, 90 faces left)</span>
 <br><br>
 <label>LED brightness: <span id="bval">{snap['brightness']}</span> / 255<br>
   <input type="range" min="0" max="255" value="{snap['brightness']}" style="width:100%"
@@ -964,6 +1001,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   Load config (JSON)
   <input type="file" accept="application/json" style="display:none" onchange="loadConfig(this)">
 </label>
+<p style="margin-top:.8rem">{au_html}</p>
+<p style="color:#888;font-size:.8rem">
+  When on, the Pi checks GitHub every couple minutes and pulls + restarts
+  automatically on new commits. Off just pauses the checks -- it doesn't
+  touch whatever code is already running.
+</p>
 
 <script>
   const state = {initial_json};
@@ -1001,6 +1044,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     if (item) item[key] = value;
     send();
   }}
+  function toggleAutoupdate(enabled) {{
+    fetch('/autoupdate', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                          body: JSON.stringify({{enabled}})}});
+  }}
   function removeItem(id) {{
     state.queue = state.queue.filter(q => q.id !== id);
     const row = document.getElementById('qi-' + id);
@@ -1023,6 +1070,30 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   }}
 </script>
 </body>"""
+
+
+AUTOUPDATE_TIMER = "media-matrix-autoupdate.timer"
+
+
+def autoupdate_status():
+    """True/False if the systemd timer's state is known, None if systemd
+    or the unit isn't there (e.g. testing off the Pi, or not installed yet)."""
+    try:
+        out = subprocess.run(["systemctl", "is-active", AUTOUPDATE_TIMER],
+                              capture_output=True, text=True, timeout=3)
+        return out.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def set_autoupdate(enabled):
+    """enable/disable --now so the choice also survives a reboot."""
+    try:
+        subprocess.run(["systemctl", "enable" if enabled else "disable", "--now",
+                         AUTOUPDATE_TIMER], capture_output=True, text=True, timeout=5)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def local_ip():
@@ -1068,6 +1139,11 @@ def parse_args():
                         "up/down: one upright character per row, slides "
                         "vertically -- needs real vertical room (text-only "
                         "mode) to look right")
+    p.add_argument("--text-glyph-rotate", type=int, default=0, choices=[0, 90, 270],
+                   help="up/down mode only: rotate each character in place "
+                        "-- 270 turns an upright letter to face right, 90 "
+                        "to face left. Try both, whichever reads correctly "
+                        "on your panel")
     p.add_argument("--rotate", type=int, default=0, choices=[0, 180],
                    help="per-panel startup seed: flip a panel mounted upside down")
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
@@ -1146,7 +1222,7 @@ def main():
         font = load_font(args.font, args.font_size or max(8, text_h - 2),
                           bold=snap["bold"], italic=snap["italic"])
         return TextScroller(snap["text"], font, canvas_w, text_h, snap["color"],
-                             snap["text_direction"])
+                             snap["text_direction"], snap["text_glyph_rotate"])
 
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]

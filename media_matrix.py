@@ -29,6 +29,19 @@ Run with:
     sudo python3 media_matrix.py --media clip.mp4 --text "hello world"
     sudo python3 media_matrix.py --text "SPECIALS TODAY: ..."   # text only
     sudo python3 media_matrix.py --media clip.mp4                # video only
+    sudo python3 media_matrix.py --web-port 8098                 # nothing yet
+                                                                   -- add
+                                                                   everything
+                                                                   from the
+                                                                   browser
+
+--media just seeds the first item of a playback queue -- add more images/
+videos from the control panel (upload button), reorder is chain order, each
+gets its own start/end trim (or hold duration for images/looping video) and
+a loop toggle, with a short crossfade between items. Remove one with the x
+on its row. Nothing uploaded yet and no --media means a black media area
+until you add something (or none reserved at all if there's no --text
+either -- see --layout etc. below for how that space is decided).
 
 Useful flags:
     --panel-width / --panel-height   pixels per panel -- defaults (32x8)
@@ -61,12 +74,22 @@ Useful flags:
     --led-pin (BCM, default 18) / --led-freq-hz / --led-dma / --led-invert
     --brightness N                      0-255, default 80 -- start low,
                                        these draw a lot of current at 255
-    --media PATH             video file to loop (anything OpenCV can decode)
-    --text STRING             text to scroll; with --media it scrolls in a
-                                strip along the bottom, otherwise it fills
-                                the whole canvas
-    --text-height N            rows reserved for the strip when --media is
-                                also given (default 4)
+    --media PATH             video file to seed the playback queue with
+                                (anything OpenCV can decode); more items --
+                                images too -- are added from the control
+                                panel while it runs
+    --text STRING             text to scroll; whenever the queue also has
+                                items it scrolls in a strip along the
+                                bottom, otherwise it fills the whole canvas.
+                                This split is live -- it reacts to the queue
+                                being empty or not, not just what you passed
+                                at startup.
+    --text-height N            rows reserved for the strip when the queue
+                                also has items (default 4)
+    --transition-s N            crossfade duration between queue items,
+                                seconds (default 0.6)
+    --upload-dir PATH            where uploaded media is saved (default:
+                                ./uploads next to this script)
     --font PATH                 .ttf/.otf font (default: DejaVu Sans --
                                 `sudo apt install fonts-dejavu-core`); bold/
                                 italic below only affect the default font,
@@ -87,11 +110,12 @@ Useful flags:
 import argparse
 import http.server
 import json
+import os
 import socket
 import sys
 import threading
 import time
-import urllib.parse
+import uuid
 from html import escape
 
 import cv2
@@ -126,46 +150,181 @@ def load_font(path, size, bold=False, italic=False):
               "(try: sudo apt install fonts-dejavu-core)")
 
 
-class VideoSource:
-    """Loops a video file, fitted to an out_w x out_h RGB frame."""
+def fit_frame(frame, fit, out_w, out_h):
+    """Resize an RGB frame to out_w x out_h, either cropping to fill or
+    letterboxing to fit the whole frame."""
+    h, w = frame.shape[:2]
+    if fit == "fill":
+        scale = max(out_w / w, out_h / h)
+    else:  # letterbox
+        scale = min(out_w / w, out_h / h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    def __init__(self, path, fit, out_w, out_h):
-        self.fit = fit
-        self.out_w, self.out_h = out_w, out_h
-        self.cap = cv2.VideoCapture(path)
+    if fit == "fill":
+        x0, y0 = (nw - out_w) // 2, (nh - out_h) // 2
+        return resized[y0:y0 + out_h, x0:x0 + out_w]
+
+    canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    x0, y0 = (out_w - nw) // 2, (out_h - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
+
+
+class ClipSource:
+    """One playlist item's decoder. `start`/`end` trim a video (seconds);
+    with `loop` on, `end` instead means how long to keep looping before the
+    item's turn ends. An image just holds a still and treats `end` as how
+    long to display it (default 5s)."""
+
+    def __init__(self, item):
+        self.kind = item["kind"]
+        self.start = max(0.0, item.get("start") or 0.0)
+        self.end = item.get("end")
+        self.loop = bool(item.get("loop"))
+        self.cap = None
+
+        if self.kind == "image":
+            self.still = np.array(Image.open(item["path"]).convert("RGB"))
+            self.total_s = self.end if self.end and self.end > 0 else 5.0
+            return
+
+        self.cap = cv2.VideoCapture(item["path"])
         if not self.cap.isOpened():
-            sys.exit(f"could not open video: {path}")
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.fps = fps if fps and fps > 1 else 24.0
+            raise RuntimeError(f"could not open {item['path']}")
+        if self.start:
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start * 1000)
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 0
+        frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        natural = (frame_count / fps) if fps > 0 and frame_count > 0 else None
+        if self.loop:
+            self.total_s = self.end if self.end and self.end > 0 else float("inf")
+        elif self.end and self.end > self.start:
+            self.total_s = self.end - self.start
+        elif natural:
+            self.total_s = max(0.1, natural - self.start)
+        else:
+            self.total_s = float("inf")  # unknown length -- rely on EOF instead
 
-    def next_frame(self):
+    def get_frame(self, fit, out_w, out_h):
+        """Returns (frame, eof) -- eof means playback ended and won't loop."""
+        if self.kind == "image":
+            return fit_frame(self.still, fit, out_w, out_h), False
+
         ok, frame = self.cap.read()
         if not ok:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if not self.loop:
+                return np.zeros((out_h, out_w, 3), dtype=np.uint8), True
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start * 1000)
             ok, frame = self.cap.read()
             if not ok:
-                sys.exit("failed to read a frame even after rewinding")
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return self._fit_frame(frame)
+                return np.zeros((out_h, out_w, 3), dtype=np.uint8), True
+        return fit_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), fit, out_w, out_h), False
 
-    def _fit_frame(self, frame):
-        h, w = frame.shape[:2]
-        out_w, out_h = self.out_w, self.out_h
-        if self.fit == "fill":
-            scale = max(out_w / w, out_h / h)
-        else:  # letterbox
-            scale = min(out_w / w, out_h / h)
-        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-        resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    def close(self):
+        if self.cap:
+            self.cap.release()
 
-        if self.fit == "fill":
-            x0, y0 = (nw - out_w) // 2, (nh - out_h) // 2
-            return resized[y0:y0 + out_h, x0:x0 + out_w]
 
-        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-        x0, y0 = (out_w - nw) // 2, (out_h - nh) // 2
-        canvas[y0:y0 + nh, x0:x0 + nw] = resized
-        return canvas
+class QueuePlayer:
+    """Plays a live-editable queue of images/videos in sequence, with a
+    short crossfade between items. `queue_getter()` returns a fresh copy of
+    the current queue (list of item dicts) each call -- items can be
+    added/removed/edited between frames without this needing to be rebuilt."""
+
+    def __init__(self, queue_getter, fit, transition_s=0.6):
+        self.queue_getter = queue_getter
+        self.fit = fit
+        self.transition_s = transition_s
+        self.current_id = None
+        self.current_clip = None
+        self.next_id = None
+        self.next_clip = None
+        self.transitioning = False
+        self.elapsed = 0.0
+
+    @staticmethod
+    def _open(item):
+        try:
+            return ClipSource(item)
+        except (RuntimeError, OSError) as e:
+            print(f"queue: failed to open {item.get('name', item.get('path'))}: {e}")
+            return None
+
+    @staticmethod
+    def _next_item(queue, after_id):
+        ids = [it["id"] for it in queue]
+        if after_id in ids:
+            return queue[(ids.index(after_id) + 1) % len(queue)]
+        return queue[0]
+
+    def next_frame(self, dt, canvas_w, out_h):
+        queue = self.queue_getter()
+        if not queue:
+            self._reset()
+            return np.zeros((out_h, canvas_w, 3), dtype=np.uint8)
+
+        if self.current_clip is None or self.current_id not in {it["id"] for it in queue}:
+            self._switch_to(queue[0])
+
+        self.elapsed += dt
+        remaining = self.current_clip.total_s - self.elapsed if self.current_clip else 0.0
+
+        if (not self.transitioning and self.current_clip and len(queue) > 1
+                and remaining <= self.transition_s):
+            nxt = self._next_item(queue, self.current_id)
+            if nxt["id"] != self.current_id:
+                self.next_clip = self._open(nxt)
+                self.next_id = nxt["id"]
+                self.transitioning = True
+
+        blank = np.zeros((out_h, canvas_w, 3), dtype=np.uint8)
+        frame_a, eof_a = self.current_clip.get_frame(self.fit, canvas_w, out_h) \
+            if self.current_clip else (blank, False)
+        done = eof_a or (self.current_clip and self.elapsed >= self.current_clip.total_s)
+
+        if self.transitioning and self.next_clip:
+            t = 1.0 - max(0.0, min(1.0, remaining / self.transition_s)) if self.transition_s else 1.0
+            t = t * t * (3 - 2 * t)  # smoothstep ease in/out
+            frame_b, _ = self.next_clip.get_frame(self.fit, canvas_w, out_h)
+            frame = (frame_a.astype(np.float32) * (1 - t)
+                     + frame_b.astype(np.float32) * t).astype(np.uint8)
+        else:
+            frame = frame_a
+
+        if done:
+            if self.transitioning and self.next_clip:
+                if self.current_clip:
+                    self.current_clip.close()
+                self.current_clip, self.current_id = self.next_clip, self.next_id
+                self.next_clip = self.next_id = None
+                self.transitioning = False
+                self.elapsed = 0.0
+            else:
+                self._switch_to(self._next_item(queue, self.current_id))
+
+        return frame
+
+    def _switch_to(self, item):
+        if self.current_clip:
+            self.current_clip.close()
+        if self.next_clip:
+            self.next_clip.close()
+        self.current_clip = self._open(item)
+        self.current_id = item["id"]
+        self.next_clip = self.next_id = None
+        self.transitioning = False
+        self.elapsed = 0.0
+
+    def _reset(self):
+        if self.current_clip:
+            self.current_clip.close()
+        if self.next_clip:
+            self.next_clip.close()
+        self.current_clip = self.next_clip = None
+        self.current_id = self.next_id = None
+        self.transitioning = False
+        self.elapsed = 0.0
 
 
 class TextScroller:
@@ -264,6 +423,13 @@ class State:
              "rotate": args.rotate}
             for _ in range(args.num_panels)
         ]
+        self.queue = []
+        if args.media:
+            self.queue.append({
+                "id": uuid.uuid4().hex[:8], "path": args.media, "kind": "video",
+                "name": os.path.basename(args.media),
+                "start": 0.0, "end": None, "loop": False,
+            })
         self.version = 0
 
     def snapshot(self):
@@ -272,7 +438,8 @@ class State:
             return dict(text=self.text, color=self.color, bold=self.bold,
                         italic=self.italic, scroll_speed=self.scroll_speed,
                         brightness=self.brightness, layout=self.layout,
-                        panels=[dict(p) for p in self.panels], version=self.version)
+                        panels=[dict(p) for p in self.panels],
+                        queue=[dict(q) for q in self.queue], version=self.version)
 
     def to_wire(self):
         """JSON-serializable snapshot for the web UI / a saved config file."""
@@ -280,6 +447,14 @@ class State:
         snap["color"] = rgb_to_hex(snap["color"])
         del snap["version"]
         return snap
+
+    def add_media(self, path, kind, name):
+        with self.lock:
+            self.queue.append({
+                "id": uuid.uuid4().hex[:8], "path": path, "kind": kind, "name": name,
+                "start": 0.0, "end": None, "loop": False,
+            })
+            self.version += 1
 
     def apply_wire(self, data):
         """Bulk-update from a JSON dict -- the web UI's live edits, or a
@@ -325,8 +500,79 @@ class State:
                     if new != cur:
                         self.panels[i] = new
                         rebuild = True
+            if "queue" in data and isinstance(data["queue"], list):
+                by_id = {item["id"]: item for item in self.queue}
+                new_queue = []
+                seen_ids = set()
+                for entry in data["queue"]:
+                    iid = entry.get("id")
+                    if iid not in by_id:
+                        continue  # only /upload creates new items, ignore fabricated ones
+                    seen_ids.add(iid)
+                    cur = by_id[iid]
+                    updated = dict(cur)
+                    if "start" in entry:
+                        try:
+                            updated["start"] = max(0.0, float(entry["start"]))
+                        except (TypeError, ValueError):
+                            pass
+                    if "end" in entry:
+                        try:
+                            updated["end"] = (None if entry["end"] in (None, "", "null")
+                                               else max(0.0, float(entry["end"])))
+                        except (TypeError, ValueError):
+                            pass
+                    if "loop" in entry:
+                        updated["loop"] = bool(entry["loop"])
+                    if updated != cur:
+                        rebuild = True
+                    new_queue.append(updated)
+                if seen_ids != set(by_id):
+                    rebuild = True  # an item was removed
+                self.queue = new_queue
             if rebuild:
                 self.version += 1
+
+
+KIND_BY_EXT = {
+    ".mp4": "video", ".mov": "video", ".avi": "video", ".mkv": "video",
+    ".webm": "video", ".gif": "video",
+    ".jpg": "image", ".jpeg": "image", ".png": "image", ".bmp": "image", ".webp": "image",
+}
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+
+def parse_multipart(content_type, body):
+    """Minimal multipart/form-data parser -- just enough to pull one
+    uploaded file out of a browser's FormData POST, no external deps."""
+    boundary = None
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.startswith("boundary="):
+            boundary = part[len("boundary="):].strip('"')
+    if not boundary:
+        raise ValueError("no multipart boundary")
+    marker = ("--" + boundary).encode()
+    fields, files = {}, {}
+    for chunk in body.split(marker)[1:-1]:
+        chunk = chunk.strip(b"\r\n")
+        if not chunk:
+            continue
+        header_blob, _, content = chunk.partition(b"\r\n\r\n")
+        name = filename = None
+        for line in header_blob.decode(errors="replace").split("\r\n"):
+            if line.lower().startswith("content-disposition:"):
+                for piece in line.split(";"):
+                    piece = piece.strip()
+                    if piece.startswith("name="):
+                        name = piece.split("=", 1)[1].strip('"')
+                    elif piece.startswith("filename="):
+                        filename = piece.split("=", 1)[1].strip('"')
+        if filename is not None:
+            files[name] = (filename, content)
+        elif name is not None:
+            fields[name] = content.decode(errors="replace")
+    return fields, files
 
 
 def render_wiring_svg(panel_w, panel_h, layout, panel_configs, cell=14):
@@ -394,9 +640,28 @@ def _panel_row(index, cfg):
 </div>"""
 
 
+def _queue_item_row(item):
+    end_val = "" if item["end"] is None else f"{item['end']:g}"
+    return f"""
+<div id="qi-{item['id']}" style="border:1px solid #333;border-radius:6px;padding:.6rem;margin-bottom:.5rem">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <strong>{escape(item['name'])}</strong> <span style="color:#888;font-size:.8rem">({item['kind']})</span>
+    <button onclick="removeItem('{item['id']}')"
+      style="background:none;border:none;color:#f66;font-size:1.1rem;cursor:pointer">&times;</button>
+  </div>
+  <label>Start (s) <input type="number" min="0" step="0.1" value="{item['start']:g}" style="width:5rem"
+    onchange="setItem('{item['id']}','start',parseFloat(this.value))"></label>
+  &nbsp; <label>End (s) <input type="number" min="0" step="0.1" value="{end_val}"
+    placeholder="natural end" style="width:6rem"
+    onchange="setItem('{item['id']}','end',this.value===''?null:parseFloat(this.value))"></label>
+  &nbsp; <label><input type="checkbox" {"checked" if item['loop'] else ""}
+    onchange="setItem('{item['id']}','loop',this.checked)"> Loop</label>
+</div>"""
+
+
 class ControlHandler(http.server.BaseHTTPRequestHandler):
     state = None  # bound per-instance by make_control_server
-    panel_w = panel_h = None
+    panel_w = panel_h = upload_dir = None
 
     def _send(self, body, content_type, code=200, extra_headers=None):
         body = body if isinstance(body, bytes) else body.encode()
@@ -431,18 +696,44 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path != "/update":
+        if self.path == "/update":
+            try:
+                data = self._read_json()
+            except (ValueError, TypeError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            self.state.apply_wire(data)
+            self._send("ok", "text/plain")
+        elif self.path == "/upload":
+            self._handle_upload()
+        else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_upload(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > MAX_UPLOAD_BYTES:
+            self._send("file too large or empty", "text/plain", code=413)
             return
+        body = self.rfile.read(length)
         try:
-            data = self._read_json()
-        except (ValueError, TypeError):
-            self.send_response(400)
-            self.end_headers()
+            _, files = parse_multipart(self.headers.get("Content-Type", ""), body)
+            filename, content = next(iter(files.values()))
+        except (ValueError, StopIteration):
+            self._send("bad upload", "text/plain", code=400)
             return
-        self.state.apply_wire(data)
-        self._send("ok", "text/plain")
+        ext = os.path.splitext(filename)[1].lower()
+        kind = KIND_BY_EXT.get(ext)
+        if kind is None:
+            self._send(f"unsupported file type: {ext or '(none)'}", "text/plain", code=400)
+            return
+        dest_name = f"{uuid.uuid4().hex[:8]}{ext}"
+        with open(os.path.join(self.upload_dir, dest_name), "wb") as f:
+            f.write(content)
+        self.state.add_media(os.path.join(self.upload_dir, dest_name), kind, filename)
+        new_item = self.state.snapshot()["queue"][-1]
+        self._send(_queue_item_row(new_item), "text/html; charset=utf-8")
 
     def log_message(self, *a):
         pass
@@ -451,6 +742,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         snap = self.state.snapshot()
         initial_json = json.dumps(self.state.to_wire()).replace("</", "<\\/")
         panel_rows = "".join(_panel_row(i, p) for i, p in enumerate(snap["panels"]))
+        queue_rows = "".join(_queue_item_row(item) for item in snap["queue"])
 
         return f"""<!doctype html><meta charset="utf-8">
 <title>LED matrix control</title>
@@ -497,6 +789,17 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 {panel_rows}
 
 <hr style="border-color:#333">
+<p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
+  Playback queue -- items play in order with a short crossfade between them.
+</p>
+<label style="display:inline-block;padding:.5rem 1rem;background:#234;
+              border-radius:4px;cursor:pointer;margin-bottom:.5rem">
+  + Add image/video
+  <input type="file" accept="video/*,image/*" style="display:none" onchange="uploadFile(this)">
+</label>
+<div id="queue">{queue_rows}</div>
+
+<hr style="border-color:#333">
 <a href="/config.json" download="led-config.json"
    style="display:inline-block;padding:.5rem 1rem;background:#234;color:#eee;
           text-decoration:none;border-radius:4px">Save config (JSON)</a>
@@ -532,6 +835,31 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                          body: text}}).then(() => location.reload());
     }});
   }}
+  function setItem(id, key, value) {{
+    const item = state.queue.find(q => q.id === id);
+    if (item) item[key] = value;
+    send();
+  }}
+  function removeItem(id) {{
+    state.queue = state.queue.filter(q => q.id !== id);
+    const row = document.getElementById('qi-' + id);
+    if (row) row.remove();
+    send();
+  }}
+  function uploadFile(input) {{
+    const file = input.files[0];
+    if (!file) return;
+    const body = new FormData();
+    body.append('file', file);
+    fetch('/upload', {{method: 'POST', body}}).then(r => {{
+      if (!r.ok) return r.text().then(msg => alert('Upload failed: ' + msg));
+      return r.text().then(html => {{
+        document.getElementById('queue').insertAdjacentHTML('beforeend', html);
+        return fetch('/config.json').then(r2 => r2.json()).then(s => {{ state.queue = s.queue; }});
+      }});
+    }});
+    input.value = '';
+  }}
 </script>
 </body>"""
 
@@ -550,9 +878,10 @@ def local_ip():
         s.close()
 
 
-def make_control_server(state, port, panel_w, panel_h):
+def make_control_server(state, port, panel_w, panel_h, upload_dir):
     handler = type("BoundControlHandler", (ControlHandler,), {
         "state": state, "panel_w": panel_w, "panel_h": panel_h,
+        "upload_dir": upload_dir,
     })
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -577,6 +906,11 @@ def parse_args():
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
     p.add_argument("--web-port", type=int, default=8098,
                    help="live control panel port, 0 to disable")
+    p.add_argument("--upload-dir", default=None,
+                   help="where uploaded media is saved (default: ./uploads "
+                        "next to this script)")
+    p.add_argument("--transition-s", type=float, default=0.6,
+                   help="crossfade duration between queue items, seconds")
     p.add_argument("--panel-width", type=int, default=32)
     p.add_argument("--panel-height", type=int, default=8)
     p.add_argument("--num-panels", type=int, default=2)
@@ -596,8 +930,10 @@ def parse_args():
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
-    if not args.media and not args.text:
-        sys.exit("nothing to show -- pass --media and/or --text")
+    if not args.media and not args.text and not args.web_port:
+        sys.exit("nothing to show and no way to add anything -- pass "
+                  "--media/--text, or leave --web-port enabled so you can "
+                  "upload/type content once it's running")
     return args
 
 
@@ -607,9 +943,11 @@ def main():
     def compute_geometry(snap):
         idx_map, canvas_w, canvas_h = build_index_map(
             args.panel_width, args.panel_height, snap["layout"], snap["panels"])
-        if args.media and args.text:
+        has_media = bool(snap["queue"])
+        has_text = bool(snap["text"])
+        if has_media and has_text:
             text_h, video_h = args.text_height, canvas_h - args.text_height
-        elif args.media:
+        elif has_media:
             text_h, video_h = 0, canvas_h
         else:
             text_h, video_h = canvas_h, 0
@@ -619,11 +957,15 @@ def main():
     snap0 = state.snapshot()
     idx_map, canvas_w, canvas_h, text_h, video_h = compute_geometry(snap0)
 
-    if args.media and video_h <= 0:
+    if snap0["queue"] and video_h <= 0:
         sys.exit("--text-height leaves no room for video -- "
                   "shrink it or use a taller panel chain")
 
-    video = VideoSource(args.media, args.fit, canvas_w, video_h) if args.media else None
+    upload_dir = args.upload_dir or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    player = QueuePlayer(lambda: state.snapshot()["queue"], args.fit, args.transition_s)
 
     def rebuild_scroller(snap):
         if text_h <= 0 or not snap["text"]:
@@ -638,19 +980,18 @@ def main():
     server = None
     if args.web_port:
         server = make_control_server(state, args.web_port, args.panel_width,
-                                      args.panel_height)
+                                      args.panel_height, upload_dir)
         print(f"control panel: http://{local_ip()}:{args.web_port}/")
         if text_h <= 0:
-            print("note: no text region reserved (no --text at startup), so "
-                  "the text/color/style fields won't do anything -- "
-                  "brightness, layout and per-panel wiring still work")
+            print("note: no text region reserved yet (no --text/no room), so "
+                  "the text/color/style fields won't show anything until "
+                  "there's a queue item alongside the text, or text alone")
 
     num_pixels = args.panel_width * args.panel_height * args.num_panels
     strip = build_strip(args, num_pixels)
     flat_idx = idx_map.reshape(-1)
 
-    render_fps_cap = video.fps if video else 30.0
-    frame_budget = 1.0 / render_fps_cap
+    frame_budget = 1.0 / 30.0
     scroll_offset = 0.0
     last_t = time.monotonic()
     rendered = 0
@@ -666,21 +1007,19 @@ def main():
             snap = state.snapshot()
             if snap["version"] != built_version:
                 new_idx_map, new_cw, new_ch, new_text_h, new_video_h = compute_geometry(snap)
-                if args.media and new_video_h <= 0:
+                if snap["queue"] and new_video_h <= 0:
                     print("layout/panel change rejected -- leaves no room "
-                          "for video at this panel size")
+                          "for the media queue at this panel size")
                 else:
                     idx_map, canvas_w, canvas_h = new_idx_map, new_cw, new_ch
                     text_h, video_h = new_text_h, new_video_h
                     flat_idx = idx_map.reshape(-1)
-                    if video:
-                        video.out_w, video.out_h = canvas_w, video_h
                 scroller = rebuild_scroller(snap)
                 built_version = snap["version"]
 
             frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-            if video:
-                frame[0:video_h] = video.next_frame()
+            if video_h > 0:
+                frame[0:video_h] = player.next_frame(dt, canvas_w, video_h)
             if scroller:
                 scroll_offset += dt * snap["scroll_speed"]
                 frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)

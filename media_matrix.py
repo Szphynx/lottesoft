@@ -98,6 +98,12 @@ Useful flags:
     --text-color R,G,B
     --bold / --italic
     --scroll-speed N            pixels/second
+    --text-direction left|right|up|down   which way the text travels.
+                                left/right always work (sideways marquee);
+                                up/down need real vertical room to look
+                                right -- best in text-only mode where text
+                                gets the full canvas height, cramped in a
+                                thin strip alongside video.
     --fit letterbox|fill        how the video fills its area (default fill)
     --web-port N                 live control panel at http://<pi>:N/ --
                                 edit everything above (except panel count/
@@ -115,6 +121,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from html import escape
 
@@ -328,31 +335,48 @@ class QueuePlayer:
 
 
 class TextScroller:
-    """Renders `text` once, then hands back a canvas_w-wide sliding window
-    of it (with a canvas-width gap before it repeats) for any pixel offset."""
+    """Renders `text` once, then hands back an out_w x out_h sliding window
+    of it (with a gap before it repeats) for any pixel offset. `direction`
+    picks the travel axis and way: left/right slide horizontally (the
+    classic marquee, entering from the trailing edge); up/down slide
+    vertically -- only meaningful when out_h gives it real room to travel,
+    i.e. text-only mode, not a thin strip alongside video."""
 
-    def __init__(self, text, font, height, color, canvas_w):
+    def __init__(self, text, font, out_w, out_h, color, direction="left"):
+        self.direction = direction
+        self.out_w, self.out_h = out_w, out_h
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         bbox = dummy.textbbox((0, 0), text, font=font)
-        strip_w = max(1, bbox[2] - bbox[0])
+        text_w = max(1, bbox[2] - bbox[0])
+        text_h = max(1, bbox[3] - bbox[1])
 
-        img = Image.new("RGB", (strip_w, height), (0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.text((-bbox[0], (height - (bbox[3] - bbox[1])) // 2 - bbox[1]),
-                   text, font=font, fill=color)
-
-        gap = np.zeros((height, canvas_w, 3), dtype=np.uint8)
-        self.loop = np.concatenate([np.array(img), gap], axis=1)
-        self.width = self.loop.shape[1]
-        self.canvas_w = canvas_w
+        if direction in ("left", "right"):
+            img = Image.new("RGB", (text_w, out_h), (0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.text((-bbox[0], (out_h - text_h) // 2 - bbox[1]), text, font=font, fill=color)
+            gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            self.loop = np.concatenate([np.array(img), gap], axis=1)
+        else:
+            img = Image.new("RGB", (out_w, text_h), (0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.text(((out_w - text_w) // 2 - bbox[0], -bbox[1]), text, font=font, fill=color)
+            gap = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            self.loop = np.concatenate([np.array(img), gap], axis=0)
+        self.axis_len = self.loop.shape[1 if direction in ("left", "right") else 0]
 
     def frame(self, offset_px):
-        start = int(offset_px) % self.width
-        end = start + self.canvas_w
-        if end <= self.width:
-            return self.loop[:, start:end]
-        wrap = end - self.width
-        return np.concatenate([self.loop[:, start:], self.loop[:, :wrap]], axis=1)
+        start = int(offset_px) % self.axis_len
+        if self.direction in ("left", "right"):
+            end = start + self.out_w
+            if end <= self.axis_len:
+                return self.loop[:, start:end]
+            wrap = end - self.axis_len
+            return np.concatenate([self.loop[:, start:], self.loop[:, :wrap]], axis=1)
+        end = start + self.out_h
+        if end <= self.axis_len:
+            return self.loop[start:end, :]
+        wrap = end - self.axis_len
+        return np.concatenate([self.loop[start:, :], self.loop[:wrap, :]], axis=0)
 
 
 def build_index_map(panel_w, panel_h, layout, panel_configs):
@@ -416,6 +440,7 @@ class State:
         self.bold = args.bold
         self.italic = args.italic
         self.scroll_speed = args.scroll_speed
+        self.text_direction = args.text_direction
         self.brightness = args.brightness
         self.layout = args.layout
         self.panels = [
@@ -437,6 +462,7 @@ class State:
         with self.lock:
             return dict(text=self.text, color=self.color, bold=self.bold,
                         italic=self.italic, scroll_speed=self.scroll_speed,
+                        text_direction=self.text_direction,
                         brightness=self.brightness, layout=self.layout,
                         panels=[dict(p) for p in self.panels],
                         queue=[dict(q) for q in self.queue], version=self.version)
@@ -479,6 +505,10 @@ class State:
                 rebuild = True
             if "scroll_speed" in data:
                 self.scroll_speed = float(data["scroll_speed"])
+            if "text_direction" in data and data["text_direction"] in \
+                    ("left", "right", "up", "down") and data["text_direction"] != self.text_direction:
+                self.text_direction = data["text_direction"]
+                rebuild = True
             if "brightness" in data:
                 self.brightness = max(0, min(255, int(data["brightness"])))
             if "layout" in data and data["layout"] in ("horizontal", "vertical") \
@@ -621,22 +651,34 @@ def _opt(value, current):
     return f'<option value="{value}" {"selected" if value == current else ""}>{value}</option>'
 
 
-def _panel_row(index, cfg):
+def render_panel_svg(panel_w, panel_h, cfg, cell=10):
+    """One panel's own local wiring diagram -- same chain-order tracer as
+    render_wiring_svg, just for a single panel in isolation so it can sit
+    next to that panel's own controls."""
+    return render_wiring_svg(panel_w, panel_h, "horizontal", [cfg], cell=cell)
+
+
+def _panel_row(index, cfg, panel_w, panel_h):
+    diagram = render_panel_svg(panel_w, panel_h, cfg)
     return f"""
-<div style="border:1px solid #333;border-radius:6px;padding:.6rem;margin-bottom:.5rem">
-  <strong>Panel {index + 1}</strong><br>
-  <label><input type="checkbox" {"checked" if cfg['serpentine'] else ""}
-    onchange="state.panels[{index}].serpentine=this.checked; send();"> Serpentine</label>
-  &nbsp; <label>Axis
-    <select onchange="state.panels[{index}].serpentine_axis=this.value; send();">
-      {_opt("row", cfg["serpentine_axis"])}{_opt("column", cfg["serpentine_axis"])}
-    </select>
-  </label>
-  &nbsp; <label>Rotate
-    <select onchange="state.panels[{index}].rotate=parseInt(this.value); send();">
-      {_opt("0", str(cfg["rotate"]))}{_opt("180", str(cfg["rotate"]))}
-    </select>
-  </label>
+<div style="border:1px solid #333;border-radius:6px;padding:.6rem;margin-bottom:.5rem;
+            display:flex;gap:.8rem;align-items:flex-start">
+  <div id="panel-diagram-{index}" style="flex:0 0 auto;width:140px">{diagram}</div>
+  <div>
+    <strong>Panel {index + 1}</strong><br>
+    <label><input type="checkbox" {"checked" if cfg['serpentine'] else ""}
+      onchange="state.panels[{index}].serpentine=this.checked; send();"> Serpentine</label>
+    &nbsp; <label>Axis
+      <select onchange="state.panels[{index}].serpentine_axis=this.value; send();">
+        {_opt("row", cfg["serpentine_axis"])}{_opt("column", cfg["serpentine_axis"])}
+      </select>
+    </label>
+    &nbsp; <label>Rotate
+      <select onchange="state.panels[{index}].rotate=parseInt(this.value); send();">
+        {_opt("0", str(cfg["rotate"]))}{_opt("180", str(cfg["rotate"]))}
+      </select>
+    </label>
+  </div>
 </div>"""
 
 
@@ -683,11 +725,22 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         return render_wiring_svg(self.panel_w, self.panel_h, snap["layout"], snap["panels"])
 
     def do_GET(self):
-        if self.path in ("/", ""):
+        path, _, query = self.path.partition("?")
+        if path in ("/", ""):
             self._send(self._render_page(), "text/html; charset=utf-8")
-        elif self.path == "/diagram":
+        elif path == "/diagram":
             self._send(self._diagram_html(), "text/html; charset=utf-8")
-        elif self.path == "/config.json":
+        elif path == "/panel-diagram":
+            try:
+                i = int(urllib.parse.parse_qs(query).get("i", ["-1"])[0])
+                cfg = self.state.snapshot()["panels"][i]
+            except (ValueError, IndexError):
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._send(render_panel_svg(self.panel_w, self.panel_h, cfg),
+                       "text/html; charset=utf-8")
+        elif path == "/config.json":
             body = json.dumps(self.state.to_wire(), indent=2)
             self._send(body, "application/json", extra_headers={
                 "Content-Disposition": 'attachment; filename="led-config.json"'})
@@ -741,7 +794,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     def _render_page(self):
         snap = self.state.snapshot()
         initial_json = json.dumps(self.state.to_wire()).replace("</", "<\\/")
-        panel_rows = "".join(_panel_row(i, p) for i, p in enumerate(snap["panels"]))
+        panel_rows = "".join(_panel_row(i, p, self.panel_w, self.panel_h)
+                             for i, p in enumerate(snap["panels"]))
         queue_rows = "".join(_queue_item_row(item) for item in snap["queue"])
 
         return f"""<!doctype html><meta charset="utf-8">
@@ -774,6 +828,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   <input type="range" min="0" max="200" value="{snap['scroll_speed']:g}" style="width:100%"
     oninput="state.scroll_speed=parseFloat(this.value); sval.textContent=this.value; sendDebounced();">
 </label><br>
+<label>Direction
+  <select onchange="state.text_direction=this.value; send();">
+    {_opt("left", snap["text_direction"])}{_opt("right", snap["text_direction"])}
+    {_opt("up", snap["text_direction"])}{_opt("down", snap["text_direction"])}
+  </select>
+</label>
+<span style="color:#888;font-size:.8rem">(up/down need the full canvas -- text-only mode)</span>
+<br><br>
 <label>Brightness: <span id="bval">{snap['brightness']}</span> / 255<br>
   <input type="range" min="0" max="255" value="{snap['brightness']}" style="width:100%"
     oninput="state.brightness=parseInt(this.value); bval.textContent=this.value; sendDebounced();">
@@ -815,15 +877,21 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   let debounceTimer;
   function send() {{
     fetch('/update', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
-                       body: JSON.stringify(state)}}).then(refreshDiagram);
+                       body: JSON.stringify(state)}}).then(refreshDiagrams);
   }}
   function sendDebounced() {{
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(send, 200);
   }}
-  function refreshDiagram() {{
+  function refreshDiagrams() {{
     fetch('/diagram').then(r => r.text()).then(html => {{
       document.getElementById('diagram').innerHTML = html;
+    }});
+    state.panels.forEach((p, i) => {{
+      fetch('/panel-diagram?i=' + i).then(r => r.text()).then(html => {{
+        const el = document.getElementById('panel-diagram-' + i);
+        if (el) el.innerHTML = html;
+      }});
     }});
   }}
   function loadConfig(input) {{
@@ -901,6 +969,11 @@ def parse_args():
     p.add_argument("--italic", action="store_true")
     p.add_argument("--scroll-speed", type=float, default=40.0,
                    help="pixels/second")
+    p.add_argument("--text-direction", default="left",
+                   choices=["left", "right", "up", "down"],
+                   help="which way the text travels -- left/right scroll "
+                        "sideways (the default marquee); up/down need real "
+                        "vertical room, i.e. text-only mode, to look right")
     p.add_argument("--rotate", type=int, default=0, choices=[0, 180],
                    help="per-panel startup seed: flip a panel mounted upside down")
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
@@ -972,7 +1045,8 @@ def main():
             return None
         font = load_font(args.font, args.font_size or max(8, text_h - 2),
                           bold=snap["bold"], italic=snap["italic"])
-        return TextScroller(snap["text"], font, text_h, snap["color"], canvas_w)
+        return TextScroller(snap["text"], font, canvas_w, text_h, snap["color"],
+                             snap["text_direction"])
 
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]
@@ -1021,7 +1095,8 @@ def main():
             if video_h > 0:
                 frame[0:video_h] = player.next_frame(dt, canvas_w, video_h)
             if scroller:
-                scroll_offset += dt * snap["scroll_speed"]
+                sign = -1.0 if snap["text_direction"] in ("right", "down") else 1.0
+                scroll_offset += sign * dt * snap["scroll_speed"]
                 frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)
 
             strip.setBrightness(snap["brightness"])

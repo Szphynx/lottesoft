@@ -533,8 +533,9 @@ class State:
     rebuild -- text bitmap, or the whole geometry pipeline (index map,
     canvas size, video/text split) for layout/per-panel changes."""
 
-    def __init__(self, args):
+    def __init__(self, args, state_file=None):
         self.lock = threading.Lock()
+        self.state_file = state_file
         self.text = args.text or ""
         self.color = tuple(int(c) for c in args.text_color.split(","))
         self.bold = args.bold
@@ -565,6 +566,37 @@ class State:
                 "brightness": 100.0, "contrast": 100.0,
             })
         self.version = 0
+        if state_file and os.path.isfile(state_file):
+            self._load(state_file)
+
+    def _load(self, path):
+        """Restore a previously-saved config (see `save()`) at startup --
+        last text/settings plus which media was queued and its per-item
+        trim/loop/brightness, so the display resumes exactly where it left
+        off on boot with no web UI interaction needed."""
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        queue = data.pop("queue", None)
+        self.apply_wire(data)
+        if isinstance(queue, list):
+            self.queue = [q for q in queue if os.path.isfile(q.get("path", ""))]
+
+    def save(self):
+        """Persist the current config so `_load` can restore it next boot.
+        Called after every live edit (web UI update/upload), not on a
+        timer -- the file is always just the last applied change."""
+        if not self.state_file:
+            return
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.to_wire(), f, indent=2)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
 
     def snapshot(self):
         """For the render loop -- color stays an RGB tuple."""
@@ -959,6 +991,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self.state.apply_wire(data)
+            self.state.save()
             self._send("ok", "text/plain")
         elif self.path == "/upload":
             self._handle_upload()
@@ -997,6 +1030,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         with open(os.path.join(self.upload_dir, dest_name), "wb") as f:
             f.write(content)
         self.state.add_media(os.path.join(self.upload_dir, dest_name), kind, filename)
+        self.state.save()
         new_item = self.state.snapshot()["queue"][-1]
         self._send(_queue_item_row(new_item), "text/html; charset=utf-8")
 
@@ -1318,6 +1352,12 @@ def parse_args():
     p.add_argument("--upload-dir", default=None,
                    help="where uploaded media is saved (default: ./uploads "
                         "next to this script)")
+    p.add_argument("--state-file", default=None,
+                   help="where the live config (text/queue/settings) is "
+                        "saved after every web UI change, and reloaded "
+                        "from on startup so playback resumes automatically "
+                        "on boot (default: ./state.json next to this "
+                        "script). Pass an empty string to disable.")
     p.add_argument("--transition-s", type=float, default=0.6,
                    help="crossfade duration between queue items, seconds")
     p.add_argument("--panel-width", type=int, default=32)
@@ -1368,7 +1408,11 @@ def main():
             text_h, video_h = canvas_h, 0
         return idx_map, canvas_w, canvas_h, text_h, video_h
 
-    state = State(args)
+    state_file = args.state_file if args.state_file is not None else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "state.json")
+    state = State(args, state_file or None)
+    if state_file and os.path.isfile(state_file):
+        print(f"resumed saved config from {state_file}")
     snap0 = state.snapshot()
     idx_map, canvas_w, canvas_h, text_h, video_h = compute_geometry(snap0)
 

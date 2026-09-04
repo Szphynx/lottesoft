@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Pull the newest video from a public Google Drive folder and hot-swap the
-# player if it changed. Run periodically by video-fracture-fetch.timer.
+# Pull a video from a public Google Drive folder and hot-swap the player
+# if it changed. Run periodically by video-fracture-fetch.timer.
 #
-# Uses the Drive API (with an API key, no OAuth) to list the folder and
-# find the most recently modified video -- this needs real Drive metadata,
-# which a plain download link can't give us. The file itself is still
-# fetched via the public uc?id= link, same as a single shared file.
+# No API key: public folders don't expose modified-time without one, so
+# "latest" here means highest filename sorted alphabetically. Name files
+# so the one you want last sorts last (01.mp4/02.mp4, or date-prefixed
+# names both work).
 #
 # Behavior:
-#  - folder's newest video differs from what's playing -> download it,
-#    install it, tell the running player to switch (no restart, no black
-#    screen)
-#  - listing/download fails (no network, folder not shared, API key bad)
-#    -> leave whatever is currently playing alone
+#  - folder's last-by-name video differs from what's playing -> download
+#    it, install it, tell the running player to switch (no restart, no
+#    black screen)
+#  - listing/download fails (no network, folder not shared) -> leave
+#    whatever is currently playing alone
 #  - folder has no video in it, or nothing ever downloaded -> log/mark
 #    that clearly
 
@@ -21,7 +21,6 @@ set -uo pipefail
 FRACTURE_DIR="/var/lib/video-fracture"
 CURRENT="$FRACTURE_DIR/current.mp4"
 TMP="$FRACTURE_DIR/.download.tmp"
-LISTING="$FRACTURE_DIR/.folder-list.json"
 SOURCE_STATE="$FRACTURE_DIR/source-id"
 STATUS="$FRACTURE_DIR/status"
 MPV_SOCKET="/tmp/mpv-fracture.sock"
@@ -33,11 +32,9 @@ status() {
 }
 
 FOLDER_ID="${VIDEO_DRIVE_FOLDER_ID:-}"
-API_KEY="${GOOGLE_API_KEY:-}"
 
-if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "REPLACE_WITH_FOLDER_ID" ] \
-    || [ -z "$API_KEY" ] || [ "$API_KEY" = "REPLACE_WITH_API_KEY" ]; then
-    status "not configured -- set VIDEO_DRIVE_FOLDER_ID and GOOGLE_API_KEY in /etc/default/video-fracture"
+if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "REPLACE_WITH_FOLDER_ID" ]; then
+    status "not configured -- set VIDEO_DRIVE_FOLDER_ID in /etc/default/video-fracture"
     exit 0
 fi
 
@@ -46,44 +43,36 @@ if ! command -v gdown >/dev/null; then
     exit 1
 fi
 
-Q="'${FOLDER_ID}' in parents and mimeType contains 'video/' and trashed = false"
-if ! curl -sS --fail --get "https://www.googleapis.com/drive/v3/files" \
-    --data-urlencode "q=${Q}" \
-    --data-urlencode "orderBy=modifiedTime desc" \
-    --data-urlencode "fields=files(id,name,modifiedTime)" \
-    --data-urlencode "pageSize=1" \
-    --data-urlencode "key=${API_KEY}" \
-    -o "$LISTING"; then
-    if [ -s "$CURRENT" ]; then
-        status "$(date -Is): couldn't list Drive folder (bad API key / folder not shared / no network), still playing previously cached video"
-    else
-        status "$(date -Is): couldn't list Drive folder (bad API key / folder not shared / no network) -- no video available yet"
-    fi
-    exit 0
-fi
+FILE_INFO=$(python3 - "$FOLDER_ID" <<'PYEOF'
+import sys
+import gdown
 
-FILE_INFO=$(python3 - "$LISTING" <<'PYEOF'
-import json, sys
-with open(sys.argv[1]) as fh:
-    data = json.load(fh)
-files = data.get("files") or []
-if files:
-    f = files[0]
-    print(f["id"] + "\t" + f.get("modifiedTime", "") + "\t" + f.get("name", ""))
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
+
+try:
+    files = gdown.download_folder(id=sys.argv[1], skip_download=True, quiet=True)
+except Exception:
+    files = None
+
+videos = [f for f in (files or []) if f.path.lower().endswith(VIDEO_EXTS)]
+if videos:
+    videos.sort(key=lambda f: f.path)
+    newest = videos[-1]
+    print(newest.id + "\t" + newest.path)
 PYEOF
 )
 
 if [ -z "$FILE_INFO" ]; then
     if [ -s "$CURRENT" ]; then
-        status "$(date -Is): no video in the Drive folder anymore, still playing previously cached video"
+        status "$(date -Is): couldn't find a video in the Drive folder (not shared? no network?), still playing previously cached video"
     else
-        status "$(date -Is): no video in the Drive folder -- no video available yet"
+        status "$(date -Is): couldn't find a video in the Drive folder (not shared? no network?) -- no video available yet"
     fi
     exit 0
 fi
 
-IFS=$'\t' read -r FILE_ID FILE_MTIME FILE_NAME <<< "$FILE_INFO"
-SOURCE_KEY="${FILE_ID}	${FILE_MTIME}"
+IFS=$'\t' read -r FILE_ID FILE_NAME <<< "$FILE_INFO"
+SOURCE_KEY="${FILE_ID}	${FILE_NAME}"
 
 if [ -s "$CURRENT" ] && [ -f "$SOURCE_STATE" ] && [ "$(cat "$SOURCE_STATE")" = "$SOURCE_KEY" ]; then
     status "$(date -Is): checked, no change ($FILE_NAME)"

@@ -56,7 +56,12 @@ while :; do
     if [ "$TFT_RED_TINT" != "0" ]; then
         RR=$(awk -v t="$TFT_RED_TINT" 'BEGIN{printf "%.3f", 1+t}')
         GB=$(awk -v t="$TFT_RED_TINT" 'BEGIN{v=1-t; if (v<0) v=0; printf "%.3f", v}')
-        VF="${VF},colorchannelmixer=rr=${RR}:gg=${GB}:bb=${GB}"
+        # This panel shows red/blue swapped (a boosted R output comes out
+        # blue on screen, confirmed on fracture5's actual hardware) -- so
+        # the tint is applied cross-wired here (send the boost out on the
+        # B channel, the cut on R) rather than fixing it via the boot
+        # overlay's own bgr option.
+        VF="${VF},colorchannelmixer=rr=0:rb=${GB}:gg=${GB}:br=${RR}:bb=0"
     fi
     VF="${VF},format=rgb565le"
 

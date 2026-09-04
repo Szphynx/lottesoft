@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot setup for a video-loop kiosk Pi (fracture5): fullscreen
-# looping video player, sourced from a public Google Drive file, plus
-# Tailscale for remote access.
+# looping video player, sourced from a public Google Drive folder (always
+# plays the newest video in it), plus Tailscale for remote access.
 #
 # Requires Raspberry Pi OS with Desktop already booting to a screen.
 #
@@ -9,15 +9,20 @@
 #   sudo bash scripts/video-fracture-install.sh [tailscale-authkey]
 #
 # Then:
-#   1. Edit /etc/default/video-fracture and set VIDEO_DRIVE_FILE_ID to the
-#      Drive file's ID (from its share link:
-#      https://drive.google.com/file/d/<FILE_ID>/view -- copy <FILE_ID>).
-#      The file must be shared as "Anyone with the link".
+#   1. Edit /etc/default/video-fracture and set:
+#      - VIDEO_DRIVE_FOLDER_ID: from the folder's share link
+#        (https://drive.google.com/drive/folders/<FOLDER_ID> -- copy
+#        <FOLDER_ID>). The folder must be shared as "Anyone with the link".
+#      - GOOGLE_API_KEY: an API key with the Drive API enabled, from
+#        https://console.cloud.google.com/apis/credentials (no OAuth
+#        needed -- an API key can list/read publicly-shared files).
 #   2. sudo systemctl start video-fracture-fetch.service   # fetch it now
 #   3. reboot (or log out/in) so the player autostarts:  sudo reboot
 #
-# Afterwards, swapping the video in Drive is picked up automatically
-# within 15 minutes (see video-fracture-fetch.timer) -- no action needed.
+# Afterwards, dropping a new video into the folder (or removing the old
+# one) is picked up automatically within 15 minutes (see
+# video-fracture-fetch.timer) -- it always plays whichever video in the
+# folder has the newest Drive modified time. No action needed.
 #
 # Useful commands:
 #   cat /var/lib/video-fracture/status          # last fetch result
@@ -43,10 +48,14 @@ echo "== config =="
 CONFIG_FILE=/etc/default/video-fracture
 if [ ! -f "$CONFIG_FILE" ]; then
     cat > "$CONFIG_FILE" <<'EOF'
-# Google Drive file ID for the fracture video.
-# From the share link: https://drive.google.com/file/d/<FILE_ID>/view
-# Copy just the <FILE_ID> part below. Must be shared as "Anyone with the link".
-VIDEO_DRIVE_FILE_ID=REPLACE_WITH_FILE_ID
+# Google Drive folder to play the newest video from.
+# From the share link: https://drive.google.com/drive/folders/<FOLDER_ID>
+# Copy just the <FOLDER_ID> part below. Must be shared as "Anyone with the link".
+VIDEO_DRIVE_FOLDER_ID=REPLACE_WITH_FOLDER_ID
+
+# API key with the Drive API enabled: https://console.cloud.google.com/apis/credentials
+# No OAuth needed -- an API key alone can list/read publicly-shared files.
+GOOGLE_API_KEY=REPLACE_WITH_API_KEY
 EOF
 fi
 
@@ -99,7 +108,7 @@ fi
 
 echo
 echo "done. now:"
-echo "  1. edit $CONFIG_FILE and set VIDEO_DRIVE_FILE_ID"
+echo "  1. edit $CONFIG_FILE and set VIDEO_DRIVE_FOLDER_ID and GOOGLE_API_KEY"
 echo "  2. sudo systemctl start video-fracture-fetch   # fetch it now"
 echo "  3. sudo reboot                              # player autostarts on desktop login"
 echo

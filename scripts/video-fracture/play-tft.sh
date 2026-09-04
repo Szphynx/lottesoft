@@ -12,8 +12,14 @@
 # TFT_FPS throttles how often a frame is written to the panel. This panel
 # has no vsync/double-buffering, so writing faster than the SPI bus can
 # push a full frame shows up as a torn/doubled image -- lower TFT_FPS
-# trades motion smoothness for fewer visible tears. Also set via
-# /etc/default/video-fracture-tft.
+# trades motion smoothness for fewer visible tears (tearing persisted even
+# down to 3fps on fracture5's actual wiring, so it's treated here as an
+# inherent limit of this panel/driver, not something to fully chase away).
+# Also set via /etc/default/video-fracture-tft.
+#
+# TFT_RED_TINT (0-1, default 0) pushes the picture toward a strong red
+# cast -- boosts red and pulls down green/blue by the same amount across
+# shadows/mid/highlights. 1 is a heavy red tint.
 
 set -uo pipefail
 
@@ -22,6 +28,7 @@ CURRENT="$FRACTURE_DIR/current.mp4"
 FB_DEVICE="${TFT_FB_DEVICE:-/dev/fb1}"
 TFT_FPS="${TFT_FPS:-12}"
 TFT_ROTATE_DEG="${TFT_ROTATE_DEG:-0}"
+TFT_RED_TINT="${TFT_RED_TINT:-0}"
 
 # Wait for both a video (fetch-video.sh) and the TFT driver to be ready.
 while [ ! -s "$CURRENT" ] || [ ! -e "$FB_DEVICE" ]; do
@@ -44,6 +51,10 @@ while :; do
 
     VF="fps=${TFT_FPS},scale=${SCALE_W}:${SCALE_H}:force_original_aspect_ratio=decrease,pad=${SCALE_W}:${SCALE_H}:(ow-iw)/2:(oh-ih)/2"
     [ -n "$ROT_FILTER" ] && VF="${VF},${ROT_FILTER}"
+    if [ "$TFT_RED_TINT" != "0" ]; then
+        NEG_TINT="-${TFT_RED_TINT}"
+        VF="${VF},colorbalance=rs=${TFT_RED_TINT}:rm=${TFT_RED_TINT}:rh=${TFT_RED_TINT}:gs=${NEG_TINT}:gm=${NEG_TINT}:gh=${NEG_TINT}:bs=${NEG_TINT}:bm=${NEG_TINT}:bh=${NEG_TINT}"
+    fi
     VF="${VF},format=rgb565le"
 
     # No -stream_loop here on purpose: ffmpeg's own internal loop hit NAL

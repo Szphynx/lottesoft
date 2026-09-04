@@ -25,7 +25,12 @@
 #                     this panel has no vsync/double-buffering, so pushing
 #                     frames faster than the SPI bus can transfer shows up
 #                     as a torn/doubled image; lower trades motion
-#                     smoothness for fewer visible tears.
+#                     smoothness for fewer visible tears. On fracture5's
+#                     actual wiring this tearing didn't go away even down
+#                     to 3fps, so it's a real limit of this panel/driver,
+#                     not just a "turn it down enough" knob.
+#   TFT_RED_TINT     0-1 (default 0) -- pushes the picture toward a heavy
+#                     red cast.
 
 set -euo pipefail
 
@@ -48,6 +53,7 @@ if [ ! -f "$FLAGS_FILE" ]; then
     cat > "$FLAGS_FILE" <<'EOF'
 TFT_FPS=12
 TFT_ROTATE_DEG=0
+TFT_RED_TINT=0
 EOF
 fi
 

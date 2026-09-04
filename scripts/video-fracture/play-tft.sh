@@ -46,13 +46,18 @@ while :; do
     [ -n "$ROT_FILTER" ] && VF="${VF},${ROT_FILTER}"
     VF="${VF},format=rgb565le"
 
+    # No -stream_loop here on purpose: ffmpeg's own internal loop hit NAL
+    # corruption at the wrap-around point on this file and crash-looped
+    # every ~15-20s. Playing the file once per invocation and letting this
+    # outer loop restart it is more reliable, at the cost of a brief gap
+    # between plays.
     ffmpeg -hide_banner -loglevel error \
-        -stream_loop -1 -re -i "$CURRENT" \
+        -re -i "$CURRENT" \
         -vf "$VF" \
         -f fbdev "$FB_DEVICE"
 
-    # ffmpeg exits if current.mp4 is swapped mid-loop (fetch-video.sh writes a
-    # new file), TFT_ROTATE_DEG/TFT_FPS changed (restart), or on any error --
-    # loop re-reads env/fb geometry and restarts.
-    sleep 2
+    # Also re-loops here when current.mp4 is swapped mid-play (fetch-video.sh
+    # writes a new file), TFT_ROTATE_DEG/TFT_FPS changed (restart), or ffmpeg
+    # errors -- loop re-reads env/fb geometry each time.
+    sleep 0.2
 done

@@ -18,8 +18,10 @@
 # Also set via /etc/default/video-fracture-tft.
 #
 # TFT_RED_TINT (0-1, default 0) pushes the picture toward a strong red
-# cast -- boosts red and pulls down green/blue by the same amount across
-# shadows/mid/highlights. 1 is a heavy red tint.
+# cast via a direct channel multiplier (colorchannelmixer, not
+# colorbalance -- colorbalance's "shift toward the complementary color"
+# sign convention gave an inverted/blue result here, so this uses the
+# unambiguous rr/gg/bb scaling instead). 1 is a heavy red tint.
 
 set -uo pipefail
 
@@ -52,8 +54,9 @@ while :; do
     VF="fps=${TFT_FPS},scale=${SCALE_W}:${SCALE_H}:force_original_aspect_ratio=decrease,pad=${SCALE_W}:${SCALE_H}:(ow-iw)/2:(oh-ih)/2"
     [ -n "$ROT_FILTER" ] && VF="${VF},${ROT_FILTER}"
     if [ "$TFT_RED_TINT" != "0" ]; then
-        NEG_TINT="-${TFT_RED_TINT}"
-        VF="${VF},colorbalance=rs=${TFT_RED_TINT}:rm=${TFT_RED_TINT}:rh=${TFT_RED_TINT}:gs=${NEG_TINT}:gm=${NEG_TINT}:gh=${NEG_TINT}:bs=${NEG_TINT}:bm=${NEG_TINT}:bh=${NEG_TINT}"
+        RR=$(awk -v t="$TFT_RED_TINT" 'BEGIN{printf "%.3f", 1+t}')
+        GB=$(awk -v t="$TFT_RED_TINT" 'BEGIN{v=1-t; if (v<0) v=0; printf "%.3f", v}')
+        VF="${VF},colorchannelmixer=rr=${RR}:gg=${GB}:bb=${GB}"
     fi
     VF="${VF},format=rgb565le"
 

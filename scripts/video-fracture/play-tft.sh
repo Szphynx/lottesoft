@@ -8,12 +8,19 @@
 # config.txt (0/90/180/270), not here -- the kernel driver reports the
 # already-rotated width/height, and this script just reads that and scales
 # into it. Change orientation there, reboot, done.
+#
+# TFT_FPS throttles how often a frame is written to the panel. This panel
+# has no vsync/double-buffering, so writing faster than the SPI bus can
+# push a full frame shows up as a torn/doubled image -- lower TFT_FPS
+# trades motion smoothness for fewer visible tears. Set via
+# /etc/default/video-fracture-tft (TFT_FPS=N), loaded by the systemd unit.
 
 set -uo pipefail
 
 FRACTURE_DIR="/var/lib/video-fracture"
 CURRENT="$FRACTURE_DIR/current.mp4"
 FB_DEVICE="${TFT_FB_DEVICE:-/dev/fb1}"
+TFT_FPS="${TFT_FPS:-12}"
 
 # Wait for both a video (fetch-video.sh) and the TFT driver to be ready.
 while [ ! -s "$CURRENT" ] || [ ! -e "$FB_DEVICE" ]; do
@@ -27,7 +34,7 @@ while :; do
 
     ffmpeg -hide_banner -loglevel error \
         -stream_loop -1 -re -i "$CURRENT" \
-        -vf "scale=${FB_W}:${FB_H}:force_original_aspect_ratio=decrease,pad=${FB_W}:${FB_H}:(ow-iw)/2:(oh-ih)/2,format=rgb565le" \
+        -vf "fps=${TFT_FPS},scale=${FB_W}:${FB_H}:force_original_aspect_ratio=decrease,pad=${FB_W}:${FB_H}:(ow-iw)/2:(oh-ih)/2,format=rgb565le" \
         -f fbdev "$FB_DEVICE"
 
     # ffmpeg exits if current.mp4 is swapped mid-loop (fetch-video.sh writes a

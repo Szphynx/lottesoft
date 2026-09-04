@@ -2,28 +2,45 @@
 """
 Cycle test patterns (letters -> numbers -> symbols) across up to three
 displays: the RB-TFT3.2-V3 (via its kernel framebuffer, /dev/fb1) and two
-Joy-IT SBC-OLED01.3 units. Both OLEDs are the same part at the same fixed
-address (0x3C), so instead of a mux, OLED #2 lives on a second, software
-("bit-banged") I2C bus on two spare GPIO pins -- no extra hardware needed.
-Add this to config.txt and reboot:
+Joy-IT SBC-OLED01.3 units.
 
-    dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=22
+CORRECTED from an earlier version of this file: the OLEDs turned out to be
+the 7-pin SPI variant (GND/VCC/CLK/MOSI/RES/DC/CS), not I2C -- there's no
+address to collide on, but each display needs 5 dedicated GPIO of its own.
+They're bit-banged in software (via luma.core's `bitbang` serial
+interface, since these modules have no MISO and so no real spidev bus).
 
-That gives OLED #2 its own /dev/i2c-3, wired to pins 16 (SDA/GPIO23) and
-15 (SCL/GPIO22) -- both free, neither claimed by the TFT HAT. OLED #1
-stays on the Pi's normal hardware bus, /dev/i2c-1 (pins 3/5).
+The TFT is a real Joy-IT RB-TFT3.2-V3: a 26-pin (13x2) header board, SSD1289
+LCD driver + XPT2046 touch, with backlight on GPIO18 (pin 12) and three
+onboard buttons on GPIO23/24/25 (pins 16/18/22) per Joy-IT's own docs.
+OLED #2's CS line originally landed on GPIO23 (pin 16) -- that's one of the
+TFT's buttons, not a free pin -- so it now lives on GPIO12 (pin 32)
+instead, outside the TFT's 26-pin footprint entirely.
 
-Each display is probed independently at startup. Any display that isn't
-wired up yet, or doesn't answer, is skipped -- the rest keep cycling. This
-is meant to be run as-is right after wiring one more screen on, with no
-code changes needed to "turn off" the ones that aren't there yet.
+    OLED-1: SCLK=GPIO5 (pin29)  SDA=GPIO6 (pin31)  RST=GPIO13 (pin33)
+            DC=GPIO19 (pin35)   CE=GPIO16 (pin36)
+    OLED-2: SCLK=GPIO26 (pin37) SDA=GPIO20 (pin38)  RST=GPIO21 (pin40)
+            DC=GPIO22 (pin15)   CE=GPIO12 (pin32)   -- moved off GPIO23/pin16
+
+LCD DC/RST for the TFT's own SSD1289 panel aren't confirmed here -- if the
+board came with an install script, its `dtoverlay=flexfb,...` (or similar)
+line's `dc-gpio=`/`reset-gpio=` params are the authoritative answer.
+
+No config.txt changes needed for the OLEDs beyond what the TFT already
+requires -- this is plain GPIO, not a kernel SPI device.
+
+The TFT is auto-detected (absent framebuffer -> skipped cleanly). The
+OLEDs can't be: bit-banged SPI has no read-back, so writing to one that
+isn't actually wired succeeds without error instead of raising one. Use
+--displays to say what's really connected rather than relying on
+autodetection for those two.
 
 Dependencies:
-    pip install pillow numpy luma.oled
+    pip install pillow numpy luma.oled RPi.GPIO
 
-Run with (needs root for /dev/fb1 and /dev/i2c-*):
+Run with (needs root for /dev/fb1 and GPIO):
     sudo python3 display_test.py
-    sudo python3 display_test.py --interval 1.5 --rotate 90
+    sudo python3 display_test.py --displays tft,oled-1 --interval 1.5
 """
 
 import argparse
@@ -35,8 +52,12 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-OLED_ADDR = 0x3C
-OLED_BUSES = {"OLED-1": 1, "OLED-2": 3}
+ALL_NAMES = ["TFT", "OLED-1", "OLED-2"]
+OLED_PINS = {
+    "OLED-1": dict(SCLK=5, SDA=6, RST=13, DC=19, CE=16),
+    # CE moved off GPIO23 (pin16) -- that's one of the TFT's onboard buttons.
+    "OLED-2": dict(SCLK=26, SDA=20, RST=21, DC=22, CE=12),
+}
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -113,33 +134,26 @@ class TFTScreen:
 
 
 # ----------------------------------------------------------------------------
-# OLEDs: same part, same fixed address (0x3C) on both -- kept apart by
-# living on two different I2C bus devices (/dev/i2c-1 hardware, /dev/i2c-3
-# bit-banged) rather than by address, so there's no collision to arbitrate.
+# OLEDs: SPI, no MISO, each on its own 5 dedicated GPIO -- bit-banged via
+# luma.core's `bitbang` serial interface, fully separate from the TFT's
+# real (kernel-driven) SPI0 bus and from each other. Nothing shared, so
+# there's nothing to arbitrate -- but also no read-back, see the module
+# docstring's detection caveat.
 # ----------------------------------------------------------------------------
 
 class OLEDScreen:
-    def __init__(self, bus_port, width=128, height=64):
-        from luma.core.interface.serial import i2c
+    def __init__(self, pins, width=128, height=64):
+        from luma.core.interface.serial import bitbang
         from luma.oled.device import sh1106
 
-        self.device = sh1106(i2c(port=bus_port, address=OLED_ADDR), width=width, height=height)
+        # NB: kwarg names (SCLK/SDA/CE/DC/RST) follow luma.core's documented
+        # bitbang examples; double-check against your installed luma.core
+        # version if this raises a TypeError at construction.
+        self.device = sh1106(bitbang(**pins), width=width, height=height)
         self.size = (width, height)
 
     def show(self, img):
         self.device.display(img.convert("1").resize(self.size))
-
-
-def find_oleds():
-    screens = []
-    for name, bus_port in OLED_BUSES.items():
-        try:
-            oled = OLEDScreen(bus_port)
-            print(f"{name} detected on /dev/i2c-{bus_port}")
-            screens.append((name, oled))
-        except Exception as e:
-            print(f"{name} not detected on /dev/i2c-{bus_port} ({e}) -- skipping")
-    return screens
 
 
 def main():
@@ -147,20 +161,45 @@ def main():
     ap.add_argument("--interval", type=float, default=1.0, help="seconds per glyph")
     ap.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
                      help="rotate the TFT image, e.g. if it's mounted sideways")
+    ap.add_argument("--displays", default=None,
+                     help="comma-separated subset to attempt, e.g. 'tft,oled-1' "
+                          "(default: all three). The OLEDs can't be auto-detected "
+                          "as absent (see module docstring) -- list only what's "
+                          "actually wired if fewer than three are connected.")
     args = ap.parse_args()
 
-    screens = []
-    try:
-        tft = TFTScreen(rotate=args.rotate)
-        print(f"TFT detected: {tft.path} {tft.fb_w}x{tft.fb_h}")
-        screens.append(("TFT", tft))
-    except Exception as e:
-        print(f"TFT not detected ({e}) -- skipping")
+    requested = None
+    if args.displays:
+        requested = {d.strip().upper() for d in args.displays.split(",")}
+        unknown = requested - set(ALL_NAMES)
+        if unknown:
+            sys.exit(f"unknown display name(s): {', '.join(sorted(unknown))} "
+                      f"(choose from {', '.join(ALL_NAMES)})")
 
-    screens.extend(find_oleds())
+    def wanted(name):
+        return requested is None or name in requested
+
+    screens = []
+    if wanted("TFT"):
+        try:
+            tft = TFTScreen(rotate=args.rotate)
+            print(f"TFT detected: {tft.path} {tft.fb_w}x{tft.fb_h}")
+            screens.append(("TFT", tft))
+        except Exception as e:
+            print(f"TFT not detected ({e}) -- skipping")
+
+    for name, pins in OLED_PINS.items():
+        if not wanted(name):
+            continue
+        try:
+            oled = OLEDScreen(pins)
+            print(f"{name} initialized on GPIO {pins}")
+            screens.append((name, oled))
+        except Exception as e:
+            print(f"{name} failed to initialize ({e}) -- skipping")
 
     if not screens:
-        sys.exit("no displays detected at all -- check wiring and interfaces")
+        sys.exit("no displays detected at all -- check wiring, interfaces, and --displays")
 
     sequence = [(tag, glyph) for tag, glyphs in CATEGORIES for glyph in glyphs]
     print(f"running with {len(screens)} display(s): " + ", ".join(n for n, _ in screens))

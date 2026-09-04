@@ -570,10 +570,10 @@ class State:
             self._load(state_file)
 
     def _load(self, path):
-        """Restore a previously-saved config (see `save()`) at startup --
-        last text/settings plus which media was queued and its per-item
-        trim/loop/brightness, so the display resumes exactly where it left
-        off on boot with no web UI interaction needed."""
+        """Restore the config from the last time "Save config (JSON)" was
+        pressed (see `save()`) -- text/settings plus which media was queued
+        and its per-item trim/loop/brightness -- so the display resumes on
+        boot with no web UI interaction needed."""
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -586,8 +586,10 @@ class State:
 
     def save(self):
         """Persist the current config so `_load` can restore it next boot.
-        Called after every live edit (web UI update/upload), not on a
-        timer -- the file is always just the last applied change."""
+        Called only when "Save config (JSON)" is pressed (see the
+        /config.json route below), not on every live edit -- boot always
+        resumes the last deliberately-saved config, not whatever a slider
+        happened to be at when the power cut out."""
         if not self.state_file:
             return
         try:
@@ -965,6 +967,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self._send(render_panel_svg(self.panel_w, self.panel_h, cfg),
                        "text/html; charset=utf-8")
         elif path == "/config.json":
+            # Also the "Save config (JSON)" button's target -- persisting
+            # here (not on every minor live edit) means what boots back up
+            # next time is whatever was in effect the last time Save was
+            # actually pressed, not just whatever a slider happened to be
+            # sitting at when the power cut out.
+            self.state.save()
             body = json.dumps(self.state.to_wire(), indent=2)
             self._send(body, "application/json", extra_headers={
                 "Content-Disposition": 'attachment; filename="led-config.json"'})
@@ -991,7 +999,6 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self.state.apply_wire(data)
-            self.state.save()
             self._send("ok", "text/plain")
         elif self.path == "/upload":
             self._handle_upload()
@@ -1030,7 +1037,6 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         with open(os.path.join(self.upload_dir, dest_name), "wb") as f:
             f.write(content)
         self.state.add_media(os.path.join(self.upload_dir, dest_name), kind, filename)
-        self.state.save()
         new_item = self.state.snapshot()["queue"][-1]
         self._send(_queue_item_row(new_item), "text/html; charset=utf-8")
 
@@ -1353,8 +1359,8 @@ def parse_args():
                    help="where uploaded media is saved (default: ./uploads "
                         "next to this script)")
     p.add_argument("--state-file", default=None,
-                   help="where the live config (text/queue/settings) is "
-                        "saved after every web UI change, and reloaded "
+                   help="where the config is saved when \"Save config "
+                        "(JSON)\" is pressed in the web UI, and reloaded "
                         "from on startup so playback resumes automatically "
                         "on boot (default: ./state.json next to this "
                         "script). Pass an empty string to disable.")

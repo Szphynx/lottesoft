@@ -53,17 +53,29 @@ def show_big_char(oled, ch, tag):
 led = Pin("LED", Pin.OUT)
 
 
-def blink_forever(period):
-    """Fast blink = something failed. Never returns."""
+def flash_missing_forever():
+    """2 quick flashes + pause, repeated -- an OLED is missing/failed. Never returns."""
     while True:
-        led.toggle()
-        time.sleep(period)
+        for _ in range(2):
+            led.on()
+            time.sleep(0.15)
+            led.off()
+            time.sleep(0.15)
+        time.sleep(0.7)
 
 
-try:
-    oleds = {name: make_oled(cfg) for name, cfg in SCREENS.items()}
-except Exception:
-    blink_forever(0.1)
+oleds = {}
+missing = []
+for name, cfg in SCREENS.items():
+    try:
+        oleds[name] = make_oled(cfg)
+    except Exception:
+        missing.append(name)
+
+if missing:
+    flash_missing_forever()
+
+led.on()  # steady on = both OLEDs up and running
 
 i = 0
 while True:
@@ -71,7 +83,6 @@ while True:
         for name, cfg in SCREENS.items():
             show_big_char(oleds[name], cfg["glyphs"][i % len(cfg["glyphs"])], name)
     except Exception:
-        blink_forever(0.1)
-    led.toggle()  # one heartbeat blink per slide change = still running
+        flash_missing_forever()
     i += 1
     time.sleep(INTERVAL)

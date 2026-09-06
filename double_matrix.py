@@ -120,7 +120,15 @@ Useful flags:
     --fit letterbox|fill        how the video fills its area (default fill)
     --spi-port / --spi-device    SPI bus/chip-select (default 0/0, i.e.
                                 CE0, matching the wiring above)
-    --spi-hz                     SPI clock speed (default 8000000)
+    --spi-hz                     SPI clock speed (default 1000000 -- a
+                                24-chip cascade (6 modules) is noisy at the
+                                8MHz luma/library default over anything but
+                                short, high-quality wiring; the modules
+                                farthest down the chain are hit worst, so
+                                flicker + dark tail-end modules means try
+                                lowering this before suspecting anything
+                                else. Raise it later once it's reliable if
+                                you want snappier updates)
     --web-port N                 live control panel at http://<pi>:N/ --
                                 edit everything above (except panel count/
                                 size) while it's running, save/load the
@@ -1226,7 +1234,11 @@ def parse_args():
                         "percent, 100=neutral")
     p.add_argument("--spi-port", type=int, default=0)
     p.add_argument("--spi-device", type=int, default=0, help="chip-select line (CE0=0, CE1=1)")
-    p.add_argument("--spi-hz", type=int, default=8000000)
+    p.add_argument("--spi-hz", type=int, default=1000000,
+                   help="24 chips cascaded gets noisy at higher speeds over "
+                        "anything but short, high-quality wiring -- flicker "
+                        "or dark modules at the far end of the chain means "
+                        "lower this before suspecting anything else")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 

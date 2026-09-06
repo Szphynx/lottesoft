@@ -80,6 +80,13 @@ Useful flags:
                                        order. Turn on --calibrate, then edit
                                        this until the wall reads 1, 2, 3, ...
                                        in reading order. Live-editable.
+    --active N                          only drive the first N modules
+                                       along the chain, blanking the rest --
+                                       for testing a subset (e.g. the first
+                                       3 of 6, if only that half is powered
+                                       right now) without changing
+                                       --num-panels or the wiring.
+                                       Live-editable.
     --threshold N                       0-255 luminance cutoff for a "lit"
                                        pixel (dimmer content needs a lower
                                        threshold to show up). Live-editable.
@@ -537,6 +544,7 @@ class State:
         self.dither = args.dither
         self.calibrate = args.calibrate
         self.order = list(args.order) if args.order else list(range(args.num_panels))
+        self.active = args.active if args.active else args.num_panels
         self.queue = []
         if args.media:
             self.queue.append({
@@ -591,7 +599,7 @@ class State:
                         layout=self.layout, block_orientation=self.block_orientation,
                         rotate180=self.rotate180, threshold=self.threshold,
                         dither=self.dither, calibrate=self.calibrate,
-                        order=list(self.order),
+                        order=list(self.order), active=self.active,
                         queue=[dict(q) for q in self.queue], version=self.version)
 
     def to_wire(self):
@@ -698,6 +706,11 @@ class State:
                     candidate = None
                 if candidate is not None and sorted(candidate) == list(range(len(self.order))):
                     self.order = candidate
+            if "active" in data:
+                try:
+                    self.active = max(1, min(len(self.order), int(data["active"])))
+                except (TypeError, ValueError):
+                    pass
             if "queue" in data and isinstance(data["queue"], list):
                 by_id = {item["id"]: item for item in self.queue}
                 new_queue = []
@@ -806,6 +819,25 @@ def chain_labels(order):
     return labels
 
 
+def apply_active_mask(bitmap, rows, cols, panel_w, panel_h, order, active):
+    """Blank every module whose chain position is beyond `active` -- for
+    testing a subset (e.g. the first 3 wired/powered modules) without
+    touching --num-panels or the wiring: the device still spans the whole
+    real chain, this just stops sending anything meaningful to the tail
+    end of it. Grid-slot space, same as `apply_block_order`, applied
+    before it -- masking is a chain-position decision (chain_labels), the
+    darkened slots then get remapped like any other content."""
+    n = rows * cols
+    if active >= n:
+        return bitmap
+    out = bitmap.copy()
+    for slot, chain_pos in enumerate(chain_labels(order)):
+        if chain_pos > active:
+            r, c = divmod(slot, cols)
+            out[r * panel_h:(r + 1) * panel_h, c * panel_w:(c + 1) * panel_w] = False
+    return out
+
+
 def apply_block_order(frame, rows, cols, panel_w, panel_h, order):
     """Rearrange module-sized tiles so chain position c is handed the tile
     for grid slot order[c]. Everything upstream of this (compositing, text,
@@ -841,12 +873,15 @@ def render_calibration_frame(rows, cols, panel_w, panel_h, font):
     return np.array(img)
 
 
-def render_layout_svg(rows, cols, panel_w, panel_h, rotate180, order, cell=4):
+def render_layout_svg(rows, cols, panel_w, panel_h, rotate180, order, active=None, cell=4):
     """Diagram of the module chain order for the current layout. Boxes are
     grid slots (where the content goes); the number in each is the chain
     position driving it and the blue path is the daisy chain's actual route
     across the wall, both straight out of `order` -- so a reordered chain
-    redraws here immediately and can't drift from what's being sent."""
+    redraws here immediately and can't drift from what's being sent. A slot
+    whose chain position is past `active` is dimmed and dashed: it's wired,
+    but nothing is currently being sent to it."""
+    active = rows * cols if active is None else active
     box_w, box_h, gap = panel_w * cell, panel_h * cell, 10
     w = cols * box_w + (cols - 1) * gap
     h = rows * box_h + (rows - 1) * gap
@@ -859,12 +894,14 @@ def render_layout_svg(rows, cols, panel_w, panel_h, rotate180, order, cell=4):
     for slot, chain_pos in enumerate(chain_labels(order)):
         r, c = divmod(slot, cols)
         x, y = c * (box_w + gap), r * (box_h + gap)
+        inactive = chain_pos > active
+        stroke = 'stroke-dasharray="3,2" stroke="#555"' if inactive else 'stroke="#888"'
         boxes.append(f'<rect x="{x}" y="{y}" width="{box_w}" height="{box_h}" rx="3" '
-                     f'fill="none" stroke="#888"/>')
+                     f'fill="none" {stroke}/>')
         # Corner, not centre: the chain path and its start/end dots run
         # through the middle of every box, and would sit on top of the digit.
         labels.append(f'<text x="{x + 5}" y="{y + 13}" font-size="11" '
-                       f'fill="#ccc">{chain_pos}</text>')
+                       f'fill="{"#666" if inactive else "#ccc"}">{chain_pos}</text>')
     for slot_a, slot_b in zip(order, order[1:]):
         x0, y0 = center(slot_a)
         x1, y1 = center(slot_b)
@@ -955,7 +992,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         snap = self.state.snapshot()
         rows, cols = LAYOUTS[snap["layout"]]
         return render_layout_svg(rows, cols, self.panel_w, self.panel_h, snap["rotate180"],
-                                  snap["order"])
+                                  snap["order"], snap["active"])
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -983,7 +1020,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     "bits": bitmap.astype(int).reshape(-1).tolist(),
                     "rows": rows, "cols": cols,
                     "pw": self.panel_w, "ph": self.panel_h,
-                    "labels": chain_labels(snap["order"]),
+                    "labels": chain_labels(snap["order"]), "active": snap["active"],
                 })
             self._send(body, "application/json")
         else:
@@ -1164,6 +1201,16 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   entry can't scramble it.
 </span>
 <br><br>
+<label>Active modules: <span id="aval">{snap['active']}</span> / {rows * cols}<br>
+  <input type="range" min="1" max="{rows * cols}" value="{snap['active']}" style="width:100%"
+    oninput="state.active=parseInt(this.value); aval.textContent=this.value; sendDebounced();">
+</label>
+<span style="color:#888;font-size:.8rem">
+  Only the first N modules along the chain are driven -- the rest are
+  blanked (dashed in the diagram/preview), for testing a subset (e.g. the
+  first 3 of 6) without touching the wiring or --num-panels.
+</span>
+<br><br>
 <label>Threshold: <span id="tval">{snap['threshold']}</span> / 255<br>
   <input type="range" min="0" max="255" value="{snap['threshold']}" style="width:100%"
     oninput="state.threshold=parseInt(this.value); tval.textContent=this.value; sendDebounced();">
@@ -1265,17 +1312,18 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     // One box per module, sized to that module's footprint in the pixel
     // grid (cell + 1px gap pitch), labelled with its chain position.
     const el = document.getElementById('overlay');
-    const key = [data.rows, data.cols, data.pw, data.ph, data.labels].join('|');
+    const key = [data.rows, data.cols, data.pw, data.ph, data.labels, data.active].join('|');
     if (el.dataset.key === key) return;
     el.dataset.key = key;
     el.innerHTML = '';
     const pitch = PREVIEW_CELL_PX + 1;
     data.labels.forEach((label, slot) => {{
       const r = Math.floor(slot / data.cols), c = slot % data.cols;
+      const inactive = label > data.active;
       const box = document.createElement('div');
       box.style.cssText = 'position:absolute;box-sizing:border-box;' +
-        'border:1px solid rgba(102,204,255,.75);font:10px monospace;' +
-        'color:#6cf;padding:0 2px';
+        `border:1px ${{inactive ? 'dashed rgba(255,255,255,.25)' : 'solid rgba(102,204,255,.75)'}};` +
+        `font:10px monospace;color:${{inactive ? '#666' : '#6cf'}};padding:0 2px`;
       box.style.left = (c * data.pw * pitch) + 'px';
       box.style.top = (r * data.ph * pitch) + 'px';
       box.style.width = (data.pw * pitch - 1) + 'px';
@@ -1392,6 +1440,11 @@ def parse_args():
                         "daisy chain shows, 1-based, e.g. \"1,3,2,4,5,6\" -- "
                         "for when the modules aren't mounted in chain order "
                         "(default: chain order, 1,2,3,...)")
+    p.add_argument("--active", type=int, default=None,
+                   help="only drive the first N modules along the chain, "
+                        "blanking the rest -- for testing a subset (e.g. "
+                        "the first 3 of 6) without changing --num-panels or "
+                        "the wiring (default: all of them)")
     p.add_argument("--threshold", type=int, default=128,
                    help="0-255 luminance cutoff for a lit pixel")
     p.add_argument("--dither", action=argparse.BooleanOptionalAction, default=True,
@@ -1425,6 +1478,9 @@ def parse_args():
             sys.exit(f"--order must list each of the {args.num_panels} blocks "
                       f"exactly once, 1-based (e.g. "
                       f"\"{','.join(str(i + 1) for i in range(args.num_panels))}\")")
+
+    if args.active is not None and not (1 <= args.active <= args.num_panels):
+        sys.exit(f"--active must be between 1 and --num-panels ({args.num_panels})")
 
     if not args.media and not args.text and not args.web_port and not args.calibrate:
         sys.exit("nothing to show and no way to add anything -- pass "
@@ -1553,6 +1609,8 @@ def main():
             # nearly black on a 1-bit display.
             gray = frame.max(axis=2)
             bitmap = frame_to_bitmap(gray, snap["threshold"], snap["dither"])
+            bitmap = apply_active_mask(bitmap, rows, cols, args.panel_width,
+                                        args.panel_height, snap["order"], snap["active"])
             # The preview shows grid-slot space (what you meant to see); the
             # chain remap below is the last step before the wire.
             preview.update(bitmap)

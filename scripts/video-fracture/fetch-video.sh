@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Pull a video from a public Google Drive folder and hot-swap the player
-# if it changed. Run periodically by video-fracture-fetch.timer.
+# Pull a video from a local folder or a public Google Drive folder and
+# hot-swap the player if it changed. Run periodically by
+# video-fracture-fetch.timer.
 #
-# No API key: public folders don't expose modified-time without one, so
-# "latest" here means highest filename sorted alphabetically. Name files
-# so the one you want last sorts last (01.mp4/02.mp4, or date-prefixed
-# names both work).
+# VIDEO_LOCAL_DIR (a folder on the Pi itself, e.g. a mounted USB drive)
+# takes priority when set -- VIDEO_DRIVE_FOLDER_ID is only used otherwise.
+# Both pick "latest" the same way: highest filename sorted alphabetically
+# (Drive doesn't expose modified-time without an API key, so local uses
+# the same convention for consistency). Name files so the one you want
+# playing sorts last (01.mp4/02.mp4, or date-prefixed names both work).
 #
-# Behavior:
-#  - folder's last-by-name video differs from what's playing -> download
-#    it, install it, tell the running player to switch (no restart, no
-#    black screen)
-#  - listing/download fails (no network, folder not shared) -> leave
-#    whatever is currently playing alone
-#  - folder has no video in it, or nothing ever downloaded -> log/mark
+# Behavior (same for either source):
+#  - last-by-name video differs from what's playing -> install it, tell
+#    the running player to switch (no restart, no black screen)
+#  - source unreachable (no network/not shared, or local dir missing) ->
+#    leave whatever is currently playing alone
+#  - source has no video in it, or nothing ever installed -> log/mark
 #    that clearly
 
 set -uo pipefail
@@ -31,10 +33,61 @@ status() {
     echo "$1" | tee "$STATUS"
 }
 
+swap_notify() {
+    if [ -S "$MPV_SOCKET" ]; then
+        echo '{"command": ["loadfile", "'"$CURRENT"'", "replace"]}' | socat - "$MPV_SOCKET" >/dev/null 2>&1 || true
+    fi
+}
+
+LOCAL_DIR="${VIDEO_LOCAL_DIR:-}"
+
+if [ -n "$LOCAL_DIR" ] && [ "$LOCAL_DIR" != "REPLACE_WITH_LOCAL_DIR" ]; then
+    if [ ! -d "$LOCAL_DIR" ]; then
+        if [ -s "$CURRENT" ]; then
+            status "$(date -Is): VIDEO_LOCAL_DIR '$LOCAL_DIR' doesn't exist (unmounted?), still playing previously cached video"
+        else
+            status "$(date -Is): VIDEO_LOCAL_DIR '$LOCAL_DIR' doesn't exist (unmounted?) -- no video available yet"
+        fi
+        exit 0
+    fi
+
+    LATEST=$(find "$LOCAL_DIR" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.m4v' \) 2>/dev/null | sort | tail -n1)
+
+    if [ -z "$LATEST" ]; then
+        if [ -s "$CURRENT" ]; then
+            status "$(date -Is): no video files in $LOCAL_DIR, still playing previously cached video"
+        else
+            status "$(date -Is): no video files in $LOCAL_DIR -- no video available yet"
+        fi
+        exit 0
+    fi
+
+    FILE_NAME="$(basename "$LATEST")"
+    SOURCE_KEY="local	${FILE_NAME}	$(stat -c %Y "$LATEST" 2>/dev/null || echo 0)"
+
+    if [ -s "$CURRENT" ] && [ -f "$SOURCE_STATE" ] && [ "$(cat "$SOURCE_STATE")" = "$SOURCE_KEY" ]; then
+        status "$(date -Is): checked, no change ($FILE_NAME)"
+        exit 0
+    fi
+
+    if ! ffprobe -v error "$LATEST" -show_entries format=duration -of default=noprint_wrappers=1 >/dev/null 2>&1; then
+        status "$(date -Is): '$FILE_NAME' isn't a valid video, still playing previously cached video"
+        exit 0
+    fi
+
+    cp "$LATEST" "$TMP"
+    mv "$TMP" "$CURRENT"
+    chmod 644 "$CURRENT"
+    echo "$SOURCE_KEY" > "$SOURCE_STATE"
+    status "$(date -Is): '$FILE_NAME' installed from $LOCAL_DIR, switching player"
+    swap_notify
+    exit 0
+fi
+
 FOLDER_ID="${VIDEO_DRIVE_FOLDER_ID:-}"
 
 if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "REPLACE_WITH_FOLDER_ID" ]; then
-    status "not configured -- set VIDEO_DRIVE_FOLDER_ID in /etc/default/video-fracture"
+    status "not configured -- set VIDEO_LOCAL_DIR or VIDEO_DRIVE_FOLDER_ID in /etc/default/video-fracture"
     exit 0
 fi
 
@@ -104,7 +157,4 @@ mv "$TMP" "$CURRENT"
 chmod 644 "$CURRENT"
 echo "$SOURCE_KEY" > "$SOURCE_STATE"
 status "$(date -Is): '$FILE_NAME' installed from Drive, switching player"
-
-if [ -S "$MPV_SOCKET" ]; then
-    echo '{"command": ["loadfile", "'"$CURRENT"'", "replace"]}' | socat - "$MPV_SOCKET" >/dev/null 2>&1 || true
-fi
+swap_notify

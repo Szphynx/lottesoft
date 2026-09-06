@@ -23,6 +23,9 @@ Physical layout -- pick whichever matches how the 6 modules are actually
 mounted, or switch live from the control panel:
     grid   3 rows of 2 modules side by side (64 wide x 24 tall)
     strip  2 stacked rows of 3 chained modules (96 wide x 16 tall)
+    half   a single row of 3 chained modules (96 wide x 8 tall) --
+           --num-panels 3, for testing one block of 3 in isolation (e.g.
+           narrowing down a wiring/power problem to one half of the chain)
 
 Both assume the daisy chain runs top row first, left to right, then the
 next row down, also left to right (module 1 = top-left, same direction
@@ -172,7 +175,7 @@ FONT_VARIANTS = {
 TEXT_COLOR = (255, 255, 255)  # only luminance reaches the hardware -- hue is moot
 
 # rows, cols of modules for each named physical layout.
-LAYOUTS = {"grid": (3, 2), "strip": (2, 3)}
+LAYOUTS = {"grid": (3, 2), "strip": (2, 3), "half": (1, 3)}
 
 
 def load_font(path, size, bold=False, italic=False):
@@ -1215,7 +1218,9 @@ def parse_args():
     p.add_argument("--panel-height", type=int, default=8)
     p.add_argument("--num-panels", type=int, default=6)
     p.add_argument("--layout", default="grid", choices=list(LAYOUTS),
-                   help="grid = 3 rows x 2 modules, strip = 2 rows x 3 chained")
+                   help="grid = 3 rows x 2 modules, strip = 2 rows x 3 "
+                        "chained, half = 1 row x 3 chained (pair with "
+                        "--num-panels 3 to drive/test only half the chain)")
     p.add_argument("--block-orientation", type=int, default=0, choices=[0, 90, -90, 180],
                    help="rotate every 8x8 chip block in place")
     p.add_argument("--rotate180", action="store_true",

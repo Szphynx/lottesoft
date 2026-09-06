@@ -70,6 +70,16 @@ Useful flags:
     --rotate180                         the whole assembly is mounted
                                        upside down -- flips the final image
                                        before sending. Live-editable.
+    --calibrate                         show each module's block number
+                                       instead of the media/text, so you can
+                                       read off the wall which module sits
+                                       where. Live-editable.
+    --order "1,3,2,4,5,6"              which block of the picture each
+                                       module along the daisy chain shows,
+                                       for when they aren't mounted in chain
+                                       order. Turn on --calibrate, then edit
+                                       this until the wall reads 1, 2, 3, ...
+                                       in reading order. Live-editable.
     --threshold N                       0-255 luminance cutoff for a "lit"
                                        pixel (dimmer content needs a lower
                                        threshold to show up). Live-editable.
@@ -145,6 +155,7 @@ import http.server
 import json
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -524,6 +535,8 @@ class State:
         self.rotate180 = args.rotate180
         self.threshold = args.threshold
         self.dither = args.dither
+        self.calibrate = args.calibrate
+        self.order = list(args.order) if args.order else list(range(args.num_panels))
         self.queue = []
         if args.media:
             self.queue.append({
@@ -577,7 +590,8 @@ class State:
                         media_pos_x=self.media_pos_x, media_pos_y=self.media_pos_y,
                         layout=self.layout, block_orientation=self.block_orientation,
                         rotate180=self.rotate180, threshold=self.threshold,
-                        dither=self.dither,
+                        dither=self.dither, calibrate=self.calibrate,
+                        order=list(self.order),
                         queue=[dict(q) for q in self.queue], version=self.version)
 
     def to_wire(self):
@@ -672,6 +686,18 @@ class State:
                     pass
             if "dither" in data:
                 self.dither = bool(data["dither"])
+            if "calibrate" in data:
+                self.calibrate = bool(data["calibrate"])
+            if "order" in data:
+                # Silently ignored unless it's a real permutation of the
+                # existing slots -- a half-typed order in the web UI's text
+                # field shouldn't scramble the wall mid-edit.
+                try:
+                    candidate = [int(v) for v in data["order"]]
+                except (TypeError, ValueError):
+                    candidate = None
+                if candidate is not None and sorted(candidate) == list(range(len(self.order))):
+                    self.order = candidate
             if "queue" in data and isinstance(data["queue"], list):
                 by_id = {item["id"]: item for item in self.queue}
                 new_queue = []
@@ -757,36 +783,95 @@ def parse_multipart(content_type, body):
     return fields, files
 
 
-def render_layout_svg(rows, cols, panel_w, panel_h, rotate180, cell=4):
-    """Diagram of the module chain order for the current layout -- chain
-    starts top-left, runs left to right across each row, then the next row
-    down (the only order this hardware/library combo can represent). Traces
-    the same `rows`/`cols` the real device geometry uses, so it can't drift
-    out of sync with what's actually wired up."""
+def parse_order(text, n):
+    """"1,3,2" / "1 3 2" / "132" -> [0, 2, 1]. None if it isn't a complete
+    permutation of the n blocks. The compact digit-run form only resolves
+    while one block is one digit; past that it fails the permutation check
+    rather than guessing where the boundaries were."""
+    tokens = re.findall(r"\d+", text or "")
+    if len(tokens) == 1 and len(tokens[0]) == n > 1:
+        tokens = list(tokens[0])
+    order = [int(t) - 1 for t in tokens]
+    return order if sorted(order) == list(range(n)) else None
+
+
+def chain_labels(order):
+    """order[c] = which grid slot chain position c drives. Inverted: for
+    each grid slot, the 1-based chain position feeding it -- i.e. the number
+    that slot's module shows in calibration mode's counterpart, and the
+    label on both the diagram and the live preview overlay."""
+    labels = [0] * len(order)
+    for c, slot in enumerate(order):
+        labels[slot] = c + 1
+    return labels
+
+
+def apply_block_order(frame, rows, cols, panel_w, panel_h, order):
+    """Rearrange module-sized tiles so chain position c is handed the tile
+    for grid slot order[c]. Everything upstream of this (compositing, text,
+    calibration digits, the preview) works in grid-slot space -- the
+    physical chain order only exists from here on down."""
+    if list(order) == list(range(rows * cols)):
+        return frame
+    out = np.empty_like(frame)
+    for c, slot in enumerate(order):
+        cr, cc = divmod(c, cols)
+        sr, sc = divmod(slot, cols)
+        out[cr * panel_h:(cr + 1) * panel_h, cc * panel_w:(cc + 1) * panel_w] = \
+            frame[sr * panel_h:(sr + 1) * panel_h, sc * panel_w:(sc + 1) * panel_w]
+    return out
+
+
+def render_calibration_frame(rows, cols, panel_w, panel_h, font):
+    """Calibration pattern: every module shows its grid-slot number inside a
+    border, so you can read straight off the wall which physical module is
+    sitting where. Adjust the block order until the wall reads 1, 2, 3, ...
+    in normal reading order -- then the mapping matches the hardware."""
+    img = Image.new("RGB", (cols * panel_w, rows * panel_h), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for slot in range(rows * cols):
+        r, c = divmod(slot, cols)
+        x0, y0 = c * panel_w, r * panel_h
+        draw.rectangle([x0, y0, x0 + panel_w - 1, y0 + panel_h - 1], outline=(255, 255, 255))
+        label = str(slot + 1)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text((x0 + (panel_w - tw) // 2 - bbox[0], y0 + (panel_h - th) // 2 - bbox[1]),
+                   label, font=font, fill=(255, 255, 255))
+    return np.array(img)
+
+
+def render_layout_svg(rows, cols, panel_w, panel_h, rotate180, order, cell=4):
+    """Diagram of the module chain order for the current layout. Boxes are
+    grid slots (where the content goes); the number in each is the chain
+    position driving it and the blue path is the daisy chain's actual route
+    across the wall, both straight out of `order` -- so a reordered chain
+    redraws here immediately and can't drift from what's being sent."""
     box_w, box_h, gap = panel_w * cell, panel_h * cell, 10
     w = cols * box_w + (cols - 1) * gap
     h = rows * box_h + (rows - 1) * gap
 
-    def center(r, c):
-        x = c * (box_w + gap) + box_w / 2
-        y = r * (box_h + gap) + box_h / 2
-        return x, y
+    def center(slot):
+        r, c = divmod(slot, cols)
+        return c * (box_w + gap) + box_w / 2, r * (box_h + gap) + box_h / 2
 
     boxes, labels, arrows = [], [], []
-    order = [(r, c) for r in range(rows) for c in range(cols)]
-    for i, (r, c) in enumerate(order):
+    for slot, chain_pos in enumerate(chain_labels(order)):
+        r, c = divmod(slot, cols)
         x, y = c * (box_w + gap), r * (box_h + gap)
         boxes.append(f'<rect x="{x}" y="{y}" width="{box_w}" height="{box_h}" rx="3" '
                      f'fill="none" stroke="#888"/>')
-        labels.append(f'<text x="{x + box_w / 2}" y="{y + box_h / 2 + 4}" '
-                       f'text-anchor="middle" font-size="11" fill="#ccc">{i + 1}</text>')
-    for (r0, c0), (r1, c1) in zip(order, order[1:]):
-        x0, y0 = center(r0, c0)
-        x1, y1 = center(r1, c1)
+        # Corner, not centre: the chain path and its start/end dots run
+        # through the middle of every box, and would sit on top of the digit.
+        labels.append(f'<text x="{x + 5}" y="{y + 13}" font-size="11" '
+                       f'fill="#ccc">{chain_pos}</text>')
+    for slot_a, slot_b in zip(order, order[1:]):
+        x0, y0 = center(slot_a)
+        x1, y1 = center(slot_b)
         arrows.append(f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" '
                        f'stroke="#6cf" stroke-width="2"/>')
-    sx, sy = center(*order[0])
-    ex, ey = center(*order[-1])
+    sx, sy = center(order[0])
+    ex, ey = center(order[-1])
     flip_note = (f'<text x="4" y="{h - 6}" font-size="10" fill="#f96">'
                  f'image flipped 180° before send</text>' if rotate180 else "")
 
@@ -869,7 +954,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     def _diagram_html(self):
         snap = self.state.snapshot()
         rows, cols = LAYOUTS[snap["layout"]]
-        return render_layout_svg(rows, cols, self.panel_w, self.panel_h, snap["rotate180"])
+        return render_layout_svg(rows, cols, self.panel_w, self.panel_h, snap["rotate180"],
+                                  snap["order"])
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -887,8 +973,18 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             if bitmap is None:
                 body = json.dumps({"w": 0, "h": 0, "bits": []})
             else:
+                snap = self.state.snapshot()
+                rows, cols = LAYOUTS[snap["layout"]]
                 h, w = bitmap.shape[:2]
-                body = json.dumps({"w": w, "h": h, "bits": bitmap.astype(int).reshape(-1).tolist()})
+                # The block geometry rides along so the preview can draw
+                # module boundaries and their chain numbers over the pixels.
+                body = json.dumps({
+                    "w": w, "h": h,
+                    "bits": bitmap.astype(int).reshape(-1).tolist(),
+                    "rows": rows, "cols": cols,
+                    "pw": self.panel_w, "ph": self.panel_h,
+                    "labels": chain_labels(snap["order"]),
+                })
             self._send(body, "application/json")
         else:
             self.send_response(404)
@@ -950,17 +1046,23 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <h1 style="font-size:1.1rem">Double matrix control</h1>
 
 <p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
-  Live preview -- the actual bitmap being sent to the panels right now:
+  Live preview -- the actual bitmap being sent to the panels right now,
+  with module boundaries and their chain positions drawn over it:
 </p>
-<div id="preview" style="background:#000;border:1px solid #444;display:inline-block"></div>
+<div id="previewWrap" style="position:relative;display:inline-block;
+     background:#000;border:1px solid #444">
+  <div id="preview"></div>
+  <div id="overlay" style="position:absolute;left:0;top:0;pointer-events:none"></div>
+</div>
 
 <div id="diagram">{self._diagram_html()}</div>
 <p style="color:#888;font-size:.85rem">
-  Blue path traces the module chain order -- green dot is where data comes
-  in (module 1 DIN), orange is the end of the chain (module 6 DOUT,
-  unused). {rows}x{cols} modules, {self.panel_w}x{self.panel_h} each
-  (panel count/size are set with --panel-width/--panel-height/--num-panels
-  at startup, not here).
+  Boxes are where content goes; the number in each is the chain position
+  driving it, and the blue path is the daisy chain's route across the wall.
+  Green dot is where data comes in (chain start, module 1 DIN), orange is
+  the end of the chain. {rows}x{cols} modules, {self.panel_w}x{self.panel_h}
+  each (panel count/size are set with --panel-width/--panel-height/
+  --num-panels at startup, not here).
 </p>
 
 <label>Text<br>
@@ -1041,6 +1143,27 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 &nbsp; <label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
   onchange="state.rotate180=this.checked; send();"> Assembly mounted upside down</label>
 <br><br>
+
+<label><input type="checkbox" {"checked" if snap['calibrate'] else ""}
+  onchange="state.calibrate=this.checked; send();"> Calibration mode (number on
+  every module)</label><br>
+<label>Block order
+  <input id="orderInput" value="{",".join(str(s + 1) for s in snap['order'])}"
+    style="width:9rem;padding:.3rem" onchange="setOrder(this.value)">
+</label>
+<button onclick="setOrder('{",".join(str(i + 1) for i in range(rows * cols))}')"
+  style="background:#234;color:#eee;border:none;border-radius:4px;padding:.35rem .7rem;
+         cursor:pointer">reset</button>
+<br><span style="color:#888;font-size:.8rem">
+  Turn on calibration mode and read the numbers off the wall. Position n in
+  this list is the n'th module along the daisy chain, and its value is which
+  block of the picture that module shows -- so if the chain's 2nd module is
+  physically sitting in block 3's place, put 3 second (1,3,2,...). Keep
+  editing until the wall reads 1, 2, 3, ... left to right, top to bottom.
+  Anything that isn't a complete permutation is ignored, so a half-typed
+  entry can't scramble it.
+</span>
+<br><br>
 <label>Threshold: <span id="tval">{snap['threshold']}</span> / 255<br>
   <input type="range" min="0" max="255" value="{snap['threshold']}" style="width:100%"
     oninput="state.threshold=parseInt(this.value); tval.textContent=this.value; sendDebounced();">
@@ -1105,6 +1228,18 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     if (item) item[key] = value;
     send();
   }}
+  function setOrder(text) {{
+    // "1,3,2" / "132" / "1 3 2" all work; anything that isn't a complete
+    // permutation is dropped by the server, so a typo can't scramble the wall.
+    let tokens = text.match(/\\d+/g) || [];
+    if (tokens.length === 1 && tokens[0].length === state.order.length)
+      tokens = tokens[0].split('');
+    const parsed = tokens.map(n => parseInt(n, 10) - 1);
+    if (parsed.length === state.order.length) state.order = parsed;
+    document.getElementById('orderInput').value =
+      state.order.map(s => s + 1).join(',');
+    send();
+  }}
   function removeItem(id) {{
     state.queue = state.queue.filter(q => q.id !== id);
     const row = document.getElementById('qi-' + id);
@@ -1126,6 +1261,29 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     input.value = '';
   }}
   const PREVIEW_CELL_PX = 6;
+  function drawOverlay(data) {{
+    // One box per module, sized to that module's footprint in the pixel
+    // grid (cell + 1px gap pitch), labelled with its chain position.
+    const el = document.getElementById('overlay');
+    const key = [data.rows, data.cols, data.pw, data.ph, data.labels].join('|');
+    if (el.dataset.key === key) return;
+    el.dataset.key = key;
+    el.innerHTML = '';
+    const pitch = PREVIEW_CELL_PX + 1;
+    data.labels.forEach((label, slot) => {{
+      const r = Math.floor(slot / data.cols), c = slot % data.cols;
+      const box = document.createElement('div');
+      box.style.cssText = 'position:absolute;box-sizing:border-box;' +
+        'border:1px solid rgba(102,204,255,.75);font:10px monospace;' +
+        'color:#6cf;padding:0 2px';
+      box.style.left = (c * data.pw * pitch) + 'px';
+      box.style.top = (r * data.ph * pitch) + 'px';
+      box.style.width = (data.pw * pitch - 1) + 'px';
+      box.style.height = (data.ph * pitch - 1) + 'px';
+      box.textContent = label;
+      el.appendChild(box);
+    }});
+  }}
   function pollPreview() {{
     fetch('/frame.json').then(r => r.json()).then(data => {{
       const el = document.getElementById('preview');
@@ -1147,6 +1305,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
       for (let i = 0; i < data.bits.length; i++) {{
         cells[i].style.background = data.bits[i] ? '#f30' : '#200';
       }}
+      drawOverlay(data);
     }}).catch(() => {{}}).finally(() => setTimeout(pollPreview, 150));
   }}
   pollPreview();
@@ -1225,6 +1384,14 @@ def parse_args():
                    help="rotate every 8x8 chip block in place")
     p.add_argument("--rotate180", action="store_true",
                    help="whole assembly mounted upside down")
+    p.add_argument("--calibrate", action="store_true",
+                   help="show each module's block number instead of the "
+                        "media/text, for working out --order")
+    p.add_argument("--order", default=None,
+                   help="which block of the picture each module along the "
+                        "daisy chain shows, 1-based, e.g. \"1,3,2,4,5,6\" -- "
+                        "for when the modules aren't mounted in chain order "
+                        "(default: chain order, 1,2,3,...)")
     p.add_argument("--threshold", type=int, default=128,
                    help="0-255 luminance cutoff for a lit pixel")
     p.add_argument("--dither", action=argparse.BooleanOptionalAction, default=True,
@@ -1252,10 +1419,17 @@ def parse_args():
         sys.exit(f"--layout {args.layout} is a {rows}x{cols} grid ({rows * cols} "
                   f"modules) but --num-panels is {args.num_panels}")
 
-    if not args.media and not args.text and not args.web_port:
+    if args.order:
+        args.order = parse_order(args.order, args.num_panels)
+        if args.order is None:
+            sys.exit(f"--order must list each of the {args.num_panels} blocks "
+                      f"exactly once, 1-based (e.g. "
+                      f"\"{','.join(str(i + 1) for i in range(args.num_panels))}\")")
+
+    if not args.media and not args.text and not args.web_port and not args.calibrate:
         sys.exit("nothing to show and no way to add anything -- pass "
-                  "--media/--text, or leave --web-port enabled so you can "
-                  "upload/type content once it's running")
+                  "--media/--text/--calibrate, or leave --web-port enabled so "
+                  "you can upload/type content once it's running")
     return args
 
 
@@ -1304,6 +1478,8 @@ def main():
 
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]
+    # One digit has to fit inside a module minus its 1px calibration border.
+    calibration_font = load_font(args.font, max(6, args.panel_height - 1))
 
     preview = Preview()
     server = None
@@ -1356,23 +1532,32 @@ def main():
                 device.contrast(snap["brightness"])
                 last_brightness = snap["brightness"]
 
-            frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-            if video_h > 0:
-                frame[0:video_h] = player.next_frame(
-                    dt, canvas_w, video_h, snap["media_brightness"], snap["media_contrast"],
-                    snap["media_rotation"], snap["media_scale"],
-                    snap["media_pos_x"], snap["media_pos_y"])
-            if scroller:
-                sign = -1.0 if snap["text_direction"] in ("right", "down") else 1.0
-                scroll_offset += sign * dt * snap["scroll_speed"]
-                frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)
+            rows, cols = LAYOUTS[snap["layout"]]
+            if snap["calibrate"]:
+                frame = render_calibration_frame(rows, cols, args.panel_width,
+                                                  args.panel_height, calibration_font)
+            else:
+                frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+                if video_h > 0:
+                    frame[0:video_h] = player.next_frame(
+                        dt, canvas_w, video_h, snap["media_brightness"], snap["media_contrast"],
+                        snap["media_rotation"], snap["media_scale"],
+                        snap["media_pos_x"], snap["media_pos_y"])
+                if scroller:
+                    sign = -1.0 if snap["text_direction"] in ("right", "down") else 1.0
+                    scroll_offset += sign * dt * snap["scroll_speed"]
+                    frame[canvas_h - text_h:canvas_h] = scroller.frame(scroll_offset)
 
             # Any bright channel counts as "lit" -- avoids the classic
             # luminance-formula surprise where pure red/blue content looks
             # nearly black on a 1-bit display.
             gray = frame.max(axis=2)
             bitmap = frame_to_bitmap(gray, snap["threshold"], snap["dither"])
+            # The preview shows grid-slot space (what you meant to see); the
+            # chain remap below is the last step before the wire.
             preview.update(bitmap)
+            bitmap = apply_block_order(bitmap, rows, cols, args.panel_width,
+                                        args.panel_height, snap["order"])
 
             img = Image.fromarray((bitmap.astype(np.uint8) * 255), mode="L").convert("1")
             if snap["rotate180"]:

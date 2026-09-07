@@ -64,10 +64,11 @@ Useful flags:
                                        Also fixed at startup.
     --layout grid|strip                 which of the two physical
                                        arrangements above -- live-editable.
-    Per-module orientation: click a module's own tile in the live preview
-    to flip it 180 (upside-down mount) -- click its "F" corner to mirror it
-    (wired/soldered backwards relative to its neighbours). Both live,
-    per-module, no CLI flag -- calibrate on the wall, same as --order.
+    Per-module orientation: drag a tile in the layout grid, same widget as
+    --order. Its angle button cycles 0/90/180/270 (a chip's own 8x8 dot
+    matrix soldered rotated relative to its neighbours); H/V mirror it
+    horizontally/vertically, independently. All three live, per-module, no
+    CLI flag -- calibrate on the wall.
 
     --rotate180                         the whole assembly is mounted
                                        upside down -- flips the final image
@@ -540,11 +541,12 @@ class State:
         self.media_pos_x = 0
         self.media_pos_y = 0
         self.layout = args.layout
-        # Per-module, not global -- a single physical board mounted upside
-        # down or wired mirrored relative to its neighbours, calibrated by
-        # clicking that module's own tile in the preview.
-        self.orient = [False] * args.num_panels
-        self.flip = [False] * args.num_panels
+        # Per-module, not global -- a single physical board rotated or
+        # mirrored relative to its neighbours, calibrated by dragging that
+        # module's own tile in the layout grid.
+        self.orient = [0] * args.num_panels  # each 0/90/180/270
+        self.flip_h = [False] * args.num_panels
+        self.flip_v = [False] * args.num_panels
         self.rotate180 = args.rotate180
         self.threshold = args.threshold
         self.dither = args.dither
@@ -602,7 +604,8 @@ class State:
                         media_rotation=self.media_rotation,
                         media_scale=self.media_scale,
                         media_pos_x=self.media_pos_x, media_pos_y=self.media_pos_y,
-                        layout=self.layout, orient=list(self.orient), flip=list(self.flip),
+                        layout=self.layout, orient=list(self.orient),
+                        flip_h=list(self.flip_h), flip_v=list(self.flip_v),
                         rotate180=self.rotate180, threshold=self.threshold,
                         dither=self.dither, calibrate=self.calibrate,
                         order=list(self.order), active=self.active,
@@ -687,7 +690,16 @@ class State:
             if "layout" in data and data["layout"] in LAYOUTS and data["layout"] != self.layout:
                 self.layout = data["layout"]
                 rebuild = True
-            for key in ("orient", "flip"):
+            if "orient" in data:
+                cur = self.orient
+                try:
+                    candidate = [int(v) for v in data["orient"]]
+                except (TypeError, ValueError):
+                    candidate = None
+                if candidate is not None and len(candidate) == len(cur) \
+                        and all(v in (0, 90, 180, 270) for v in candidate):
+                    self.orient = candidate
+            for key in ("flip_h", "flip_v"):
                 if key in data:
                     cur = getattr(self, key)
                     try:
@@ -849,33 +861,46 @@ def apply_active_mask(bitmap, rows, cols, panel_w, panel_h, order, active):
     return out
 
 
-def apply_module_transforms(bitmap, rows, cols, panel_w, panel_h, order, orient, flip):
-    """Per-module 180-degree rotate and/or mirror, applied in grid-slot
-    space but indexed by chain position (`orient`/`flip`, via `order`) --
-    a rotate/mirror is a property of the physical board, so it has to stay
-    attached to that board's chain position when `order` drags its content
-    to a different slot, not to whichever slot happened to hold it before.
-    Both preserve a module's panel_w x panel_h footprint (unlike a
-    90-degree turn, which would need a taller-than-wide slot -- not
-    physically what a single fixed-aspect board mounted differently can
-    do), so this is a plain array flip per module, no PIL/resampling
-    needed. Independent per module: one board mounted upside down or wired
-    backwards doesn't imply its neighbours are."""
-    if not any(orient) and not any(flip):
+def apply_module_transforms(bitmap, rows, cols, panel_w, panel_h, order, orient, flip_h, flip_v):
+    """Per-module rotate (0/90/180/270) and/or mirror (independently
+    horizontal and vertical), applied in grid-slot space but indexed by
+    chain position (`orient`/`flip_h`/`flip_v`, via `order`) -- a rotate or
+    mirror is a property of the physical board, so it has to stay attached
+    to that board's chain position when `order` drags its content to a
+    different slot, not to whichever slot happened to hold it before.
+
+    90/270 rotate each 8x8 chip block in place rather than the whole
+    panel_w x panel_h tile as one shape -- a true whole-tile 90 would need
+    a taller-than-wide slot, which a fixed 32x8 board mounted differently
+    can't produce. This is the same correction the old global
+    --block-orientation applied (via luma's device-wide block rotation),
+    just per module now instead of uniformly: it's for a chip whose own
+    8x8 dot-matrix component is soldered rotated relative to its
+    neighbours, not for the module's footprint in the overall picture."""
+    if not any(orient) and not any(flip_h) and not any(flip_v):
         return bitmap
     out = bitmap.copy()
     labels = chain_labels(order)
+    chips_w, chips_h = panel_w // 8, panel_h // 8
     for slot in range(rows * cols):
         chain_pos = labels[slot] - 1
-        if not orient[chain_pos] and not flip[chain_pos]:
+        deg, fh, fv = orient[chain_pos], flip_h[chain_pos], flip_v[chain_pos]
+        if not deg and not fh and not fv:
             continue
         r, c = divmod(slot, cols)
         y0, x0 = r * panel_h, c * panel_w
         tile = out[y0:y0 + panel_h, x0:x0 + panel_w]
-        if orient[chain_pos]:
-            tile = tile[::-1, ::-1]
-        if flip[chain_pos]:
+        if deg:
+            rotated = tile.copy()
+            for cy in range(chips_h):
+                for cx in range(chips_w):
+                    block = tile[cy * 8:cy * 8 + 8, cx * 8:cx * 8 + 8]
+                    rotated[cy * 8:cy * 8 + 8, cx * 8:cx * 8 + 8] = np.rot90(block, k=deg // 90)
+            tile = rotated
+        if fh:
             tile = tile[:, ::-1]
+        if fv:
+            tile = tile[::-1, :]
         out[y0:y0 + panel_h, x0:x0 + panel_w] = tile
     return out
 
@@ -1041,7 +1066,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     "rows": rows, "cols": cols,
                     "pw": self.panel_w, "ph": self.panel_h,
                     "labels": chain_labels(snap["order"]), "active": snap["active"],
-                    "orient": snap["orient"], "flip": snap["flip"],
+                    "orient": snap["orient"], "flip_h": snap["flip_h"], "flip_v": snap["flip_v"],
                 })
             self._send(body, "application/json")
         else:
@@ -1115,9 +1140,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <p style="color:#888;font-size:.85rem;margin:.8rem 0 .3rem">
   Turn on calibration mode below, then drag tiles here to match the numbers
   you actually see on the wall -- read 1, 2, 3, ... left to right, top to
-  bottom once it matches. R rotates that module 180, F mirrors it; both
-  travel with the tile if you drag it elsewhere. {rows}x{cols} modules,
-  {self.panel_w}x{self.panel_h} each.
+  bottom once it matches. The angle button (top-right) cycles 0/90/180/270;
+  H/V (bottom-right) mirror horizontally/vertically, independently. All
+  three travel with the tile if you drag it elsewhere. {rows}x{cols}
+  modules, {self.panel_w}x{self.panel_h} each.
 </p>
 <label><input type="checkbox" {"checked" if snap['calibrate'] else ""}
   onchange="state.calibrate=this.checked; send();"> Calibration mode</label>
@@ -1197,7 +1223,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
   onchange="state.rotate180=this.checked; send();"> Assembly mounted upside down</label>
 <span style="color:#888;font-size:.8rem">
-  -- one module wrong instead? Use its R/F buttons in the layout grid above.
+  -- one module wrong instead? Use its angle/H/V buttons in the layout grid
+  above.
 </span>
 <br><br>
 
@@ -1332,23 +1359,27 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   function renderBlockGrid(data) {{
     // The actual control surface: one draggable tile per grid slot, showing
     // which chain position (physical module) currently sits there. Drag a
-    // tile onto another to swap them -- R/F on the tile itself rotate/mirror
-    // that module and travel with it if dragged elsewhere.
+    // tile onto another to swap them. The angle button (top-right) cycles
+    // 0/90/180/270 -- rotates that module's chips in place, same
+    // correction the old global --block-orientation applied, just per
+    // module now. H/V (bottom-right) mirror it horizontally/vertically,
+    // independently. All three travel with the tile if dragged elsewhere.
     const el = document.getElementById('blockGrid');
     if (dragSlot !== null) return; // don't rebuild out from under an active drag
-    const key = [data.rows, data.cols, data.labels, data.active, data.orient, data.flip].join('|');
+    const key = [data.rows, data.cols, data.labels, data.active,
+                 data.orient, data.flip_h, data.flip_v].join('|');
     if (el.dataset.key === key) return;
     el.dataset.key = key;
     el.innerHTML = '';
     el.style.display = 'inline-grid';
-    el.style.gridTemplateColumns = `repeat(${{data.cols}}, 72px)`;
+    el.style.gridTemplateColumns = `repeat(${{data.cols}}, 76px)`;
     el.style.gap = '4px';
     data.labels.forEach((chainPos, slot) => {{
       const inactive = chainPos > data.active;
       const c = chainPos - 1;
       const cell = document.createElement('div');
       cell.draggable = true;
-      cell.style.cssText = 'position:relative;width:72px;height:44px;box-sizing:border-box;' +
+      cell.style.cssText = 'position:relative;width:76px;height:48px;box-sizing:border-box;' +
         `border:2px ${{inactive ? 'dashed #444' : 'solid #6cf'}};border-radius:4px;` +
         `background:${{inactive ? '#181818' : '#123'}};cursor:grab;` +
         'display:flex;align-items:center;justify-content:center;user-select:none';
@@ -1356,21 +1387,24 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
       num.textContent = chainPos;
       num.style.cssText = `font:bold 18px monospace;color:${{inactive ? '#555' : '#eee'}}`;
       cell.appendChild(num);
-      const chip = (letter, on, toggle) => {{
+      const chip = (label, on, toggle, pos) => {{
         const b = document.createElement('span');
-        b.textContent = letter;
-        b.style.cssText = 'position:absolute;top:1px;cursor:pointer;font:9px monospace;' +
+        b.textContent = label;
+        b.style.cssText = `position:absolute;${{pos}}cursor:pointer;font:9px monospace;` +
           `padding:0 3px;background:${{on ? '#6cf' : 'rgba(255,255,255,.15)'}};` +
           `color:${{on ? '#012' : '#eee'}}`;
         b.onclick = (e) => {{ e.stopPropagation(); toggle(); }};
         return b;
       }};
-      const rot = chip('R', data.orient[c], () => {{ state.orient[c] = !state.orient[c]; send(); }});
-      rot.style.right = '12px';
-      const mir = chip('F', data.flip[c], () => {{ state.flip[c] = !state.flip[c]; send(); }});
-      mir.style.right = '0';
+      const rot = chip(data.orient[c] + '°', data.orient[c] !== 0,
+        () => {{ state.orient[c] = (state.orient[c] + 90) % 360; send(); }}, 'top:1px;right:1px;');
+      const h = chip('H', data.flip_h[c],
+        () => {{ state.flip_h[c] = !state.flip_h[c]; send(); }}, 'bottom:1px;right:14px;');
+      const v = chip('V', data.flip_v[c],
+        () => {{ state.flip_v[c] = !state.flip_v[c]; send(); }}, 'bottom:1px;right:1px;');
       cell.appendChild(rot);
-      cell.appendChild(mir);
+      cell.appendChild(h);
+      cell.appendChild(v);
       cell.addEventListener('dragstart', () => {{ dragSlot = slot; cell.style.opacity = '.4'; }});
       cell.addEventListener('dragend', () => {{ dragSlot = null; cell.style.opacity = '1'; }});
       cell.addEventListener('dragover', (e) => e.preventDefault());
@@ -1659,8 +1693,8 @@ def main():
             bitmap = apply_active_mask(bitmap, rows, cols, args.panel_width,
                                         args.panel_height, snap["order"], snap["active"])
             bitmap = apply_module_transforms(bitmap, rows, cols, args.panel_width,
-                                              args.panel_height, snap["order"],
-                                              snap["orient"], snap["flip"])
+                                              args.panel_height, snap["order"], snap["orient"],
+                                              snap["flip_h"], snap["flip_v"])
             # The preview shows grid-slot space, post per-module correction
             # (what you meant to see, already fixed up) -- the chain remap
             # below is the last step before the wire.

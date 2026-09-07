@@ -854,7 +854,38 @@ def apply_block_order(frame, rows, cols, panel_w, panel_h, order):
     return out
 
 
-def render_calibration_frame(rows, cols, panel_w, panel_h, font):
+# Classic 3x5 pixel numerals -- legible at any module height >=5px, unlike
+# a TrueType font antialiased down this small: at 7-8px a curved digit like
+# "2" or "3" degrades to noise once thresholded to 1-bit, while a straight
+# one like "1" happens to survive, which is exactly the failure mode a
+# calibration display can least afford (numbers becoming unreadable).
+DIGIT_GLYPHS = {
+    "0": ["111", "101", "101", "101", "111"],
+    "1": ["010", "110", "010", "010", "111"],
+    "2": ["111", "001", "111", "100", "111"],
+    "3": ["111", "001", "111", "001", "111"],
+    "4": ["101", "101", "111", "001", "001"],
+    "5": ["111", "100", "111", "001", "111"],
+    "6": ["111", "100", "111", "101", "111"],
+    "7": ["111", "001", "010", "010", "010"],
+    "8": ["111", "101", "111", "101", "111"],
+    "9": ["111", "101", "111", "001", "111"],
+}
+DIGIT_GLYPH_W, DIGIT_GLYPH_H = 3, 5
+
+
+def draw_digits(draw, x0, y0, text, color=(255, 255, 255)):
+    """Draw `text` (digits only) as exact DIGIT_GLYPHS pixels at (x0, y0)."""
+    cx = x0
+    for ch in text:
+        for gy, row in enumerate(DIGIT_GLYPHS[ch]):
+            for gx, bit in enumerate(row):
+                if bit == "1":
+                    draw.point((cx + gx, y0 + gy), fill=color)
+        cx += DIGIT_GLYPH_W + 1
+
+
+def render_calibration_frame(rows, cols, panel_w, panel_h):
     """Calibration pattern: every module shows its grid-slot number inside a
     border, so you can read straight off the wall which physical module is
     sitting where. Adjust the block order until the wall reads 1, 2, 3, ...
@@ -866,10 +897,13 @@ def render_calibration_frame(rows, cols, panel_w, panel_h, font):
         x0, y0 = c * panel_w, r * panel_h
         draw.rectangle([x0, y0, x0 + panel_w - 1, y0 + panel_h - 1], outline=(255, 255, 255))
         label = str(slot + 1)
-        bbox = draw.textbbox((0, 0), label, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text((x0 + (panel_w - tw) // 2 - bbox[0], y0 + (panel_h - th) // 2 - bbox[1]),
-                   label, font=font, fill=(255, 255, 255))
+        label_w = len(label) * (DIGIT_GLYPH_W + 1) - 1
+        # Centered within the interior, inside the 1px border on every edge
+        # -- not the full module, which is what let the old text-based
+        # version's glyph collide with the border.
+        tx = x0 + 1 + max(0, (panel_w - 2 - label_w) // 2)
+        ty = y0 + 1 + max(0, (panel_h - 2 - DIGIT_GLYPH_H) // 2)
+        draw_digits(draw, tx, ty, label)
     return np.array(img)
 
 
@@ -1534,8 +1568,6 @@ def main():
 
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]
-    # One digit has to fit inside a module minus its 1px calibration border.
-    calibration_font = load_font(args.font, max(6, args.panel_height - 1))
 
     preview = Preview()
     server = None
@@ -1590,8 +1622,7 @@ def main():
 
             rows, cols = LAYOUTS[snap["layout"]]
             if snap["calibrate"]:
-                frame = render_calibration_frame(rows, cols, args.panel_width,
-                                                  args.panel_height, calibration_font)
+                frame = render_calibration_frame(rows, cols, args.panel_width, args.panel_height)
             else:
                 frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
                 if video_h > 0:
@@ -1608,7 +1639,10 @@ def main():
             # luminance-formula surprise where pure red/blue content looks
             # nearly black on a 1-bit display.
             gray = frame.max(axis=2)
-            bitmap = frame_to_bitmap(gray, snap["threshold"], snap["dither"])
+            # Dithering is for photographic gradients -- on calibration's
+            # exact-pixel digits/borders it only adds noise, never helps.
+            dither = snap["dither"] and not snap["calibrate"]
+            bitmap = frame_to_bitmap(gray, snap["threshold"], dither)
             bitmap = apply_active_mask(bitmap, rows, cols, args.panel_width,
                                         args.panel_height, snap["order"], snap["active"])
             # The preview shows grid-slot space (what you meant to see); the

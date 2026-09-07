@@ -208,6 +208,14 @@ TEXT_COLOR = (255, 255, 255)  # only luminance reaches the hardware -- hue is mo
 # rows, cols of modules for each named physical layout.
 LAYOUTS = {"grid": (3, 2), "strip": (2, 3), "half": (1, 3)}
 
+# luma's spi() asserts bus_speed_hz is exactly one of a fixed set of clock
+# dividers (0.5/1/2/4/8/...MHz) -- anything else raises AssertionError deep
+# inside device construction, before main()'s own try/except even starts,
+# so a bad value here is an unrecoverable crash loop, not a soft failure.
+# This is the practical low-speed subset for a long MAX7219 chain; luma
+# itself also accepts 16-52MHz, not offered here as pointless for this.
+SPI_HZ_CHOICES = (500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000)
+
 
 def split_row_for(rows, dual_bus):
     """How many of `rows` grid-rows the first SPI bus drives when
@@ -688,7 +696,7 @@ class State:
             if "spi_hz" in data:
                 try:
                     hz = int(data["spi_hz"])
-                    if 100_000 <= hz <= 8_000_000:
+                    if hz in SPI_HZ_CHOICES:
                         self.spi_hz = hz
                 except (TypeError, ValueError):
                     pass
@@ -1462,12 +1470,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <br><br>
 <label>SPI clock
   <select onchange="state.spi_hz=parseInt(this.value); send();">
-    {_opt("200000", str(snap["spi_hz"]))}
-    {_opt("500000", str(snap["spi_hz"]))}
-    {_opt("1000000", str(snap["spi_hz"]))}
-    {_opt("2000000", str(snap["spi_hz"]))}
-    {_opt("4000000", str(snap["spi_hz"]))}
-    {_opt("8000000", str(snap["spi_hz"]))}
+    {"".join(_opt(str(hz), str(snap["spi_hz"])) for hz in SPI_HZ_CHOICES)}
   </select>
 </label>
 <span style="color:#888;font-size:.8rem">
@@ -1828,7 +1831,7 @@ def parse_args():
                         "half no longer depends on the first half's chips "
                         "to relay it. Default: one bus, the whole chain "
                         "daisy-chained as before.")
-    p.add_argument("--spi-hz", type=int, default=1000000,
+    p.add_argument("--spi-hz", type=int, default=1000000, choices=SPI_HZ_CHOICES,
                    help="24 chips cascaded gets noisy at higher speeds over "
                         "anything but short, high-quality wiring -- flicker "
                         "or dark modules at the far end of the chain means "

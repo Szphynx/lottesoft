@@ -172,6 +172,7 @@ import http.server
 import json
 import math
 import os
+import random
 import re
 import socket
 import subprocess
@@ -952,52 +953,114 @@ MAX7219_INTENSITY = 10  # luma.led_matrix.const.max7219.INTENSITY register addre
 MAX7219_NOOP = 0        # ...NOOP -- a chip ignores this pair entirely
 
 
+def boot_sweep_frame(chip_positions, active, canvas_w, canvas_h, cascaded, slot_for):
+    """Pure per-tick math for boot_sweep, split out so it's testable without
+    real timing: given which chips are mid-fade right now (`active`, a dict
+    {(gx, gy): level 0-15}), build the pixel frame (only active chips lit)
+    and the per-chip INTENSITY command (NOOP everywhere else, so inactive
+    chips' brightness is never touched)."""
+    frame = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    cmd = [MAX7219_NOOP, 0] * cascaded
+    for pos, level in active.items():
+        if level <= 0:
+            continue
+        gx, gy = pos
+        frame[gy * 8:(gy + 1) * 8, gx * 8:(gx + 1) * 8] = 255
+        slot = slot_for[pos]
+        cmd[2 * slot:2 * slot + 2] = [MAX7219_INTENSITY, level]
+    return frame, cmd
+
+
+def boot_sweep_active_chips(t, starts, fade_s):
+    """Which chips are mid-fade at time `t`, and their INTENSITY level
+    (0-15, a triangular envelope that rises then falls across that chip's
+    own fade_s-wide window). Pure function of the precomputed per-chip
+    random start times, so the coverage guarantee -- every chip gets
+    exactly one activation somewhere in [0, duration_s) -- and the
+    envelope shape are both testable without any real timing or
+    hardware."""
+    active = {}
+    for pos, start in starts.items():
+        local_t = t - start
+        if 0 <= local_t < fade_s:
+            frac = local_t / fade_s
+            active[pos] = round((1 - abs(2 * frac - 1)) * 15)
+    return active
+
+
 def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
-                fade_steps=4, step_s=0.02):
-    """A visible "just came back up" signal on the LEDs: fade each 8x8 chip
-    in turn from the first physically wired chip to the last, then blank.
-    Finer-grained than a whole-module chase (every chip, not every
-    module), and each step is a real hardware brightness ramp, not a hard
-    on/off -- confined to a single chip at a time, so unlike per-chip
-    *rotation* there's no cross-chip boundary for it to tear at.
+                duration_s=0.3, fade_s=0.06, fps=60, rng=None):
+    """A brief, chaotic "just came back up" flash: every 8x8 chip gets its
+    own randomly-timed fade-in-then-out within a short shared window, all
+    overlapping in time -- unlike a chase (one chip at a time), several
+    chips are mid-fade at any given instant, at random, so it reads as
+    scattered sparkle rather than a wipe. Every chip gets exactly one fade
+    cycle somewhere in the window, so the whole assembly still gets
+    touched once -- only the timing is randomized, not which chips
+    participate.
+
+    One display() + one data() call per animation tick, however many
+    chips are simultaneously mid-fade -- that's what keeps ~24 chips'
+    worth of independent, overlapping fades inside a real ~duration_s
+    budget on actual SPI hardware, instead of one round-trip per chip.
 
     The fade uses the MAX7219's own per-chip INTENSITY register instead of
     device-wide contrast(): contrast() writes the same value to every
-    cascaded chip in one shot, so it can't dim just one chip. A MAX7219
-    chain is a plain shift register, though -- sending a NOOP (opcode 0)
-    for every chip except the one target, whose slot carries the real
-    INTENSITY command, changes only that chip's register and leaves
-    every other chip's brightness (and pixels) alone. `device._offsets`
-    is the same chip-position table `display()` itself sends in, so
-    looking a chip's image offset up in it is guaranteed to name the
-    right slot in that per-chip command -- no separate addressing math
-    to get wrong.
+    cascaded chip in one shot, so it can't dim just one chip at a time.
+    Sending a NOOP (opcode 0) for every chip except the ones mid-fade,
+    whose slots carry the real INTENSITY command, changes only those
+    chips' registers. `device._offsets` is the same chip-position table
+    display() itself sends in, so looking a chip's image offset up in it
+    names the right slot -- no separate addressing math to get wrong.
 
     Runs once at startup/restart, before the real render loop picks up
     wherever the last saved config left off. Resets every chip's
     intensity back to `brightness` at the end -- the main loop only calls
-    contrast() again when brightness *changes*, so without this the last
-    chip touched here would be stuck dim."""
-    blank = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-    up = [round(i * 15 / fade_steps) for i in range(fade_steps + 1)]
-    ramp = up + up[-2::-1]  # fade in to full, then back down to 0
+    contrast() again when brightness *changes*, so without this whichever
+    chip faded last would be stuck dim."""
+    rng = rng or random.Random()
+    cascaded = device.cascaded
+    offsets = list(device._offsets)
+    n_x, n_y = canvas_w // 8, canvas_h // 8
+    chip_positions = [(gx, gy) for gy in range(n_y) for gx in range(n_x)]
+    slot_for = {(gx, gy): offsets.index(gy * 8 * canvas_w + gx * 8) for gx, gy in chip_positions}
+    starts = {pos: rng.uniform(0, max(duration_s - fade_s, 0)) for pos in chip_positions}
 
-    for y in range(0, canvas_h, 8):
-        for x in range(0, canvas_w, 8):
-            frame = blank.copy()
-            frame[y:y + 8, x:x + 8] = 255
-            img = Image.fromarray(frame, mode="L").convert("1")
-            if rotate180:
-                img = img.rotate(180)
-            device.display(img)
-            chip = device._offsets.index(y * canvas_w + x)
-            for level in ramp:
-                cmd = [MAX7219_NOOP, 0] * device.cascaded
-                cmd[2 * chip:2 * chip + 2] = [MAX7219_INTENSITY, level]
-                device.data(cmd)
-                time.sleep(step_s)
-    device.display(Image.fromarray(blank, mode="L").convert("1"))
+    t0 = time.monotonic()
+    dt_frame = 1.0 / fps
+    while True:
+        t = time.monotonic() - t0
+        if t >= duration_s:
+            break
+        active = boot_sweep_active_chips(t, starts, fade_s)
+        frame, cmd = boot_sweep_frame(chip_positions, active, canvas_w, canvas_h,
+                                       cascaded, slot_for)
+        img = Image.fromarray(frame, mode="L").convert("1")
+        if rotate180:
+            img = img.rotate(180)
+        device.display(img)
+        device.data(cmd)
+        slack = dt_frame - (time.monotonic() - t0 - t)
+        if slack > 0:
+            time.sleep(slack)
+
+    device.display(Image.fromarray(np.zeros((canvas_h, canvas_w), dtype=np.uint8),
+                                    mode="L").convert("1"))
     device.contrast(brightness)
+
+
+def run_boot_sweep(devices, rotate180, brightness, **kwargs):
+    """Runs boot_sweep on each (device, canvas_w, canvas_h) at the same
+    time, not one after another -- so a dual-bus assembly (--spi-device2)
+    flashes as one wall within the same ~0.3s window instead of each half
+    flashing in turn."""
+    threads = [threading.Thread(target=boot_sweep, args=(d, cw, ch, rotate180, brightness),
+                                 kwargs=kwargs)
+               for d, cw, ch in devices]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
 
 
 # Classic 3x5 pixel numerals -- legible at any module height >=5px, unlike
@@ -1824,8 +1887,7 @@ def main():
                         bus_speed_hz=snap0["spi_hz"])
     device = build_device(serial_iface, canvas_w, split_row * args.panel_height,
                            snap0["block_orientation"], snap0["brightness"])
-    boot_sweep(device, canvas_w, split_row * args.panel_height,
-               snap0["rotate180"], snap0["brightness"])
+    boot_devices = [(device, canvas_w, split_row * args.panel_height)]
 
     serial_iface2 = device2 = None
     if dual_bus:
@@ -1833,8 +1895,9 @@ def main():
                              bus_speed_hz=snap0["spi_hz"])
         device2 = build_device(serial_iface2, canvas_w, (rows0 - split_row) * args.panel_height,
                                 snap0["block_orientation"], snap0["brightness"])
-        boot_sweep(device2, canvas_w, (rows0 - split_row) * args.panel_height,
-                   snap0["rotate180"], snap0["brightness"])
+        boot_devices.append((device2, canvas_w, (rows0 - split_row) * args.panel_height))
+
+    run_boot_sweep(boot_devices, snap0["rotate180"], snap0["brightness"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0

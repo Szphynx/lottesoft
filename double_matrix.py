@@ -174,6 +174,7 @@ import math
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -927,6 +928,31 @@ def apply_block_order(frame, rows, cols, panel_w, panel_h, order):
     return out
 
 
+def boot_sweep(device, rows, cols, panel_w, panel_h, canvas_w, canvas_h,
+                rotate180, step_s=0.08):
+    """A visible "just came back up" signal on the LEDs: chase one
+    module-sized tile from the first physically wired module to the last,
+    then blank. Raster position c in this frame IS chain position c --
+    unlike everything in the main render loop, this has no `order` to
+    thread through, because it deliberately bypasses apply_block_order:
+    the sweep is about the physical chain (what just powered on, in wiring
+    order), not the drag-and-drop content mapping, so it always walks
+    first-wired-module to last regardless of how the blocks are reordered
+    on screen. Runs once at startup/restart, before the real render loop
+    picks up wherever the last saved config left off."""
+    blank = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    for c in range(rows * cols):
+        frame = blank.copy()
+        r, cc = divmod(c, cols)
+        frame[r * panel_h:(r + 1) * panel_h, cc * panel_w:(cc + 1) * panel_w] = 255
+        img = Image.fromarray(frame, mode="L").convert("1")
+        if rotate180:
+            img = img.rotate(180)
+        device.display(img)
+        time.sleep(step_s)
+    device.display(Image.fromarray(blank, mode="L").convert("1"))
+
+
 # Classic 3x5 pixel numerals -- legible at any module height >=5px, unlike
 # a TrueType font antialiased down this small: at 7-8px a curved digit like
 # "2" or "3" degrades to noise once thresholded to 1-bit, while a straight
@@ -1097,9 +1123,25 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self._send("ok", "text/plain")
         elif self.path == "/upload":
             self._handle_upload()
+        elif self.path == "/restart":
+            self._handle_restart()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_restart(self):
+        """sudo systemctl restart double-matrix -- for when the LED chain
+        needs a hard reset (e.g. after replugging modules) and a page reload
+        isn't enough. Reply first: the restart kills this very process, so
+        the actual systemctl call happens on a short delay in a background
+        thread, after the response has had time to reach the browser."""
+        self._send("restarting", "text/plain")
+
+        def restart_after_reply():
+            time.sleep(0.3)
+            subprocess.Popen(["sudo", "systemctl", "restart", "double-matrix"])
+
+        threading.Thread(target=restart_after_reply, daemon=True).start()
 
     def _handle_upload(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1138,9 +1180,16 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <title>Double matrix control</title>
 <body style="font:16px monospace;background:#111;color:#eee;
              max-width:32rem;margin:2rem auto;padding:0 1rem">
-<h1 style="font-size:1.1rem">Double matrix control</h1>
+<h1 style="font-size:1.1rem">Double matrix control
+  <span id="svcStatus" style="font-size:.6rem;padding:.15rem .5rem;border-radius:3px;
+       vertical-align:middle;margin-left:.5rem;background:#2a4;color:#012">ONLINE</span>
+</h1>
+<button onclick="restartService()" title="sudo systemctl restart double-matrix"
+  style="background:#622;color:#fdd;border:none;border-radius:4px;padding:.35rem .7rem;
+         cursor:pointer">restart service</button>
+<span id="restartMsg" style="font-size:.8rem;color:#888;margin-left:.5rem"></span>
 
-<p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
+<p style="color:#888;font-size:.85rem;margin:.5rem 0 .3rem">
   Live preview -- the actual bitmap being sent to the panels right now:
 </p>
 <div id="previewWrap" style="position:relative;display:inline-block;
@@ -1438,8 +1487,29 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
       el.appendChild(cell);
     }});
   }}
+  let svcFails = 0, svcWasDown = false;
+  function setSvcStatus(online) {{
+    const el = document.getElementById('svcStatus');
+    if (online) {{
+      svcFails = 0;
+      el.textContent = 'ONLINE'; el.style.background = '#2a4'; el.style.color = '#012';
+      if (svcWasDown) {{
+        document.getElementById('restartMsg').textContent = 'back online';
+        svcWasDown = false;
+      }}
+    }} else if (++svcFails >= 2) {{
+      el.textContent = 'OFFLINE'; el.style.background = '#a22'; el.style.color = '#fdd';
+      svcWasDown = true;
+    }}
+  }}
+  function restartService() {{
+    if (!confirm('Restart the double-matrix service now?')) return;
+    document.getElementById('restartMsg').textContent = 'restarting...';
+    fetch('/restart', {{method: 'POST'}}).catch(() => {{}});
+  }}
   function pollPreview() {{
     fetch('/frame.json').then(r => r.json()).then(data => {{
+      setSvcStatus(true);
       const el = document.getElementById('preview');
       if (!data.w || !data.h) return;
       if (el.dataset.w != data.w || el.dataset.h != data.h) {{
@@ -1461,7 +1531,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
       }}
       drawOverlay(data);
       renderBlockGrid(data);
-    }}).catch(() => {{}}).finally(() => setTimeout(pollPreview, 150));
+    }}).catch(() => {{ setSvcStatus(false); }}).finally(() => setTimeout(pollPreview, 150));
   }}
   pollPreview();
 </script>
@@ -1662,6 +1732,9 @@ def main():
                         bus_speed_hz=args.spi_hz)
     device = build_device(serial_iface, canvas_w, canvas_h, snap0["block_orientation"],
                            snap0["brightness"])
+    rows0, cols0 = LAYOUTS[snap0["layout"]]
+    boot_sweep(device, rows0, cols0, args.panel_width, args.panel_height,
+               canvas_w, canvas_h, snap0["rotate180"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0

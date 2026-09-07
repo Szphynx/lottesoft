@@ -174,6 +174,7 @@ import math
 import os
 import random
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -953,12 +954,56 @@ MAX7219_INTENSITY = 10  # luma.led_matrix.const.max7219.INTENSITY register addre
 MAX7219_NOOP = 0        # ...NOOP -- a chip ignores this pair entirely
 
 
-def boot_sweep_frame(chip_positions, active, canvas_w, canvas_h, cascaded, slot_for):
-    """Pure per-tick math for boot_sweep, split out so it's testable without
-    real timing: given which chips are mid-fade right now (`active`, a dict
-    {(gx, gy): level 0-15}), build the pixel frame (only active chips lit)
-    and the per-chip INTENSITY command (NOOP everywhere else, so inactive
-    chips' brightness is never touched)."""
+def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
+                duration_s=1.0, fade_steps=2):
+    """STARTUP animation: fade each 8x8 chip in turn, first physically
+    wired chip to last, then blank -- one chip fully fades in and back out
+    before the next one starts. Deliberately sequential (unlike the
+    shutdown flash's overlapping randomness), so it reads as the chain
+    visibly coming alive one board at a time.
+
+    `duration_s` targets the WHOLE sweep regardless of chip count -- each
+    chip's own ramp is scaled to fit, so a 12-chip bus and a 24-chip bus
+    both finish in about the same time instead of the smaller one racing
+    through early.
+
+    Same per-chip INTENSITY trick as the shutdown flash (see there for
+    why it has to be that and not contrast()); resets every chip's
+    intensity back to `brightness` at the end, since the main loop only
+    calls contrast() again when brightness *changes*."""
+    cascaded = device.cascaded
+    ramp_len = 2 * fade_steps + 1  # fade in to full, then back down to 0
+    step_s = duration_s / (cascaded * ramp_len) if cascaded else 0
+    up = [round(i * 15 / fade_steps) for i in range(fade_steps + 1)]
+    ramp = up + up[-2::-1]
+    blank = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+
+    for y in range(0, canvas_h, 8):
+        for x in range(0, canvas_w, 8):
+            frame = blank.copy()
+            frame[y:y + 8, x:x + 8] = 255
+            img = Image.fromarray(frame, mode="L").convert("1")
+            if rotate180:
+                img = img.rotate(180)
+            device.display(img)
+            chip = device._offsets.index(y * canvas_w + x)
+            for level in ramp:
+                cmd = [MAX7219_NOOP, 0] * cascaded
+                cmd[2 * chip:2 * chip + 2] = [MAX7219_INTENSITY, level]
+                device.data(cmd)
+                if step_s:
+                    time.sleep(step_s)
+
+    device.display(Image.fromarray(blank, mode="L").convert("1"))
+    device.contrast(brightness)
+
+
+def shutdown_flash_frame(chip_positions, active, canvas_w, canvas_h, cascaded, slot_for):
+    """Pure per-tick math for shutdown_flash, split out so it's testable
+    without real timing: given which chips are mid-fade right now
+    (`active`, a dict {(gx, gy): level 0-15}), build the pixel frame (only
+    active chips lit) and the per-chip INTENSITY command (NOOP everywhere
+    else, so inactive chips' brightness is never touched)."""
     frame = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
     cmd = [MAX7219_NOOP, 0] * cascaded
     for pos, level in active.items():
@@ -971,7 +1016,7 @@ def boot_sweep_frame(chip_positions, active, canvas_w, canvas_h, cascaded, slot_
     return frame, cmd
 
 
-def boot_sweep_active_chips(t, starts, fade_s):
+def shutdown_flash_active_chips(t, starts, fade_s):
     """Which chips are mid-fade at time `t`, and their INTENSITY level
     (0-15, a triangular envelope that rises then falls across that chip's
     own fade_s-wide window). Pure function of the precomputed per-chip
@@ -988,16 +1033,16 @@ def boot_sweep_active_chips(t, starts, fade_s):
     return active
 
 
-def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
-                duration_s=0.3, fade_s=0.06, fps=60, rng=None):
-    """A brief, chaotic "just came back up" flash: every 8x8 chip gets its
-    own randomly-timed fade-in-then-out within a short shared window, all
-    overlapping in time -- unlike a chase (one chip at a time), several
-    chips are mid-fade at any given instant, at random, so it reads as
-    scattered sparkle rather than a wipe. Every chip gets exactly one fade
-    cycle somewhere in the window, so the whole assembly still gets
-    touched once -- only the timing is randomized, not which chips
-    participate.
+def shutdown_flash(device, canvas_w, canvas_h, rotate180, brightness,
+                    duration_s=0.7, fade_s=0.09, fps=60, rng=None):
+    """SHUTDOWN animation: every 8x8 chip gets its own randomly-timed
+    fade-in-then-out within a short shared window, all overlapping in time
+    -- unlike the startup chase (one chip at a time), several chips are
+    mid-fade at any given instant, at random, so it reads as the wall
+    flickering out in one chaotic burst rather than marching off in
+    order. Every chip gets exactly one fade cycle somewhere in the
+    window, so the whole assembly still gets touched once -- only the
+    timing is randomized, not which chips participate.
 
     One display() + one data() call per animation tick, however many
     chips are simultaneously mid-fade -- that's what keeps ~24 chips'
@@ -1013,11 +1058,14 @@ def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
     display() itself sends in, so looking a chip's image offset up in it
     names the right slot -- no separate addressing math to get wrong.
 
-    Runs once at startup/restart, before the real render loop picks up
-    wherever the last saved config left off. Resets every chip's
-    intensity back to `brightness` at the end -- the main loop only calls
-    contrast() again when brightness *changes*, so without this whichever
-    chip faded last would be stuck dim."""
+    Runs when the process is stopping (SIGTERM -- systemctl stop/restart,
+    a reboot -- or Ctrl-C), right before the display is actually cleared.
+    A bare `kill -9` can't run this or anything else: SIGKILL has no
+    handler to catch. Resets every chip's intensity back to `brightness`
+    at the end so device.clear()/show() right after doesn't clear a wall
+    still stuck mid-fade in the caller's eyes (harmless in practice since
+    it's about to go dark anyway, but keeps the device's own state sane
+    if something else reads it first)."""
     rng = rng or random.Random()
     cascaded = device.cascaded
     offsets = list(device._offsets)
@@ -1032,9 +1080,9 @@ def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
         t = time.monotonic() - t0
         if t >= duration_s:
             break
-        active = boot_sweep_active_chips(t, starts, fade_s)
-        frame, cmd = boot_sweep_frame(chip_positions, active, canvas_w, canvas_h,
-                                       cascaded, slot_for)
+        active = shutdown_flash_active_chips(t, starts, fade_s)
+        frame, cmd = shutdown_flash_frame(chip_positions, active, canvas_w, canvas_h,
+                                           cascaded, slot_for)
         img = Image.fromarray(frame, mode="L").convert("1")
         if rotate180:
             img = img.rotate(180)
@@ -1049,13 +1097,12 @@ def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
     device.contrast(brightness)
 
 
-def run_boot_sweep(devices, rotate180, brightness, **kwargs):
-    """Runs boot_sweep on each (device, canvas_w, canvas_h) at the same
-    time, not one after another -- so a dual-bus assembly (--spi-device2)
-    flashes as one wall within the same ~0.3s window instead of each half
-    flashing in turn."""
-    threads = [threading.Thread(target=boot_sweep, args=(d, cw, ch, rotate180, brightness),
-                                 kwargs=kwargs)
+def run_concurrent(fn, devices, *args, **kwargs):
+    """Runs `fn` (boot_sweep or shutdown_flash) on each (device, canvas_w,
+    canvas_h) in `devices` at the same time, not one after another -- so a
+    dual-bus assembly (--spi-device2) animates as one wall within the
+    same window instead of each half animating in turn."""
+    threads = [threading.Thread(target=fn, args=(d, cw, ch, *args), kwargs=kwargs)
                for d, cw, ch in devices]
     for th in threads:
         th.start()
@@ -1824,6 +1871,16 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # systemctl stop/restart (and a reboot's shutdown sequence) send
+    # SIGTERM, not Ctrl-C's SIGINT -- without a handler that's an
+    # unconditional kill, no `finally` block, no shutdown_flash. Funnel it
+    # into the same KeyboardInterrupt handling below. (A bare `kill -9`
+    # sends SIGKILL, which no handler can catch -- nothing can run in
+    # response to that, by design.)
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     def compute_geometry(snap):
         rows, cols = LAYOUTS[snap["layout"]]
         canvas_w, canvas_h = cols * args.panel_width, rows * args.panel_height
@@ -1897,7 +1954,7 @@ def main():
                                 snap0["block_orientation"], snap0["brightness"])
         boot_devices.append((device2, canvas_w, (rows0 - split_row) * args.panel_height))
 
-    run_boot_sweep(boot_devices, snap0["rotate180"], snap0["brightness"])
+    run_concurrent(boot_sweep, boot_devices, snap0["rotate180"], snap0["brightness"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0
@@ -2011,6 +2068,12 @@ def main():
     finally:
         if server:
             server.shutdown()
+        snap = state.snapshot()
+        total_rows = canvas_h // args.panel_height
+        shutdown_devices = [(device, canvas_w, split_row * args.panel_height)]
+        if device2:
+            shutdown_devices.append((device2, canvas_w, (total_rows - split_row) * args.panel_height))
+        run_concurrent(shutdown_flash, shutdown_devices, snap["rotate180"], snap["brightness"])
         device.clear()
         device.show()
         if device2:

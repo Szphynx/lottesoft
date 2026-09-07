@@ -928,29 +928,56 @@ def apply_block_order(frame, rows, cols, panel_w, panel_h, order):
     return out
 
 
-def boot_sweep(device, rows, cols, panel_w, panel_h, canvas_w, canvas_h,
-                rotate180, step_s=0.08):
-    """A visible "just came back up" signal on the LEDs: chase one
-    module-sized tile from the first physically wired module to the last,
-    then blank. Raster position c in this frame IS chain position c --
-    unlike everything in the main render loop, this has no `order` to
-    thread through, because it deliberately bypasses apply_block_order:
-    the sweep is about the physical chain (what just powered on, in wiring
-    order), not the drag-and-drop content mapping, so it always walks
-    first-wired-module to last regardless of how the blocks are reordered
-    on screen. Runs once at startup/restart, before the real render loop
-    picks up wherever the last saved config left off."""
+MAX7219_INTENSITY = 10  # luma.led_matrix.const.max7219.INTENSITY register address
+MAX7219_NOOP = 0        # ...NOOP -- a chip ignores this pair entirely
+
+
+def boot_sweep(device, canvas_w, canvas_h, rotate180, brightness,
+                fade_steps=4, step_s=0.02):
+    """A visible "just came back up" signal on the LEDs: fade each 8x8 chip
+    in turn from the first physically wired chip to the last, then blank.
+    Finer-grained than a whole-module chase (every chip, not every
+    module), and each step is a real hardware brightness ramp, not a hard
+    on/off -- confined to a single chip at a time, so unlike per-chip
+    *rotation* there's no cross-chip boundary for it to tear at.
+
+    The fade uses the MAX7219's own per-chip INTENSITY register instead of
+    device-wide contrast(): contrast() writes the same value to every
+    cascaded chip in one shot, so it can't dim just one chip. A MAX7219
+    chain is a plain shift register, though -- sending a NOOP (opcode 0)
+    for every chip except the one target, whose slot carries the real
+    INTENSITY command, changes only that chip's register and leaves
+    every other chip's brightness (and pixels) alone. `device._offsets`
+    is the same chip-position table `display()` itself sends in, so
+    looking a chip's image offset up in it is guaranteed to name the
+    right slot in that per-chip command -- no separate addressing math
+    to get wrong.
+
+    Runs once at startup/restart, before the real render loop picks up
+    wherever the last saved config left off. Resets every chip's
+    intensity back to `brightness` at the end -- the main loop only calls
+    contrast() again when brightness *changes*, so without this the last
+    chip touched here would be stuck dim."""
     blank = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-    for c in range(rows * cols):
-        frame = blank.copy()
-        r, cc = divmod(c, cols)
-        frame[r * panel_h:(r + 1) * panel_h, cc * panel_w:(cc + 1) * panel_w] = 255
-        img = Image.fromarray(frame, mode="L").convert("1")
-        if rotate180:
-            img = img.rotate(180)
-        device.display(img)
-        time.sleep(step_s)
+    up = [round(i * 15 / fade_steps) for i in range(fade_steps + 1)]
+    ramp = up + up[-2::-1]  # fade in to full, then back down to 0
+
+    for y in range(0, canvas_h, 8):
+        for x in range(0, canvas_w, 8):
+            frame = blank.copy()
+            frame[y:y + 8, x:x + 8] = 255
+            img = Image.fromarray(frame, mode="L").convert("1")
+            if rotate180:
+                img = img.rotate(180)
+            device.display(img)
+            chip = device._offsets.index(y * canvas_w + x)
+            for level in ramp:
+                cmd = [MAX7219_NOOP, 0] * device.cascaded
+                cmd[2 * chip:2 * chip + 2] = [MAX7219_INTENSITY, level]
+                device.data(cmd)
+                time.sleep(step_s)
     device.display(Image.fromarray(blank, mode="L").convert("1"))
+    device.contrast(brightness)
 
 
 # Classic 3x5 pixel numerals -- legible at any module height >=5px, unlike
@@ -1732,9 +1759,7 @@ def main():
                         bus_speed_hz=args.spi_hz)
     device = build_device(serial_iface, canvas_w, canvas_h, snap0["block_orientation"],
                            snap0["brightness"])
-    rows0, cols0 = LAYOUTS[snap0["layout"]]
-    boot_sweep(device, rows0, cols0, args.panel_width, args.panel_height,
-               canvas_w, canvas_h, snap0["rotate180"])
+    boot_sweep(device, canvas_w, canvas_h, snap0["rotate180"], snap0["brightness"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0

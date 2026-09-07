@@ -565,6 +565,15 @@ class State:
         # handle, no device rebuild) -- for tuning a marginal chain/wiring
         # run from the web UI instead of editing config + restarting.
         self.spi_hz = args.spi_hz
+        # Only meaningful with --spi-device2: whether the second bus is
+        # actively written to each frame. Turning it off doesn't revert to
+        # a single daisy chain (that's a wiring fact, not a software one)
+        # -- it just stops sending anything to bus 2, so whatever it's
+        # wired to holds its last frame (MAX7219 needs no refresh) while
+        # bus 1 keeps running on its own. Lets you tell live whether bus 1
+        # alone is clean, and whether driving bus 2 alongside it disturbs
+        # anything (shared DIN/CLK), without editing flags and restarting.
+        self.dual_bus_active = True
         self.media_brightness = args.media_brightness
         self.media_contrast = args.media_contrast
         self.media_rotation = 0.0
@@ -635,6 +644,7 @@ class State:
                         text_stacked=self.text_stacked,
                         text_glyph_rotate=self.text_glyph_rotate,
                         brightness=self.brightness, spi_hz=self.spi_hz,
+                        dual_bus_active=self.dual_bus_active,
                         media_brightness=self.media_brightness,
                         media_contrast=self.media_contrast,
                         media_rotation=self.media_rotation,
@@ -700,6 +710,8 @@ class State:
                         self.spi_hz = hz
                 except (TypeError, ValueError):
                     pass
+            if "dual_bus_active" in data:
+                self.dual_bus_active = bool(data["dual_bus_active"])
             if "media_brightness" in data:
                 try:
                     self.media_brightness = max(0.0, min(200.0, float(data["media_brightness"])))
@@ -1228,6 +1240,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     state = None  # bound per-instance by make_control_server
     panel_w = panel_h = upload_dir = None
     preview = None
+    dual_bus = False
 
     def _send(self, body, content_type, code=200, extra_headers=None):
         body = body if isinstance(body, bytes) else body.encode()
@@ -1340,6 +1353,17 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         initial_json = json.dumps(self.state.to_wire()).replace("</", "<\\/")
         queue_rows = "".join(_queue_item_row(item) for item in snap["queue"])
         rows, cols = LAYOUTS[snap["layout"]]
+
+        dual_bus_control = "" if not self.dual_bus else f"""
+<label><input type="checkbox" {"checked" if snap['dual_bus_active'] else ""}
+  onchange="state.dual_bus_active=this.checked; send();"> Bus 2 active (--spi-device2)</label>
+<span style="color:#888;font-size:.8rem">
+  Off pauses bus 2 only -- it holds its last frame (no refresh needed),
+  bus 1 keeps running. Doesn't revert to a single daisy chain, that's a
+  wiring fact not a software one -- this is for telling live whether bus 1
+  alone is clean, and whether driving bus 2 alongside it disturbs anything.
+</span>
+<br><br>"""
 
         return f"""<!doctype html><meta charset="utf-8">
 <title>Double matrix control</title>
@@ -1479,7 +1503,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   chain means lower this before suspecting anything else.
 </span>
 <br><br>
-
+{dual_bus_control}
 <label>Active modules: <span id="aval">{snap['active']}</span> / {rows * cols}<br>
   <input type="range" min="1" max="{rows * cols}" value="{snap['active']}" style="width:100%"
     oninput="state.active=parseInt(this.value); aval.textContent=this.value; sendDebounced();">
@@ -1728,10 +1752,10 @@ def local_ip():
         s.close()
 
 
-def make_control_server(state, port, panel_w, panel_h, upload_dir, preview):
+def make_control_server(state, port, panel_w, panel_h, upload_dir, preview, dual_bus=False):
     handler = type("BoundControlHandler", (ControlHandler,), {
         "state": state, "panel_w": panel_w, "panel_h": panel_h,
-        "upload_dir": upload_dir, "preview": preview,
+        "upload_dir": upload_dir, "preview": preview, "dual_bus": dual_bus,
     })
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1933,7 +1957,8 @@ def main():
     server = None
     if args.web_port:
         server = make_control_server(state, args.web_port, args.panel_width,
-                                      args.panel_height, upload_dir, preview)
+                                      args.panel_height, upload_dir, preview,
+                                      dual_bus=dual_bus)
         print(f"control panel: http://{local_ip()}:{args.web_port}/")
         if text_h <= 0:
             print("note: no text region reserved yet (no --text/no room), so "
@@ -2053,7 +2078,10 @@ def main():
             if device2:
                 split_h = split_row * args.panel_height
                 device.display(img.crop((0, 0, canvas_w, split_h)))
-                device2.display(img.crop((0, split_h, canvas_w, canvas_h)))
+                if snap["dual_bus_active"]:
+                    device2.display(img.crop((0, split_h, canvas_w, canvas_h)))
+                # else: bus 2 gets nothing this frame -- it holds whatever
+                # it last showed (no refresh needed) while bus 1 keeps going
             else:
                 device.display(img)
             rendered += 1

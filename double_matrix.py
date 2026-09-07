@@ -207,6 +207,15 @@ TEXT_COLOR = (255, 255, 255)  # only luminance reaches the hardware -- hue is mo
 LAYOUTS = {"grid": (3, 2), "strip": (2, 3), "half": (1, 3)}
 
 
+def split_row_for(rows, dual_bus):
+    """How many of `rows` grid-rows the first SPI bus drives when
+    --spi-device2 is set -- the rest go to a second, independent bus (its
+    own direct DIN/CLK/CS run from the Pi, not daisy-chained off the first
+    bus's last chip). Single-bus mode (dual_bus False, the default) keeps
+    everything on the one device, same as before dual-bus existed."""
+    return (rows // 2) if dual_bus else rows
+
+
 def load_font(path, size, bold=False, italic=False):
     candidates = [path] if path else FONT_VARIANTS[(bold, italic)]
     for candidate in candidates:
@@ -542,6 +551,10 @@ class State:
         self.text_stacked = args.text_stacked
         self.text_glyph_rotate = args.text_glyph_rotate
         self.brightness = args.brightness
+        # Applied live (a plain attribute set on the underlying spidev
+        # handle, no device rebuild) -- for tuning a marginal chain/wiring
+        # run from the web UI instead of editing config + restarting.
+        self.spi_hz = args.spi_hz
         self.media_brightness = args.media_brightness
         self.media_contrast = args.media_contrast
         self.media_rotation = 0.0
@@ -611,7 +624,7 @@ class State:
                         text_direction=self.text_direction,
                         text_stacked=self.text_stacked,
                         text_glyph_rotate=self.text_glyph_rotate,
-                        brightness=self.brightness,
+                        brightness=self.brightness, spi_hz=self.spi_hz,
                         media_brightness=self.media_brightness,
                         media_contrast=self.media_contrast,
                         media_rotation=self.media_rotation,
@@ -670,6 +683,13 @@ class State:
                 rebuild = True
             if "brightness" in data:
                 self.brightness = max(0, min(255, int(data["brightness"])))
+            if "spi_hz" in data:
+                try:
+                    hz = int(data["spi_hz"])
+                    if 100_000 <= hz <= 8_000_000:
+                        self.spi_hz = hz
+                except (TypeError, ValueError):
+                    pass
             if "media_brightness" in data:
                 try:
                     self.media_brightness = max(0.0, min(200.0, float(data["media_brightness"])))
@@ -1330,6 +1350,22 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
   onchange="state.rotate180=this.checked; send();"> Assembly mounted upside down</label>
 <br><br>
+<label>SPI clock
+  <select onchange="state.spi_hz=parseInt(this.value); send();">
+    {_opt("200000", str(snap["spi_hz"]))}
+    {_opt("500000", str(snap["spi_hz"]))}
+    {_opt("1000000", str(snap["spi_hz"]))}
+    {_opt("2000000", str(snap["spi_hz"]))}
+    {_opt("4000000", str(snap["spi_hz"]))}
+    {_opt("8000000", str(snap["spi_hz"]))}
+  </select>
+</label>
+<span style="color:#888;font-size:.8rem">
+  Applies live, no restart -- a long chain or marginal wiring run needs a
+  slower clock; flicker or dark/glitchy modules at the far end of the
+  chain means lower this before suspecting anything else.
+</span>
+<br><br>
 
 <label>Active modules: <span id="aval">{snap['active']}</span> / {rows * cols}<br>
   <input type="range" min="1" max="{rows * cols}" value="{snap['active']}" style="width:100%"
@@ -1668,11 +1704,26 @@ def parse_args():
                         "percent, 100=neutral")
     p.add_argument("--spi-port", type=int, default=0)
     p.add_argument("--spi-device", type=int, default=0, help="chip-select line (CE0=0, CE1=1)")
+    p.add_argument("--spi-device2", type=int, default=None,
+                   help="chip-select for a SECOND, independent SPI bus (e.g. "
+                        "1 for CE1) -- splits the assembly at the halfway "
+                        "row, each half driven by its own direct wiring run "
+                        "from the Pi instead of daisy-chaining the second "
+                        "half off the first half's DOUT. Use this when a "
+                        "long/marginal DOUT-to-DIN run between the two "
+                        "halves glitches no matter how the chain is routed "
+                        "or how slow the clock is -- CLK and DIN can stay "
+                        "the same physical wires as the first bus (only CS "
+                        "differs), or be run fresh; either way the second "
+                        "half no longer depends on the first half's chips "
+                        "to relay it. Default: one bus, the whole chain "
+                        "daisy-chained as before.")
     p.add_argument("--spi-hz", type=int, default=1000000,
                    help="24 chips cascaded gets noisy at higher speeds over "
                         "anything but short, high-quality wiring -- flicker "
                         "or dark modules at the far end of the chain means "
-                        "lower this before suspecting anything else")
+                        "lower this before suspecting anything else. "
+                        "Live-editable from the web UI.")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
@@ -1680,6 +1731,15 @@ def parse_args():
     if rows * cols != args.num_panels:
         sys.exit(f"--layout {args.layout} is a {rows}x{cols} grid ({rows * cols} "
                   f"modules) but --num-panels is {args.num_panels}")
+
+    if args.spi_device2 is not None:
+        if args.spi_device2 == args.spi_device:
+            sys.exit("--spi-device2 must differ from --spi-device -- they're "
+                      "separate chip-selects (e.g. --spi-device 0 --spi-device2 1)")
+        if rows < 2:
+            sys.exit(f"--spi-device2 splits the assembly by row, so it needs "
+                      f"a layout with at least 2 rows (--layout {args.layout} "
+                      f"is {rows}x{cols}) -- use grid or strip, or drop --spi-device2")
 
     if args.order:
         args.order = parse_order(args.order, args.num_panels)
@@ -1741,6 +1801,8 @@ def main():
                              snap["text_direction"], snap["text_stacked"],
                              snap["text_glyph_rotate"])
 
+    dual_bus = args.spi_device2 is not None
+
     scroller = rebuild_scroller(snap0)
     built_version = snap0["version"]
 
@@ -1755,11 +1817,24 @@ def main():
                   "the text field won't show anything until there's a queue "
                   "item alongside the text, or text alone")
 
+    rows0, cols0 = LAYOUTS[snap0["layout"]]
+    split_row = split_row_for(rows0, dual_bus)
+
     serial_iface = spi(port=args.spi_port, device=args.spi_device, gpio=noop(),
-                        bus_speed_hz=args.spi_hz)
-    device = build_device(serial_iface, canvas_w, canvas_h, snap0["block_orientation"],
-                           snap0["brightness"])
-    boot_sweep(device, canvas_w, canvas_h, snap0["rotate180"], snap0["brightness"])
+                        bus_speed_hz=snap0["spi_hz"])
+    device = build_device(serial_iface, canvas_w, split_row * args.panel_height,
+                           snap0["block_orientation"], snap0["brightness"])
+    boot_sweep(device, canvas_w, split_row * args.panel_height,
+               snap0["rotate180"], snap0["brightness"])
+
+    serial_iface2 = device2 = None
+    if dual_bus:
+        serial_iface2 = spi(port=args.spi_port, device=args.spi_device2, gpio=noop(),
+                             bus_speed_hz=snap0["spi_hz"])
+        device2 = build_device(serial_iface2, canvas_w, (rows0 - split_row) * args.panel_height,
+                                snap0["block_orientation"], snap0["brightness"])
+        boot_sweep(device2, canvas_w, (rows0 - split_row) * args.panel_height,
+                   snap0["rotate180"], snap0["brightness"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0
@@ -1768,6 +1843,7 @@ def main():
     last_report = last_t
     last_brightness = snap0["brightness"]
     last_block_orientation = snap0["block_orientation"]
+    last_spi_hz = snap0["spi_hz"]
 
     print("running -- ctrl-c to stop")
     try:
@@ -1785,8 +1861,14 @@ def main():
                 else:
                     if (new_cw, new_ch) != (canvas_w, canvas_h) or \
                             snap["block_orientation"] != last_block_orientation:
-                        device = build_device(serial_iface, new_cw, new_ch,
+                        new_rows, _ = LAYOUTS[snap["layout"]]
+                        split_row = split_row_for(new_rows, dual_bus)
+                        device = build_device(serial_iface, new_cw, split_row * args.panel_height,
                                                snap["block_orientation"], snap["brightness"])
+                        if dual_bus:
+                            device2 = build_device(
+                                serial_iface2, new_cw, (new_rows - split_row) * args.panel_height,
+                                snap["block_orientation"], snap["brightness"])
                         last_brightness = snap["brightness"]
                         last_block_orientation = snap["block_orientation"]
                     canvas_w, canvas_h = new_cw, new_ch
@@ -1796,9 +1878,18 @@ def main():
 
             if snap["brightness"] != last_brightness:
                 device.contrast(snap["brightness"])
+                if device2:
+                    device2.contrast(snap["brightness"])
                 last_brightness = snap["brightness"]
 
+            if snap["spi_hz"] != last_spi_hz:
+                serial_iface._spi.max_speed_hz = snap["spi_hz"]
+                if serial_iface2:
+                    serial_iface2._spi.max_speed_hz = snap["spi_hz"]
+                last_spi_hz = snap["spi_hz"]
+
             rows, cols = LAYOUTS[snap["layout"]]
+            split_row = split_row_for(rows, dual_bus)
             if snap["calibrate"]:
                 frame = render_calibration_frame(rows, cols, args.panel_width, args.panel_height)
             else:
@@ -1836,7 +1927,12 @@ def main():
             img = Image.fromarray((bitmap.astype(np.uint8) * 255), mode="L").convert("1")
             if snap["rotate180"]:
                 img = img.rotate(180)
-            device.display(img)
+            if device2:
+                split_h = split_row * args.panel_height
+                device.display(img.crop((0, 0, canvas_w, split_h)))
+                device2.display(img.crop((0, split_h, canvas_w, canvas_h)))
+            else:
+                device.display(img)
             rendered += 1
 
             if args.stats and t0 - last_report >= 1.0:
@@ -1854,6 +1950,9 @@ def main():
             server.shutdown()
         device.clear()
         device.show()
+        if device2:
+            device2.clear()
+            device2.show()
         print("\nstopped")
 
 

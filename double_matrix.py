@@ -849,26 +849,32 @@ def apply_active_mask(bitmap, rows, cols, panel_w, panel_h, order, active):
     return out
 
 
-def apply_module_transforms(bitmap, rows, cols, panel_w, panel_h, orient, flip):
-    """Per-module 180-degree rotate and/or mirror, in grid-slot space.
-    Both preserve a module's panel_w x panel_h footprint (unlike a 90-degree
-    turn, which would need a taller-than-wide slot -- not physically what a
-    single fixed-aspect board mounted differently can do), so this is a
-    plain array flip per module, no PIL/resampling needed. Independent per
-    module: one board mounted upside down or wired backwards doesn't imply
-    its neighbours are."""
+def apply_module_transforms(bitmap, rows, cols, panel_w, panel_h, order, orient, flip):
+    """Per-module 180-degree rotate and/or mirror, applied in grid-slot
+    space but indexed by chain position (`orient`/`flip`, via `order`) --
+    a rotate/mirror is a property of the physical board, so it has to stay
+    attached to that board's chain position when `order` drags its content
+    to a different slot, not to whichever slot happened to hold it before.
+    Both preserve a module's panel_w x panel_h footprint (unlike a
+    90-degree turn, which would need a taller-than-wide slot -- not
+    physically what a single fixed-aspect board mounted differently can
+    do), so this is a plain array flip per module, no PIL/resampling
+    needed. Independent per module: one board mounted upside down or wired
+    backwards doesn't imply its neighbours are."""
     if not any(orient) and not any(flip):
         return bitmap
     out = bitmap.copy()
+    labels = chain_labels(order)
     for slot in range(rows * cols):
-        if not orient[slot] and not flip[slot]:
+        chain_pos = labels[slot] - 1
+        if not orient[chain_pos] and not flip[chain_pos]:
             continue
         r, c = divmod(slot, cols)
         y0, x0 = r * panel_h, c * panel_w
         tile = out[y0:y0 + panel_h, x0:x0 + panel_w]
-        if orient[slot]:
+        if orient[chain_pos]:
             tile = tile[::-1, ::-1]
-        if flip[slot]:
+        if flip[chain_pos]:
             tile = tile[:, ::-1]
         out[y0:y0 + panel_h, x0:x0 + panel_w] = tile
     return out
@@ -943,54 +949,6 @@ def render_calibration_frame(rows, cols, panel_w, panel_h):
     return np.array(img)
 
 
-def render_layout_svg(rows, cols, panel_w, panel_h, rotate180, order, active=None, cell=4):
-    """Diagram of the module chain order for the current layout. Boxes are
-    grid slots (where the content goes); the number in each is the chain
-    position driving it and the blue path is the daisy chain's actual route
-    across the wall, both straight out of `order` -- so a reordered chain
-    redraws here immediately and can't drift from what's being sent. A slot
-    whose chain position is past `active` is dimmed and dashed: it's wired,
-    but nothing is currently being sent to it."""
-    active = rows * cols if active is None else active
-    box_w, box_h, gap = panel_w * cell, panel_h * cell, 10
-    w = cols * box_w + (cols - 1) * gap
-    h = rows * box_h + (rows - 1) * gap
-
-    def center(slot):
-        r, c = divmod(slot, cols)
-        return c * (box_w + gap) + box_w / 2, r * (box_h + gap) + box_h / 2
-
-    boxes, labels, arrows = [], [], []
-    for slot, chain_pos in enumerate(chain_labels(order)):
-        r, c = divmod(slot, cols)
-        x, y = c * (box_w + gap), r * (box_h + gap)
-        inactive = chain_pos > active
-        stroke = 'stroke-dasharray="3,2" stroke="#555"' if inactive else 'stroke="#888"'
-        boxes.append(f'<rect x="{x}" y="{y}" width="{box_w}" height="{box_h}" rx="3" '
-                     f'fill="none" {stroke}/>')
-        # Corner, not centre: the chain path and its start/end dots run
-        # through the middle of every box, and would sit on top of the digit.
-        labels.append(f'<text x="{x + 5}" y="{y + 13}" font-size="11" '
-                       f'fill="{"#666" if inactive else "#ccc"}">{chain_pos}</text>')
-    for slot_a, slot_b in zip(order, order[1:]):
-        x0, y0 = center(slot_a)
-        x1, y1 = center(slot_b)
-        arrows.append(f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" '
-                       f'stroke="#6cf" stroke-width="2"/>')
-    sx, sy = center(order[0])
-    ex, ey = center(order[-1])
-    flip_note = (f'<text x="4" y="{h - 6}" font-size="10" fill="#f96">'
-                 f'image flipped 180° before send</text>' if rotate180 else "")
-
-    return f"""<svg viewBox="0 0 {w} {h}" role="img" aria-label="Module chain order for the current layout"
-     style="width:100%;max-width:340px;height:auto;background:#000;border:1px solid #444;display:block">
-  {"".join(boxes)}{"".join(arrows)}{"".join(labels)}
-  <circle cx="{sx:.1f}" cy="{sy:.1f}" r="4" fill="#3f6"/>
-  <circle cx="{ex:.1f}" cy="{ey:.1f}" r="4" fill="#f63"/>
-  {flip_note}
-</svg>"""
-
-
 def _opt(value, current):
     return f'<option value="{value}" {"selected" if str(value) == str(current) else ""}>{value}</option>'
 
@@ -1058,18 +1016,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode() if length else "{}"
         return json.loads(raw)
 
-    def _diagram_html(self):
-        snap = self.state.snapshot()
-        rows, cols = LAYOUTS[snap["layout"]]
-        return render_layout_svg(rows, cols, self.panel_w, self.panel_h, snap["rotate180"],
-                                  snap["order"], snap["active"])
-
     def do_GET(self):
         path, _, query = self.path.partition("?")
         if path in ("/", ""):
             self._send(self._render_page(), "text/html; charset=utf-8")
-        elif path == "/diagram":
-            self._send(self._diagram_html(), "text/html; charset=utf-8")
         elif path == "/config.json":
             self.state.save()
             body = json.dumps(self.state.to_wire(), indent=2)
@@ -1154,8 +1104,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <h1 style="font-size:1.1rem">Double matrix control</h1>
 
 <p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
-  Live preview -- the actual bitmap being sent to the panels right now,
-  with module boundaries and their chain positions drawn over it:
+  Live preview -- the actual bitmap being sent to the panels right now:
 </p>
 <div id="previewWrap" style="position:relative;display:inline-block;
      background:#000;border:1px solid #444">
@@ -1163,15 +1112,20 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   <div id="overlay" style="position:absolute;left:0;top:0;pointer-events:none"></div>
 </div>
 
-<div id="diagram">{self._diagram_html()}</div>
-<p style="color:#888;font-size:.85rem">
-  Boxes are where content goes; the number in each is the chain position
-  driving it, and the blue path is the daisy chain's route across the wall.
-  Green dot is where data comes in (chain start, module 1 DIN), orange is
-  the end of the chain. {rows}x{cols} modules, {self.panel_w}x{self.panel_h}
-  each (panel count/size are set with --panel-width/--panel-height/
-  --num-panels at startup, not here).
+<p style="color:#888;font-size:.85rem;margin:.8rem 0 .3rem">
+  Turn on calibration mode below, then drag tiles here to match the numbers
+  you actually see on the wall -- read 1, 2, 3, ... left to right, top to
+  bottom once it matches. R rotates that module 180, F mirrors it; both
+  travel with the tile if you drag it elsewhere. {rows}x{cols} modules,
+  {self.panel_w}x{self.panel_h} each.
 </p>
+<label><input type="checkbox" {"checked" if snap['calibrate'] else ""}
+  onchange="state.calibrate=this.checked; send();"> Calibration mode</label>
+&nbsp;
+<button onclick="resetOrder()"
+  style="background:#234;color:#eee;border:none;border-radius:4px;padding:.35rem .7rem;
+         cursor:pointer">reset layout</button>
+<div id="blockGrid" style="margin:.5rem 0"></div>
 
 <label>Text<br>
   <input value="{escape(snap['text'])}" style="width:100%;padding:.4rem"
@@ -1243,31 +1197,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 <label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
   onchange="state.rotate180=this.checked; send();"> Assembly mounted upside down</label>
 <span style="color:#888;font-size:.8rem">
-  -- one module wrong instead? Click its tile in the preview above (rotate
-  180) or its "F" corner (mirror).
+  -- one module wrong instead? Use its R/F buttons in the layout grid above.
 </span>
 <br><br>
 
-<label><input type="checkbox" {"checked" if snap['calibrate'] else ""}
-  onchange="state.calibrate=this.checked; send();"> Calibration mode (number on
-  every module)</label><br>
-<label>Block order
-  <input id="orderInput" value="{",".join(str(s + 1) for s in snap['order'])}"
-    style="width:9rem;padding:.3rem" onchange="setOrder(this.value)">
-</label>
-<button onclick="setOrder('{",".join(str(i + 1) for i in range(rows * cols))}')"
-  style="background:#234;color:#eee;border:none;border-radius:4px;padding:.35rem .7rem;
-         cursor:pointer">reset</button>
-<br><span style="color:#888;font-size:.8rem">
-  Turn on calibration mode and read the numbers off the wall. Position n in
-  this list is the n'th module along the daisy chain, and its value is which
-  block of the picture that module shows -- so if the chain's 2nd module is
-  physically sitting in block 3's place, put 3 second (1,3,2,...). Keep
-  editing until the wall reads 1, 2, 3, ... left to right, top to bottom.
-  Anything that isn't a complete permutation is ignored, so a half-typed
-  entry can't scramble it.
-</span>
-<br><br>
 <label>Active modules: <span id="aval">{snap['active']}</span> / {rows * cols}<br>
   <input type="range" min="1" max="{rows * cols}" value="{snap['active']}" style="width:100%"
     oninput="state.active=parseInt(this.value); aval.textContent=this.value; sendDebounced();">
@@ -1317,16 +1250,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   let debounceTimer;
   function send() {{
     fetch('/update', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
-                       body: JSON.stringify(state)}}).then(refreshDiagram);
+                       body: JSON.stringify(state)}});
   }}
   function sendDebounced() {{
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(send, 200);
-  }}
-  function refreshDiagram() {{
-    fetch('/diagram').then(r => r.text()).then(html => {{
-      document.getElementById('diagram').innerHTML = html;
-    }});
   }}
   function loadConfig(input) {{
     const file = input.files[0];
@@ -1342,16 +1270,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     if (item) item[key] = value;
     send();
   }}
-  function setOrder(text) {{
-    // "1,3,2" / "132" / "1 3 2" all work; anything that isn't a complete
-    // permutation is dropped by the server, so a typo can't scramble the wall.
-    let tokens = text.match(/\\d+/g) || [];
-    if (tokens.length === 1 && tokens[0].length === state.order.length)
-      tokens = tokens[0].split('');
-    const parsed = tokens.map(n => parseInt(n, 10) - 1);
-    if (parsed.length === state.order.length) state.order = parsed;
-    document.getElementById('orderInput').value =
-      state.order.map(s => s + 1).join(',');
+  function resetOrder() {{
+    state.order = state.order.map((_, i) => i);
     send();
   }}
   function removeItem(id) {{
@@ -1375,33 +1295,16 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     input.value = '';
   }}
   const PREVIEW_CELL_PX = 6;
-  function toggleModule(slot, key) {{
-    state[key][slot] = !state[key][slot];
-    send();
-  }}
   function drawOverlay(data) {{
-    // One box per module, sized to that module's footprint in the pixel
-    // grid (cell + 1px gap pitch), labelled with its chain position, with
-    // an R (rotate 180) and F (mirror) button right on the module itself
-    // -- the per-module orientation controls, in the same place the module
-    // they affect is.
+    // Purely visual -- module boundaries and chain positions traced over
+    // the actual pixels, for reference. The interactive controls live in
+    // the layout grid below (renderBlockGrid), not here.
     const el = document.getElementById('overlay');
-    const key = [data.rows, data.cols, data.pw, data.ph, data.labels, data.active,
-                 data.orient, data.flip].join('|');
+    const key = [data.rows, data.cols, data.pw, data.ph, data.labels, data.active].join('|');
     if (el.dataset.key === key) return;
     el.dataset.key = key;
     el.innerHTML = '';
     const pitch = PREVIEW_CELL_PX + 1;
-    const btn = (letter, slot, stateKey) => {{
-      const on = data[stateKey][slot];
-      const b = document.createElement('span');
-      b.textContent = letter;
-      b.style.cssText = 'position:absolute;top:0;pointer-events:auto;cursor:pointer;' +
-        `padding:0 3px;background:${{on ? '#6cf' : 'rgba(255,255,255,.15)'}};` +
-        `color:${{on ? '#012' : '#eee'}}`;
-      b.onclick = () => toggleModule(slot, stateKey);
-      return b;
-    }};
     data.labels.forEach((label, slot) => {{
       const r = Math.floor(slot / data.cols), c = slot % data.cols;
       const inactive = label > data.active;
@@ -1414,13 +1317,68 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
       box.style.width = (data.pw * pitch - 1) + 'px';
       box.style.height = (data.ph * pitch - 1) + 'px';
       box.textContent = label;
-      const rot = btn('R', slot, 'orient');
-      rot.style.right = '12px';
-      const mir = btn('F', slot, 'flip');
-      mir.style.right = '0';
-      box.appendChild(rot);
-      box.appendChild(mir);
       el.appendChild(box);
+    }});
+  }}
+  let dragSlot = null;
+  function swapSlots(labels, a, b) {{
+    const cA = labels[a] - 1, cB = labels[b] - 1;
+    const newOrder = state.order.slice();
+    newOrder[cA] = b;
+    newOrder[cB] = a;
+    state.order = newOrder;
+    send();
+  }}
+  function renderBlockGrid(data) {{
+    // The actual control surface: one draggable tile per grid slot, showing
+    // which chain position (physical module) currently sits there. Drag a
+    // tile onto another to swap them -- R/F on the tile itself rotate/mirror
+    // that module and travel with it if dragged elsewhere.
+    const el = document.getElementById('blockGrid');
+    if (dragSlot !== null) return; // don't rebuild out from under an active drag
+    const key = [data.rows, data.cols, data.labels, data.active, data.orient, data.flip].join('|');
+    if (el.dataset.key === key) return;
+    el.dataset.key = key;
+    el.innerHTML = '';
+    el.style.display = 'inline-grid';
+    el.style.gridTemplateColumns = `repeat(${{data.cols}}, 72px)`;
+    el.style.gap = '4px';
+    data.labels.forEach((chainPos, slot) => {{
+      const inactive = chainPos > data.active;
+      const c = chainPos - 1;
+      const cell = document.createElement('div');
+      cell.draggable = true;
+      cell.style.cssText = 'position:relative;width:72px;height:44px;box-sizing:border-box;' +
+        `border:2px ${{inactive ? 'dashed #444' : 'solid #6cf'}};border-radius:4px;` +
+        `background:${{inactive ? '#181818' : '#123'}};cursor:grab;` +
+        'display:flex;align-items:center;justify-content:center;user-select:none';
+      const num = document.createElement('span');
+      num.textContent = chainPos;
+      num.style.cssText = `font:bold 18px monospace;color:${{inactive ? '#555' : '#eee'}}`;
+      cell.appendChild(num);
+      const chip = (letter, on, toggle) => {{
+        const b = document.createElement('span');
+        b.textContent = letter;
+        b.style.cssText = 'position:absolute;top:1px;cursor:pointer;font:9px monospace;' +
+          `padding:0 3px;background:${{on ? '#6cf' : 'rgba(255,255,255,.15)'}};` +
+          `color:${{on ? '#012' : '#eee'}}`;
+        b.onclick = (e) => {{ e.stopPropagation(); toggle(); }};
+        return b;
+      }};
+      const rot = chip('R', data.orient[c], () => {{ state.orient[c] = !state.orient[c]; send(); }});
+      rot.style.right = '12px';
+      const mir = chip('F', data.flip[c], () => {{ state.flip[c] = !state.flip[c]; send(); }});
+      mir.style.right = '0';
+      cell.appendChild(rot);
+      cell.appendChild(mir);
+      cell.addEventListener('dragstart', () => {{ dragSlot = slot; cell.style.opacity = '.4'; }});
+      cell.addEventListener('dragend', () => {{ dragSlot = null; cell.style.opacity = '1'; }});
+      cell.addEventListener('dragover', (e) => e.preventDefault());
+      cell.addEventListener('drop', (e) => {{
+        e.preventDefault();
+        if (dragSlot !== null && dragSlot !== slot) swapSlots(data.labels, dragSlot, slot);
+      }});
+      el.appendChild(cell);
     }});
   }}
   function pollPreview() {{
@@ -1445,6 +1403,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         cells[i].style.background = data.bits[i] ? '#f30' : '#200';
       }}
       drawOverlay(data);
+      renderBlockGrid(data);
     }}).catch(() => {{}}).finally(() => setTimeout(pollPreview, 150));
   }}
   pollPreview();
@@ -1700,7 +1659,8 @@ def main():
             bitmap = apply_active_mask(bitmap, rows, cols, args.panel_width,
                                         args.panel_height, snap["order"], snap["active"])
             bitmap = apply_module_transforms(bitmap, rows, cols, args.panel_width,
-                                              args.panel_height, snap["orient"], snap["flip"])
+                                              args.panel_height, snap["order"],
+                                              snap["orient"], snap["flip"])
             # The preview shows grid-slot space, post per-module correction
             # (what you meant to see, already fixed up) -- the chain remap
             # below is the last step before the wire.

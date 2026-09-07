@@ -64,9 +64,11 @@ Useful flags:
                                        Also fixed at startup.
     --layout grid|strip                 which of the two physical
                                        arrangements above -- live-editable.
-    --block-orientation 0|90|-90|180    rotates every 8x8 chip block in
-                                       place -- use if characters/video read
-                                       sideways or mirrored. Live-editable.
+    Per-module orientation: click a module's own tile in the live preview
+    to flip it 180 (upside-down mount) -- click its "F" corner to mirror it
+    (wired/soldered backwards relative to its neighbours). Both live,
+    per-module, no CLI flag -- calibrate on the wall, same as --order.
+
     --rotate180                         the whole assembly is mounted
                                        upside down -- flips the final image
                                        before sending. Live-editable.
@@ -538,7 +540,11 @@ class State:
         self.media_pos_x = 0
         self.media_pos_y = 0
         self.layout = args.layout
-        self.block_orientation = args.block_orientation
+        # Per-module, not global -- a single physical board mounted upside
+        # down or wired mirrored relative to its neighbours, calibrated by
+        # clicking that module's own tile in the preview.
+        self.orient = [False] * args.num_panels
+        self.flip = [False] * args.num_panels
         self.rotate180 = args.rotate180
         self.threshold = args.threshold
         self.dither = args.dither
@@ -596,7 +602,7 @@ class State:
                         media_rotation=self.media_rotation,
                         media_scale=self.media_scale,
                         media_pos_x=self.media_pos_x, media_pos_y=self.media_pos_y,
-                        layout=self.layout, block_orientation=self.block_orientation,
+                        layout=self.layout, orient=list(self.orient), flip=list(self.flip),
                         rotate180=self.rotate180, threshold=self.threshold,
                         dither=self.dither, calibrate=self.calibrate,
                         order=list(self.order), active=self.active,
@@ -681,10 +687,15 @@ class State:
             if "layout" in data and data["layout"] in LAYOUTS and data["layout"] != self.layout:
                 self.layout = data["layout"]
                 rebuild = True
-            if "block_orientation" in data and int(data["block_orientation"]) in (0, 90, -90, 180) \
-                    and int(data["block_orientation"]) != self.block_orientation:
-                self.block_orientation = int(data["block_orientation"])
-                rebuild = True
+            for key in ("orient", "flip"):
+                if key in data:
+                    cur = getattr(self, key)
+                    try:
+                        candidate = [bool(v) for v in data[key]]
+                    except TypeError:
+                        candidate = None
+                    if candidate is not None and len(candidate) == len(cur):
+                        setattr(self, key, candidate)
             if "rotate180" in data:
                 self.rotate180 = bool(data["rotate180"])
             if "threshold" in data:
@@ -835,6 +846,31 @@ def apply_active_mask(bitmap, rows, cols, panel_w, panel_h, order, active):
         if chain_pos > active:
             r, c = divmod(slot, cols)
             out[r * panel_h:(r + 1) * panel_h, c * panel_w:(c + 1) * panel_w] = False
+    return out
+
+
+def apply_module_transforms(bitmap, rows, cols, panel_w, panel_h, orient, flip):
+    """Per-module 180-degree rotate and/or mirror, in grid-slot space.
+    Both preserve a module's panel_w x panel_h footprint (unlike a 90-degree
+    turn, which would need a taller-than-wide slot -- not physically what a
+    single fixed-aspect board mounted differently can do), so this is a
+    plain array flip per module, no PIL/resampling needed. Independent per
+    module: one board mounted upside down or wired backwards doesn't imply
+    its neighbours are."""
+    if not any(orient) and not any(flip):
+        return bitmap
+    out = bitmap.copy()
+    for slot in range(rows * cols):
+        if not orient[slot] and not flip[slot]:
+            continue
+        r, c = divmod(slot, cols)
+        y0, x0 = r * panel_h, c * panel_w
+        tile = out[y0:y0 + panel_h, x0:x0 + panel_w]
+        if orient[slot]:
+            tile = tile[::-1, ::-1]
+        if flip[slot]:
+            tile = tile[:, ::-1]
+        out[y0:y0 + panel_h, x0:x0 + panel_w] = tile
     return out
 
 
@@ -1055,6 +1091,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     "rows": rows, "cols": cols,
                     "pw": self.panel_w, "ph": self.panel_h,
                     "labels": chain_labels(snap["order"]), "active": snap["active"],
+                    "orient": snap["orient"], "flip": snap["flip"],
                 })
             self._send(body, "application/json")
         else:
@@ -1203,16 +1240,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 </label>
 <span style="color:#888;font-size:.8rem">grid = 3 rows x 2 modules, strip = 2 rows x 3 chained</span>
 <br><br>
-<label>Block orientation
-  <select onchange="state.block_orientation=parseInt(this.value); send();">
-    {_opt("0", str(snap["block_orientation"]))}
-    {_opt("90", str(snap["block_orientation"]))}
-    {_opt("-90", str(snap["block_orientation"]))}
-    {_opt("180", str(snap["block_orientation"]))}
-  </select>
-</label>
-&nbsp; <label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
+<label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
   onchange="state.rotate180=this.checked; send();"> Assembly mounted upside down</label>
+<span style="color:#888;font-size:.8rem">
+  -- one module wrong instead? Click its tile in the preview above (rotate
+  180) or its "F" corner (mirror).
+</span>
 <br><br>
 
 <label><input type="checkbox" {"checked" if snap['calibrate'] else ""}
@@ -1342,15 +1375,33 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     input.value = '';
   }}
   const PREVIEW_CELL_PX = 6;
+  function toggleModule(slot, key) {{
+    state[key][slot] = !state[key][slot];
+    send();
+  }}
   function drawOverlay(data) {{
     // One box per module, sized to that module's footprint in the pixel
-    // grid (cell + 1px gap pitch), labelled with its chain position.
+    // grid (cell + 1px gap pitch), labelled with its chain position, with
+    // an R (rotate 180) and F (mirror) button right on the module itself
+    // -- the per-module orientation controls, in the same place the module
+    // they affect is.
     const el = document.getElementById('overlay');
-    const key = [data.rows, data.cols, data.pw, data.ph, data.labels, data.active].join('|');
+    const key = [data.rows, data.cols, data.pw, data.ph, data.labels, data.active,
+                 data.orient, data.flip].join('|');
     if (el.dataset.key === key) return;
     el.dataset.key = key;
     el.innerHTML = '';
     const pitch = PREVIEW_CELL_PX + 1;
+    const btn = (letter, slot, stateKey) => {{
+      const on = data[stateKey][slot];
+      const b = document.createElement('span');
+      b.textContent = letter;
+      b.style.cssText = 'position:absolute;top:0;pointer-events:auto;cursor:pointer;' +
+        `padding:0 3px;background:${{on ? '#6cf' : 'rgba(255,255,255,.15)'}};` +
+        `color:${{on ? '#012' : '#eee'}}`;
+      b.onclick = () => toggleModule(slot, stateKey);
+      return b;
+    }};
     data.labels.forEach((label, slot) => {{
       const r = Math.floor(slot / data.cols), c = slot % data.cols;
       const inactive = label > data.active;
@@ -1363,6 +1414,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
       box.style.width = (data.pw * pitch - 1) + 'px';
       box.style.height = (data.ph * pitch - 1) + 'px';
       box.textContent = label;
+      const rot = btn('R', slot, 'orient');
+      rot.style.right = '12px';
+      const mir = btn('F', slot, 'flip');
+      mir.style.right = '0';
+      box.appendChild(rot);
+      box.appendChild(mir);
       el.appendChild(box);
     }});
   }}
@@ -1419,9 +1476,11 @@ def make_control_server(state, port, panel_w, panel_h, upload_dir, preview):
     return server
 
 
-def build_device(serial_iface, canvas_w, canvas_h, block_orientation, brightness):
-    return max7219(serial_iface, width=canvas_w, height=canvas_h,
-                    block_orientation=block_orientation, rotate=0, contrast=brightness)
+def build_device(serial_iface, canvas_w, canvas_h, brightness):
+    # Per-module orientation/mirroring is done in software (apply_module_transforms)
+    # on the composited bitmap, not via luma's device-wide block_orientation --
+    # a single physical board can be mounted wrong independently of its neighbours.
+    return max7219(serial_iface, width=canvas_w, height=canvas_h, rotate=0, contrast=brightness)
 
 
 def parse_args():
@@ -1462,8 +1521,6 @@ def parse_args():
                    help="grid = 3 rows x 2 modules, strip = 2 rows x 3 "
                         "chained, half = 1 row x 3 chained (pair with "
                         "--num-panels 3 to drive/test only half the chain)")
-    p.add_argument("--block-orientation", type=int, default=0, choices=[0, 90, -90, 180],
-                   help="rotate every 8x8 chip block in place")
     p.add_argument("--rotate180", action="store_true",
                    help="whole assembly mounted upside down")
     p.add_argument("--calibrate", action="store_true",
@@ -1582,8 +1639,7 @@ def main():
 
     serial_iface = spi(port=args.spi_port, device=args.spi_device, gpio=noop(),
                         bus_speed_hz=args.spi_hz)
-    device = build_device(serial_iface, canvas_w, canvas_h, snap0["block_orientation"],
-                           snap0["brightness"])
+    device = build_device(serial_iface, canvas_w, canvas_h, snap0["brightness"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0
@@ -1606,10 +1662,8 @@ def main():
                     print("layout/text-height change rejected -- leaves no "
                           "room for the media queue at this layout")
                 else:
-                    if (new_cw, new_ch) != (canvas_w, canvas_h) or \
-                            snap["block_orientation"] != device._correction_angle:
-                        device = build_device(serial_iface, new_cw, new_ch,
-                                               snap["block_orientation"], snap["brightness"])
+                    if (new_cw, new_ch) != (canvas_w, canvas_h):
+                        device = build_device(serial_iface, new_cw, new_ch, snap["brightness"])
                         last_brightness = snap["brightness"]
                     canvas_w, canvas_h = new_cw, new_ch
                     text_h, video_h = new_text_h, new_video_h
@@ -1645,8 +1699,11 @@ def main():
             bitmap = frame_to_bitmap(gray, snap["threshold"], dither)
             bitmap = apply_active_mask(bitmap, rows, cols, args.panel_width,
                                         args.panel_height, snap["order"], snap["active"])
-            # The preview shows grid-slot space (what you meant to see); the
-            # chain remap below is the last step before the wire.
+            bitmap = apply_module_transforms(bitmap, rows, cols, args.panel_width,
+                                              args.panel_height, snap["orient"], snap["flip"])
+            # The preview shows grid-slot space, post per-module correction
+            # (what you meant to see, already fixed up) -- the chain remap
+            # below is the last step before the wire.
             preview.update(bitmap)
             bitmap = apply_block_order(bitmap, rows, cols, args.panel_width,
                                         args.panel_height, snap["order"])

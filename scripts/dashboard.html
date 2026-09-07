@@ -1,12 +1,389 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Thermal matrix Pis</title>
-<body style="font:16px sans-serif;background:#111;color:#eee;padding:2rem">
-<h1>Thermal matrix Pis</h1>
-<!-- One <li> per Pi. Get its address with `tailscale ip -4` on that Pi. -->
-<ul>
-  <li><a href="http://100.x.y.z:8787/">pi1</a></li>
-</ul>
-<p>Open on a device joined to your tailnet. Each link shows that Pi's
-live status: running or not, uptime, active mode.</p>
-</body>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermal matrix fleet</title>
+<!--
+  One-page fleet dashboard for the thermal-matrix Pis. No build step: open
+  this file directly (or host it anywhere) on a device joined to your
+  tailnet. Pi entries (host, port, login) and their positions on the map
+  are stored in this browser's localStorage -- nothing is hardcoded here
+  and nothing is sent anywhere but the Pis themselves.
+
+  Talks to each Pi's status_server.py (see scripts/status_server.py) over
+  plain http://<tailscale-ip>:8787 -- that only works from a tailnet
+  device, and only if this page is itself loaded over http/file (a page
+  loaded over https would have its requests blocked as mixed content).
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #111; color: #eee;
+    font: 15px/1.4 -apple-system, system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: .75rem;
+    padding: .75rem 1rem; background: #171717; border-bottom: 1px solid #2a2a2a;
+  }
+  header h1 { font-size: 1.05rem; margin: 0; font-weight: 600; flex: 1; }
+  button {
+    font: inherit; background: #2a2a2a; color: #eee; border: 1px solid #3a3a3a;
+    border-radius: 6px; padding: .4rem .7rem; cursor: pointer;
+  }
+  button:hover { background: #333; }
+  button.danger { border-color: #7a2a2a; color: #ff8080; }
+  button.danger:hover { background: #3a1f1f; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.primary:hover { background: #1d4ed8; }
+
+  #map {
+    position: relative; width: 100%; height: calc(100vh - 52px);
+    overflow: hidden; touch-action: none;
+    background-image: radial-gradient(#242424 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+  #empty {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #666; text-align: center; padding: 2rem;
+  }
+
+  .node {
+    position: absolute; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center; gap: .3rem;
+    cursor: grab; user-select: none; width: 92px;
+  }
+  .node.dragging { cursor: grabbing; z-index: 5; }
+  .node .thumb {
+    width: 56px; height: 56px; border-radius: 50%; background: #000;
+    background-size: cover; image-rendering: pixelated;
+    border: 3px solid #555; box-shadow: 0 0 0 4px #111;
+  }
+  .node.active .thumb { border-color: #2ecc71; }
+  .node.inactive .thumb { border-color: #e74c3c; }
+  .node.unreachable .thumb { border-color: #555; opacity: .5; }
+  .node .name { font-size: .78rem; color: #ccc; text-align: center; word-break: break-word; }
+  .node .sub { font-size: .68rem; color: #888; }
+
+  #panel {
+    position: fixed; top: 0; right: 0; height: 100%; width: 340px;
+    max-width: 92vw; background: #171717; border-left: 1px solid #2a2a2a;
+    padding: 1.2rem; overflow-y: auto; transform: translateX(100%);
+    transition: transform .18s ease; z-index: 10;
+  }
+  #panel.open { transform: translateX(0); }
+  #panel h2 { margin: 0 0 .2rem; font-size: 1.1rem; }
+  #panel .stat { display: flex; justify-content: space-between; margin: .3rem 0; color: #bbb; }
+  #panel .stat b { color: #eee; font-weight: 500; }
+  #panel img.preview {
+    width: 100%; aspect-ratio: 1; image-rendering: pixelated; background: #000;
+    border-radius: 8px; margin: .8rem 0; border: 1px solid #2a2a2a;
+  }
+  #panel .row { display: flex; gap: .5rem; margin-top: .6rem; flex-wrap: wrap; }
+  #panel .close { float: right; }
+  .badge {
+    display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+    font-size: .75rem; font-weight: 600;
+  }
+  .badge.active { background: #1e4029; color: #4ade80; }
+  .badge.inactive { background: #402020; color: #ff8080; }
+  .badge.unreachable { background: #333; color: #999; }
+
+  dialog {
+    background: #171717; color: #eee; border: 1px solid #333; border-radius: 10px;
+    padding: 1.2rem; width: 320px; max-width: 92vw;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog label { display: block; margin-top: .6rem; font-size: .8rem; color: #aaa; }
+  dialog input {
+    width: 100%; margin-top: .2rem; padding: .4rem .5rem; border-radius: 6px;
+    border: 1px solid #333; background: #0f0f0f; color: #eee; font: inherit;
+  }
+  dialog .row { display: flex; gap: .5rem; margin-top: 1rem; justify-content: flex-end; }
+  #overlay-hint {
+    position: absolute; bottom: .6rem; left: .8rem; font-size: .72rem; color: #555;
+  }
+</style>
+
+<header>
+  <h1>Thermal matrix fleet</h1>
+  <button id="add-btn">+ Add Pi</button>
+</header>
+
+<div id="map">
+  <div id="empty">No Pis added yet. Click "+ Add Pi" and enter the host and login
+    printed at the end of <code>scripts/install.sh</code> on that Pi.</div>
+  <div id="overlay-hint">drag a node to arrange them like your space &middot; click for details</div>
+</div>
+
+<aside id="panel">
+  <button class="close" id="panel-close">close</button>
+  <h2 id="p-name"></h2>
+  <div id="p-badge"></div>
+  <div style="margin-top:.8rem">
+    <div class="stat"><span>host</span><b id="p-host"></b></div>
+    <div class="stat"><span>uptime</span><b id="p-uptime"></b></div>
+    <div class="stat"><span>cpu temp</span><b id="p-temp"></b></div>
+    <div class="stat"><span>mode</span><b id="p-mode"></b></div>
+  </div>
+  <img class="preview" id="p-preview" alt="live panel preview">
+  <div class="row">
+    <button id="p-restart">restart service</button>
+    <button class="danger" id="p-reboot">reboot Pi</button>
+  </div>
+  <div class="row">
+    <button id="p-edit">edit</button>
+    <button class="danger" id="p-remove">remove</button>
+  </div>
+</aside>
+
+<dialog id="edit-dialog">
+  <h2 id="dlg-title" style="margin:0">Add Pi</h2>
+  <label>Name<input id="f-name" placeholder="attic"></label>
+  <label>Tailscale IP or hostname<input id="f-host" placeholder="100.x.y.z"></label>
+  <label>Port<input id="f-port" value="8787"></label>
+  <label>Status user<input id="f-user" placeholder="admin"></label>
+  <label>Status password<input id="f-pass" type="password"></label>
+  <div class="row">
+    <button id="dlg-cancel">cancel</button>
+    <button class="primary" id="dlg-save">save</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+
+const STORE_KEY = "thermalFleet.pis";
+const POLL_MS = 5000;
+const FETCH_TIMEOUT_MS = 4000;
+
+const mapEl = document.getElementById("map");
+const emptyEl = document.getElementById("empty");
+const panel = document.getElementById("panel");
+const dlg = document.getElementById("edit-dialog");
+
+let pis = load();
+let nodeEls = new Map();   // id -> node div
+let statuses = new Map();  // id -> last status.json (or null if unreachable)
+let selectedId = null;
+let editingId = null;      // set when the dialog is editing rather than adding
+
+function load() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; }
+  catch { return []; }
+}
+function save() { localStorage.setItem(STORE_KEY, JSON.stringify(pis)); }
+function uid() { return Math.random().toString(36).slice(2, 9); }
+
+function authHeader(pi) { return "Basic " + btoa(`${pi.user}:${pi.pass}`); }
+function baseUrl(pi) { return `http://${pi.host}:${pi.port || 8787}`; }
+
+async function api(pi, path, opts = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(baseUrl(pi) + path, {
+      ...opts,
+      signal: ctrl.signal,
+      headers: {
+        Authorization: authHeader(pi),
+        "X-Dashboard": "1",
+        ...(opts.headers || {}),
+      },
+    });
+    if (!res.ok) throw new Error("http " + res.status);
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function renderAll() {
+  emptyEl.style.display = pis.length ? "none" : "flex";
+  const seen = new Set();
+  for (const pi of pis) {
+    seen.add(pi.id);
+    if (!nodeEls.has(pi.id)) createNode(pi);
+    positionNode(pi);
+    updateNodeVisual(pi);
+  }
+  for (const [id, el] of nodeEls) {
+    if (!seen.has(id)) { el.remove(); nodeEls.delete(id); statuses.delete(id); }
+  }
+}
+
+function positionNode(pi) {
+  const el = nodeEls.get(pi.id);
+  el.style.left = (pi.x ?? 50) + "%";
+  el.style.top = (pi.y ?? 50) + "%";
+}
+
+function createNode(pi) {
+  const el = document.createElement("div");
+  el.className = "node unreachable";
+  el.innerHTML = `<div class="thumb"></div><div class="name"></div><div class="sub"></div>`;
+  el.addEventListener("click", (e) => { if (!el.dragged) openPanel(pi.id); });
+  makeDraggable(el, pi);
+  mapEl.appendChild(el);
+  nodeEls.set(pi.id, el);
+}
+
+function makeDraggable(el, pi) {
+  let start = null;
+  el.addEventListener("pointerdown", (e) => {
+    el.setPointerCapture(e.pointerId);
+    el.dragged = false;
+    const rect = mapEl.getBoundingClientRect();
+    start = { x: e.clientX, y: e.clientY, rect };
+    el.classList.add("dragging");
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!start) return;
+    if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 3) el.dragged = true;
+    if (!el.dragged) return;
+    const px = ((e.clientX - start.rect.left) / start.rect.width) * 100;
+    const py = ((e.clientY - start.rect.top) / start.rect.height) * 100;
+    pi.x = Math.min(97, Math.max(3, px));
+    pi.y = Math.min(95, Math.max(5, py));
+    positionNode(pi);
+  });
+  el.addEventListener("pointerup", () => {
+    el.classList.remove("dragging");
+    start = null;
+    if (el.dragged) save();
+  });
+}
+
+function updateNodeVisual(pi) {
+  const el = nodeEls.get(pi.id);
+  const st = statuses.get(pi.id);
+  const state = !st ? "unreachable" : st.active === "active" ? "active" : "inactive";
+  el.className = "node " + state;
+  el.querySelector(".name").textContent = pi.name || pi.host;
+  el.querySelector(".sub").textContent =
+    state === "unreachable" ? "unreachable" : (st.uptime ? "up " + st.uptime : st.active);
+  const thumb = el.querySelector(".thumb");
+  if (st && st.has_preview) {
+    thumb.style.backgroundImage = `url("${previewUrl(pi)}")`;
+  } else {
+    thumb.style.backgroundImage = "";
+  }
+  if (selectedId === pi.id) fillPanel(pi, st);
+}
+
+function previewUrl(pi) {
+  // Basic auth can't go in an <img> src cross-origin reliably, so we fetch
+  // as a blob and hand the node/panel an object URL instead.
+  return pi._previewObjectUrl || "";
+}
+
+async function pollOne(pi) {
+  try {
+    const res = await api(pi, "/status.json");
+    const info = await res.json();
+    statuses.set(pi.id, info);
+    if (info.has_preview) {
+      try {
+        const imgRes = await api(pi, "/preview.png");
+        const blob = await imgRes.blob();
+        if (pi._previewObjectUrl) URL.revokeObjectURL(pi._previewObjectUrl);
+        pi._previewObjectUrl = URL.createObjectURL(blob);
+      } catch { /* keep last preview on transient failure */ }
+    }
+  } catch {
+    statuses.set(pi.id, null);
+  }
+  updateNodeVisual(pi);
+}
+
+function pollAll() { for (const pi of pis) pollOne(pi); }
+
+function openPanel(id) {
+  selectedId = id;
+  const pi = pis.find((p) => p.id === id);
+  fillPanel(pi, statuses.get(id));
+  panel.classList.add("open");
+}
+function closePanel() { panel.classList.remove("open"); selectedId = null; }
+
+function fillPanel(pi, st) {
+  if (selectedId !== pi.id) return;
+  const state = !st ? "unreachable" : st.active === "active" ? "active" : "inactive";
+  document.getElementById("p-name").textContent = pi.name || pi.host;
+  document.getElementById("p-badge").innerHTML =
+    `<span class="badge ${state}">${st ? st.active : "unreachable"}</span>`;
+  document.getElementById("p-host").textContent = `${pi.host}:${pi.port || 8787}`;
+  document.getElementById("p-uptime").textContent = st?.uptime || "-";
+  document.getElementById("p-temp").textContent = st?.cpu_temp_c != null ? st.cpu_temp_c + " C" : "-";
+  document.getElementById("p-mode").textContent = st?.flags || "-";
+  const img = document.getElementById("p-preview");
+  img.style.display = st?.has_preview ? "block" : "none";
+  if (st?.has_preview && pi._previewObjectUrl) img.src = pi._previewObjectUrl;
+}
+
+document.getElementById("panel-close").onclick = closePanel;
+
+document.getElementById("p-restart").onclick = async () => {
+  const pi = pis.find((p) => p.id === selectedId);
+  if (!pi || !confirm(`Restart the thermal-matrix service on ${pi.name || pi.host}?`)) return;
+  try { await api(pi, "/restart", { method: "POST" }); }
+  catch { alert("restart request failed -- is the Pi reachable?"); }
+  setTimeout(() => pollOne(pi), 1500);
+};
+
+document.getElementById("p-reboot").onclick = async () => {
+  const pi = pis.find((p) => p.id === selectedId);
+  if (!pi || !confirm(`Reboot the whole Pi "${pi.name || pi.host}"? It'll be offline for a bit.`)) return;
+  try { await api(pi, "/reboot", { method: "POST" }); }
+  catch { alert("reboot request failed -- is the Pi reachable?"); }
+};
+
+document.getElementById("p-remove").onclick = () => {
+  const pi = pis.find((p) => p.id === selectedId);
+  if (!pi || !confirm(`Remove "${pi.name || pi.host}" from this dashboard? (does not touch the Pi)`)) return;
+  pis = pis.filter((p) => p.id !== pi.id);
+  save();
+  closePanel();
+  renderAll();
+};
+
+document.getElementById("p-edit").onclick = () => openDialog(selectedId);
+
+document.getElementById("add-btn").onclick = () => openDialog(null);
+
+function openDialog(id) {
+  editingId = id;
+  const pi = id ? pis.find((p) => p.id === id) : null;
+  document.getElementById("dlg-title").textContent = pi ? "Edit Pi" : "Add Pi";
+  document.getElementById("f-name").value = pi?.name || "";
+  document.getElementById("f-host").value = pi?.host || "";
+  document.getElementById("f-port").value = pi?.port || 8787;
+  document.getElementById("f-user").value = pi?.user || "";
+  document.getElementById("f-pass").value = pi?.pass || "";
+  dlg.showModal();
+}
+document.getElementById("dlg-cancel").onclick = () => dlg.close();
+
+document.getElementById("dlg-save").onclick = () => {
+  const name = document.getElementById("f-name").value.trim();
+  const host = document.getElementById("f-host").value.trim();
+  const port = parseInt(document.getElementById("f-port").value, 10) || 8787;
+  const user = document.getElementById("f-user").value.trim();
+  const pass = document.getElementById("f-pass").value;
+  if (!host) { alert("host is required"); return; }
+
+  if (editingId) {
+    const pi = pis.find((p) => p.id === editingId);
+    Object.assign(pi, { name, host, port, user, pass });
+  } else {
+    pis.push({ id: uid(), name, host, port, user, pass, x: 15 + Math.random() * 70, y: 15 + Math.random() * 70 });
+  }
+  save();
+  dlg.close();
+  renderAll();
+  pollAll();
+};
+
+renderAll();
+pollAll();
+setInterval(pollAll, POLL_MS);
+</script>

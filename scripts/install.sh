@@ -10,10 +10,11 @@
 #   journalctl -u thermal-matrix -f         # live logs / --stats output
 #   sudo systemctl stop thermal-matrix      # stop it
 #
-# thermal-status runs a status page on :8787 (Tailscale IP only,
+# thermal-status runs a status+control page on :8787 (Tailscale IP only,
 # password-protected -- login is auto-generated in
 # /etc/default/thermal-status, `sudo cat` it to see it).
-# See scripts/dashboard.html for a one-page links list across all Pis.
+# See scripts/dashboard.html for a one-page fleet dashboard: live status,
+# a panel preview and restart/reboot for every Pi you add to it.
 #
 # Flags (--colorwise, --rotate, calibration, ...) live in
 # /etc/default/thermal-matrix -- edit that file, then
@@ -96,5 +97,6 @@ fi
 echo
 echo "done. i2c0 needs a reboot to take effect: sudo reboot"
 echo "then: sudo systemctl enable --now thermal-matrix thermal-status"
-echo "status page: http://\$(tailscale ip -4):8787/  (add it to scripts/dashboard.html)"
+echo "status page: http://\$(tailscale ip -4):8787/"
 echo "status page login: cat $STATUS_ENV"
+echo "add this Pi's IP + login to scripts/dashboard.html (open it on a tailnet device)"

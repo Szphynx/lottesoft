@@ -25,6 +25,7 @@ Useful flags:
 """
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -42,6 +43,12 @@ from rgbmatrix import RGBMatrix, RGBMatrixOptions
 
 SENSOR_W, SENSOR_H = 32, 24
 PANEL = 64
+
+# Snapshot of the rendered panel, written to tmpfs for the status server's
+# /preview.png to serve -- lets the dashboard show what's actually on the
+# LED panel without touching the SD card or the sensor/render loop's pace.
+PREVIEW_PATH = "/run/thermal-matrix/preview.png"
+PREVIEW_INTERVAL_S = 1.0
 
 I2C_FREQ = 400_000       # raise to 1_000_000 only with 2.2k pull-ups + short wires
 GAMMA = 0.70             # <1 lifts the cold end out of the panel's crushed blacks
@@ -385,6 +392,16 @@ class Pipeline:
         return self.lut[idx]
 
 
+def write_preview(rgb):
+    """Best-effort atomic dump of the current panel frame as a PNG."""
+    try:
+        tmp = PREVIEW_PATH + ".tmp"
+        Image.fromarray(rgb, "RGB").save(tmp)
+        os.replace(tmp, PREVIEW_PATH)
+    except OSError:
+        pass
+
+
 # ----------------------------------------------------------------------------
 # Main.
 # ----------------------------------------------------------------------------
@@ -492,6 +509,8 @@ def main():
     rendered = 0
     last_report = time.monotonic()
     last_reads = 0
+    last_preview = 0.0
+    os.makedirs(os.path.dirname(PREVIEW_PATH), exist_ok=True)
 
     print("running -- ctrl-c to stop")
     if args.preview:
@@ -509,6 +528,10 @@ def main():
             canvas.SetImage(Image.fromarray(rgb, "RGB"))
             canvas = matrix.SwapOnVSync(canvas)
             rendered += 1
+
+            if t0 - last_preview >= PREVIEW_INTERVAL_S:
+                write_preview(rgb)
+                last_preview = t0
 
             if args.preview:
                 size = PANEL * args.preview_scale

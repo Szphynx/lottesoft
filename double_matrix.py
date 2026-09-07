@@ -64,11 +64,13 @@ Useful flags:
                                        Also fixed at startup.
     --layout grid|strip                 which of the two physical
                                        arrangements above -- live-editable.
-    --block-orientation 0|90|180|270    rotate every 8x8 chip in the chain
-                                       the same way -- global, not
-                                       per-module (content spanning a
-                                       module boundary only reads right
-                                       when every module agrees). Live.
+    No 90/270 rotation control, global or per-module: confirmed a per-chip
+    rotation can't stay coherent for content spanning more than one chip
+    (a straight line across two same-row chips, both rotated identically,
+    tears into two disconnected pieces at the chip boundary) -- not
+    fixable in software, so it isn't offered. --rotate180 below is the
+    only rotation, because it's whole-canvas and doesn't cut through a
+    chip.
 
     Per-module mirror: drag a tile in the layout grid, same widget as
     --order. H/V flip that module horizontally/vertically, independently
@@ -107,10 +109,10 @@ Useful flags:
     --brightness N                      0-255, MAX7219 hardware intensity
                                        register. Live-editable.
 
-    Layout, block orientation, rotate180, threshold, dither and brightness
-    are all live-editable from the control panel below -- it shows a
-    diagram of the actual chain order that updates the moment you change
-    layout, no page reload, no restart. Panel count/size stay CLI-only.
+    Layout, rotate180, threshold, dither and brightness are all
+    live-editable from the control panel below -- it shows a diagram of
+    the actual chain order that updates the moment you change layout, no
+    page reload, no restart. Panel count/size stay CLI-only.
 
     --media-brightness / --media-contrast   percent, 100=neutral -- global
                                        software adjustment applied to the
@@ -528,7 +530,7 @@ class TextScroller:
 class State:
     """Live-editable display settings, shared between the render loop and
     the web control server. `version` bumps only on changes that require a
-    rebuild -- text bitmap, or geometry/device (layout, block orientation)."""
+    rebuild -- text bitmap, or geometry/device (layout)."""
 
     def __init__(self, args, state_file=None):
         self.lock = threading.Lock()
@@ -548,15 +550,17 @@ class State:
         self.media_pos_x = 0
         self.media_pos_y = 0
         self.layout = args.layout
-        # Global -- every chip in the chain rotated the same way, via the
-        # device's own luma block_orientation. Has to be uniform: content
-        # spanning a module boundary (video, scrolling text, the
-        # calibration marker) only reads correctly when every module
-        # agrees on this.
-        self.block_orientation = args.block_orientation
-        # Per-module mirror, unlike rotation, doesn't touch chip boundaries
-        # so it's safe to differ module to module -- calibrated by dragging
-        # that module's own tile in the layout grid.
+        # No rotation control here -- confirmed a per-chip rotation (global
+        # or per-module, uniform or not) can't stay coherent for content
+        # spanning more than one chip: a straight line across two same-row
+        # chips, both rotated identically, tears into two disconnected
+        # pieces at the chip boundary. --rotate180 (whole-canvas) is the
+        # only rotation left, because it's the only one that doesn't cut
+        # through a chip.
+        #
+        # flip_h/flip_v mirror the whole module tile, not per-chip, so they
+        # stay coherent within that module -- calibrated by dragging that
+        # module's own tile in the layout grid.
         self.flip_h = [False] * args.num_panels
         self.flip_v = [False] * args.num_panels
         self.rotate180 = args.rotate180
@@ -616,7 +620,7 @@ class State:
                         media_rotation=self.media_rotation,
                         media_scale=self.media_scale,
                         media_pos_x=self.media_pos_x, media_pos_y=self.media_pos_y,
-                        layout=self.layout, block_orientation=self.block_orientation,
+                        layout=self.layout,
                         flip_h=list(self.flip_h), flip_v=list(self.flip_v),
                         rotate180=self.rotate180, threshold=self.threshold,
                         dither=self.dither, calibrate=self.calibrate,
@@ -702,14 +706,6 @@ class State:
             if "layout" in data and data["layout"] in LAYOUTS and data["layout"] != self.layout:
                 self.layout = data["layout"]
                 rebuild = True
-            if "block_orientation" in data:
-                try:
-                    v = int(data["block_orientation"])
-                except (TypeError, ValueError):
-                    v = None
-                if v in (0, 90, 180, 270) and v != self.block_orientation:
-                    self.block_orientation = v
-                    rebuild = True
             for key in ("flip_h", "flip_v"):
                 if key in data:
                     cur = getattr(self, key)
@@ -879,17 +875,15 @@ def apply_module_transforms(bitmap, rows, cols, panel_w, panel_h, order, flip_h,
     to that board's chain position when `order` drags its content to a
     different slot, not to whichever slot happened to hold it before.
 
-    Rotation is NOT here -- it lives in --block-orientation (global, via
-    the device's own luma block_orientation). A per-module rotation was
-    tried and reverted: it only reads correctly when every module gets the
-    *same* value (every chip in the chain rotated the same way keeps
-    continuous content -- video, scrolling text, the calibration
-    border -- reading correctly across module boundaries); the moment one
-    module's rotation differs from its neighbours, content that's meant to
-    flow across that boundary visibly tears there. That's not a bug to fix
-    in software -- it's what a chip whose address mapping genuinely
-    differs from its neighbours' looks like. A whole-tile mirror doesn't
-    have this problem (it doesn't touch chip boundaries), so it's safe
+    There is no rotation control anywhere in this file, global or
+    per-module -- per-chip rotation (luma's block_orientation) was tried
+    both ways and confirmed incoherent for anything spanning more than one
+    chip: a straight line across two same-row chips, both rotated
+    identically, tears into two disconnected pieces at the chip boundary.
+    That's not fixable in software; --rotate180 (whole-canvas, in the
+    render loop) is the only rotation left, because it's the only one
+    that doesn't cut through a chip. A whole-tile mirror doesn't have this
+    problem either (it doesn't touch chip boundaries), so it's safe
     per-module."""
     if not any(flip_h) and not any(flip_v):
         return bitmap
@@ -965,11 +959,13 @@ def render_calibration_frame(rows, cols, panel_w, panel_h):
     in normal reading order -- then the mapping matches the hardware.
 
     Border and digit are drawn inside a single 8x8 chip, not spanning the
-    whole panel_w x panel_h module: a marker that crosses a chip boundary
-    comes apart under --block-orientation (each chip's own 8x8 gets rotated
-    independently by the driver), which made the calibration display itself
-    unreadable under rotation. A marker confined to one chip rotates as one
-    clean piece regardless."""
+    whole panel_w x panel_h module -- a marker that crosses a chip
+    boundary is exactly the kind of content per-chip rotation tears apart
+    (confirmed elsewhere in this file: even applied uniformly, a shape
+    spanning two chips comes apart at the boundary). There's no rotation
+    control left to trigger that here, but staying chip-confined costs
+    nothing and means this can't regress the same way again if one gets
+    added back."""
     img = Image.new("RGB", (cols * panel_w, rows * panel_h), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     chip_col = (panel_w // 8) // 2  # a chip fully inside the module
@@ -1155,9 +1151,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   bottom once it matches. H/V (bottom-right) mirror that module
   horizontally/vertically, independently, and travel with the tile if you
   drag it elsewhere -- for the one module wired backwards relative to the
-  rest. If every module reads rotated the same way instead, that's Block
-  orientation below, not a per-tile fix (rotating just one module tears
-  content at its edges -- see the note there). {rows}x{cols} modules,
+  rest. There's no rotation control (global or per-module): a per-chip
+  rotation can't stay coherent for anything spanning more than one chip,
+  confirmed directly -- a straight line across two same-row chips, rotated
+  identically, tears apart at the chip boundary regardless. --rotate180
+  below is whole-canvas, so it's unaffected. {rows}x{cols} modules,
   {self.panel_w}x{self.panel_h} each.
 </p>
 <label><input type="checkbox" {"checked" if snap['calibrate'] else ""}
@@ -1234,22 +1232,6 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   </select>
 </label>
 <span style="color:#888;font-size:.8rem">grid = 3 rows x 2 modules, strip = 2 rows x 3 chained</span>
-<br><br>
-<label>Block orientation
-  <select onchange="state.block_orientation=parseInt(this.value); send();">
-    {_opt("0", str(snap["block_orientation"]))}
-    {_opt("90", str(snap["block_orientation"]))}
-    {_opt("180", str(snap["block_orientation"]))}
-    {_opt("270", str(snap["block_orientation"]))}
-  </select>
-</label>
-<span style="color:#888;font-size:.8rem">
-  Global, not per-module -- rotates every chip in the chain the same way.
-  Has to be uniform: content crossing a module boundary (video, scrolling
-  text, the layout grid's own numbers) only reads correctly when every
-  module agrees. One module wired backwards instead of rotated? Use its
-  H/V buttons in the layout grid above -- that's safe per-module.
-</span>
 <br><br>
 <label><input type="checkbox" {"checked" if snap['rotate180'] else ""}
   onchange="state.rotate180=this.checked; send();"> Assembly mounted upside down</label>
@@ -1388,8 +1370,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     // which chain position (physical module) currently sits there. Drag a
     // tile onto another to swap them. H/V mirror that module horizontally/
     // vertically, independently, and travel with the tile if dragged
-    // elsewhere. No rotation here -- that's global (Block orientation),
-    // not per-tile: see the note above the grid.
+    // elsewhere. No rotation control anywhere -- see the note above the
+    // grid for why.
     const el = document.getElementById('blockGrid');
     if (dragSlot !== null) return; // don't rebuild out from under an active drag
     const key = [data.rows, data.cols, data.labels, data.active,
@@ -1492,11 +1474,18 @@ def make_control_server(state, port, panel_w, panel_h, upload_dir, preview):
     return server
 
 
-def build_device(serial_iface, canvas_w, canvas_h, block_orientation, brightness):
-    # luma only accepts 0/90/-90/180 -- 270 and -90 are the same turn.
-    luma_angle = -90 if block_orientation == 270 else block_orientation
-    return max7219(serial_iface, width=canvas_w, height=canvas_h, rotate=0,
-                    block_orientation=luma_angle, contrast=brightness)
+def build_device(serial_iface, canvas_w, canvas_h, brightness):
+    # No block_orientation: luma applies it per 8x8 chip independently, which
+    # only stays coherent for content confined to a single chip. Confirmed
+    # directly -- a straight line spanning two chips in the same row, both
+    # rotated identically, tears into two disconnected segments at the chip
+    # boundary. Global vs per-module makes no difference; it's incoherent
+    # either way for anything that spans more than one chip (video, text,
+    # a display meant to read as one continuous picture). --rotate180
+    # (whole-canvas PIL rotate, in the render loop) and flip_h/flip_v
+    # (whole-tile per module) are the only orientation controls because
+    # they're the only ones that don't cut through a chip.
+    return max7219(serial_iface, width=canvas_w, height=canvas_h, rotate=0, contrast=brightness)
 
 
 def parse_args():
@@ -1537,11 +1526,6 @@ def parse_args():
                    help="grid = 3 rows x 2 modules, strip = 2 rows x 3 "
                         "chained, half = 1 row x 3 chained (pair with "
                         "--num-panels 3 to drive/test only half the chain)")
-    p.add_argument("--block-orientation", type=int, default=0, choices=[0, 90, 180, 270],
-                   help="rotate every 8x8 chip the same way -- global, not "
-                        "per-module: content spanning a module boundary "
-                        "only reads correctly when every module agrees on "
-                        "this. Live-editable.")
     p.add_argument("--rotate180", action="store_true",
                    help="whole assembly mounted upside down")
     p.add_argument("--calibrate", action="store_true",
@@ -1660,8 +1644,7 @@ def main():
 
     serial_iface = spi(port=args.spi_port, device=args.spi_device, gpio=noop(),
                         bus_speed_hz=args.spi_hz)
-    device = build_device(serial_iface, canvas_w, canvas_h, snap0["block_orientation"],
-                           snap0["brightness"])
+    device = build_device(serial_iface, canvas_w, canvas_h, snap0["brightness"])
 
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0
@@ -1669,7 +1652,6 @@ def main():
     rendered = 0
     last_report = last_t
     last_brightness = snap0["brightness"]
-    last_block_orientation = snap0["block_orientation"]
 
     print("running -- ctrl-c to stop")
     try:
@@ -1685,12 +1667,9 @@ def main():
                     print("layout/text-height change rejected -- leaves no "
                           "room for the media queue at this layout")
                 else:
-                    if (new_cw, new_ch) != (canvas_w, canvas_h) or \
-                            snap["block_orientation"] != last_block_orientation:
-                        device = build_device(serial_iface, new_cw, new_ch,
-                                               snap["block_orientation"], snap["brightness"])
+                    if (new_cw, new_ch) != (canvas_w, canvas_h):
+                        device = build_device(serial_iface, new_cw, new_ch, snap["brightness"])
                         last_brightness = snap["brightness"]
-                        last_block_orientation = snap["block_orientation"]
                     canvas_w, canvas_h = new_cw, new_ch
                     text_h, video_h = new_text_h, new_video_h
                 scroller = rebuild_scroller(snap)

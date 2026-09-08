@@ -5,11 +5,11 @@ Raspberry Pi 4. A minimal security-cam viewer: full color by default, with
 optional grayscale/false-color modes for low-light or night-vision-style
 viewing.
 
-Renders straight to the HDMI output via KMS/DRM (SDL's "kmsdrm" video
-driver) -- no desktop session, X11, or Wayland compositor needed. That
-means it can run as a plain systemd service that comes up on boot with
-nobody logged in: see scripts/install-security-cam-hdmi.sh, which installs
-it as the "security-cam-hdmi" service.
+Runs as a normal fullscreen app inside the desktop session (X11 or
+Wayland) -- same technique as a fullscreen video-loop player: launched via
+a desktop autostart entry so it comes up after login, but the desktop
+itself stays usable (switch away with alt-tab, ssh in, etc). See
+scripts/install-security-cam-hdmi.sh, which installs the autostart entry.
 
 Run by hand with:
     python3 security_cam_hdmi.py
@@ -24,19 +24,14 @@ Useful flags:
     --gamma 0.7             only affects --mono / --palette
     --no-agc                disable auto-contrast in --mono / --palette modes
     --stats                 print render fps once a second
-    q, Esc, or ctrl-c quits (q/Esc only work if a keyboard is attached)
+    q or Esc in the window quits
 """
 
 import argparse
-import os
 import time
 
 import numpy as np
 import cv2
-
-# Must be set before pygame's display module initializes -- this is what
-# lets it draw directly to the HDMI output with no X11/Wayland running.
-os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
 
 
 # ----------------------------------------------------------------------------

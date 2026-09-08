@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Pi Camera Module 3 (CSI ribbon slot) -> live display over HDMI, on a
-Raspberry Pi 4. A minimal security-cam viewer: full color by default, with
-optional grayscale/false-color modes for low-light or night-vision-style
-viewing.
+Raspberry Pi. Emulates the classic analog security/IR-cam look
+(blown-out monochrome, CRT scanlines, a subtle lens vignette) by default,
+with motion-blob detection boxing anything that moves.
 
 Runs as a normal fullscreen app inside the desktop session (X11 or
 Wayland) -- same technique as a fullscreen video-loop player: launched via
@@ -14,25 +14,28 @@ scripts/install-security-cam-hdmi.sh, which installs the autostart entry.
 Run by hand with:
     python3 security_cam_hdmi.py
 
-Runs with motion-blob detection and a fake fisheye lens effect ON by
-default -- this is tuned to be cheap enough for a Raspberry Pi 3 with no
-extra hardware (no Coral/TPU), not just the Pi 4. There's no real person
-detector here: a moving-blob box is a cheap stand-in, not a person
-classifier, so it'll also box pets, shadows, and waving branches.
+Tuned to be cheap enough for a Raspberry Pi 3 with no extra hardware (no
+Coral/TPU), not just the Pi 4. There's no real person detector: a
+moving-blob box is a cheap stand-in, not a person classifier, so it'll
+also box pets, shadows, and waving branches.
 
 Useful flags:
     --resolution 640x480    camera capture size (lower = faster on a Pi 3)
     --rotate 0|90|180|270
     --hflip / --vflip
-    --mono                  grayscale instead of color (auto-contrast applied)
+    --color                 full color instead of the default infrared look
+    --mono                  grayscale instead of the default infrared look
     --palette ironbow|whitehot|blackhot|rainbow|redhot|bodyheat|colorwise|infrared|<opencv colormap name>
-                            false-color night-vision-style look instead of color
+                            false-color look (default: infrared)
     --gamma 0.7             only affects --mono / --palette
     --no-agc                disable auto-contrast in --mono / --palette modes
-    --no-fisheye            disable the fisheye warp (on by default) -- toggle
-                            this to check how much it costs on your hardware
-    --fisheye-strength 0.4  0 = none, higher = more barrel distortion
+    --no-fisheye            disable the fisheye warp + vignette (on by
+                            default) -- toggle this to check how much it
+                            costs on your hardware
+    --fisheye-strength 0.015   0 = none, higher = more barrel distortion
+    --vignette-strength 0.45   0 = none, higher = darker corners
     --no-motion             disable motion-blob detection (on by default)
+    --no-crt-lines          disable the fine scanline overlay (on by default)
     --stats                 print render fps once a second
     q or Esc in the window quits
 """
@@ -54,7 +57,18 @@ AGC_HIGH_PCT = 98.0
 AGC_ALPHA = 0.1          # EMA on the range; lower = steadier, slower to adapt
 MIN_SPAN = 20.0          # never stretch a span narrower than this (0-255 units)
 
-FISHEYE_STRENGTH = 0.4
+DEFAULT_PALETTE = "infrared"
+
+# Power law (not r^2) so the warp stays nearly flat near the center and
+# only bends noticeably toward the corners, like a mild real lens rather
+# than a fully spherical fisheye.
+FISHEYE_STRENGTH = 0.015
+FISHEYE_POWER = 4
+
+VIGNETTE_STRENGTH = 0.45
+VIGNETTE_MIN = 0.55     # corners never darken past this fraction of brightness
+
+SCANLINE_STRENGTH = 0.15   # every other row is darkened by this fraction
 
 # Motion/blob detection runs on a downscaled copy to stay cheap on a Pi 3;
 # boxes are scaled back up to full frame size afterward.
@@ -198,11 +212,12 @@ class Agc:
 
 
 # ----------------------------------------------------------------------------
-# Fake fisheye lens effect -- purely cosmetic barrel distortion, applied
-# via a remap table built once per frame size (not per frame).
+# Fake fisheye lens effect + vignette -- purely cosmetic, both built once
+# per frame size (not per frame) from the same radial distance grid.
 # ----------------------------------------------------------------------------
 
-def build_fisheye_maps(size, strength):
+def _radial_grid(size):
+    """Normalised (dx, dy, r) grids; r=1 at the shorter dimension's edge."""
     w, h = size
     cx, cy = w / 2.0, h / 2.0
     radius = min(cx, cy)
@@ -211,11 +226,23 @@ def build_fisheye_maps(size, strength):
     dx = (xs - cx) / radius
     dy = (ys - cy) / radius
     r = np.sqrt(dx * dx + dy * dy)
-    factor = 1.0 + strength * (r ** 2)
+    return dx, dy, r, cx, cy, radius
+
+
+def build_fisheye_maps(size, strength, power=FISHEYE_POWER):
+    dx, dy, r, cx, cy, radius = _radial_grid(size)
+    factor = 1.0 + strength * (r ** power)
 
     map_x = (dx * factor) * radius + cx
     map_y = (dy * factor) * radius + cy
     return map_x.astype(np.float32), map_y.astype(np.float32)
+
+
+def build_vignette(size, strength=VIGNETTE_STRENGTH, min_mult=VIGNETTE_MIN):
+    """(h, w) float32 brightness multiplier, 1.0 at center, darker at corners."""
+    _, _, r, _, _, _ = _radial_grid(size)
+    mask = 1.0 - strength * np.clip(r, 0.0, 1.0) ** 2
+    return np.clip(mask, min_mult, 1.0).astype(np.float32)
 
 
 # ----------------------------------------------------------------------------
@@ -302,10 +329,12 @@ def parse_resolution(s):
 def main():
     p = argparse.ArgumentParser()
     mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--color", action="store_true",
+                       help="full color instead of the default infrared look")
     mode.add_argument("--mono", action="store_true",
-                       help="grayscale instead of color, with auto-contrast")
+                       help="grayscale instead of the default infrared look, with auto-contrast")
     mode.add_argument("--palette", default=None,
-                       help="false-color night-vision-style look instead of color: "
+                       help="false-color look instead of the default infrared: "
                             "ironbow, whitehot, blackhot, rainbow, redhot, "
                             "bodyheat, colorwise, infrared, or any "
                             "OpenCV colormap name such as inferno / magma / turbo")
@@ -320,12 +349,18 @@ def main():
     p.add_argument("--no-agc", action="store_true",
                    help="disable auto-contrast in --mono / --palette modes")
     p.add_argument("--no-fisheye", action="store_true",
-                   help="disable the fisheye warp (on by default)")
+                   help="disable the fisheye warp + vignette (on by default)")
     p.add_argument("--fisheye-strength", type=float, default=FISHEYE_STRENGTH)
+    p.add_argument("--vignette-strength", type=float, default=VIGNETTE_STRENGTH)
     p.add_argument("--no-motion", action="store_true",
                    help="disable motion-blob detection (on by default)")
+    p.add_argument("--no-crt-lines", action="store_true",
+                   help="disable the scanline overlay (on by default)")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
+
+    if not args.mono and not args.palette and not args.color:
+        args.palette = DEFAULT_PALETTE
 
     rotate_k = (args.rotate // 90) % 4
     processed = args.mono or args.palette
@@ -333,6 +368,13 @@ def main():
     agc = Agc() if (processed and not args.no_agc) else None
     fisheye = not args.no_fisheye
     motion_on = not args.no_motion
+    crt_lines = not args.no_crt_lines
+
+    # Box color comes from the active palette's own brightest anchor (or
+    # plain white for --mono / --color) instead of an arbitrary red, so it
+    # reads as part of the same limited color scheme instead of a jarring
+    # accent color.
+    box_color = tuple(int(c) for c in lut[255]) if lut is not None else (255, 255, 255)
 
     print(f"starting camera at {args.resolution[0]}x{args.resolution[1]}...")
     camera = Camera(args.resolution, args.hflip, args.vflip)
@@ -342,13 +384,14 @@ def main():
     print(f"  {display.size[0]}x{display.size[1]}")
 
     # Frame size after rotation -- rot90 swaps width/height on a 90/270
-    # turn, and both the fisheye map and the motion detector are built
+    # turn, and the fisheye map / vignette / motion detector are all built
     # once for that fixed size rather than recomputed every frame.
     w, h = args.resolution
     frame_size = (h, w) if rotate_k in (1, 3) else (w, h)
     fisheye_maps = build_fisheye_maps(frame_size, args.fisheye_strength) if fisheye else None
+    vignette = build_vignette(frame_size, args.vignette_strength) if fisheye else None
+    vignette_3ch = vignette[:, :, None] if vignette is not None else None
     motion = MotionDetector(frame_size) if motion_on else None
-    box_color = (255, 60, 60)
 
     frames = 0
     last_report = time.monotonic()
@@ -377,8 +420,14 @@ def main():
             else:
                 rgb = bgr[:, :, ::-1].copy()  # BGR -> RGB
 
+            if fisheye:
+                rgb = (rgb.astype(np.float32) * vignette_3ch).astype(np.uint8)
+
             for x, y, bw, bh in boxes:
                 cv2.rectangle(rgb, (x, y), (x + bw, y + bh), box_color, 2)
+
+            if crt_lines:
+                rgb[1::2] = (rgb[1::2].astype(np.float32) * (1.0 - SCANLINE_STRENGTH)).astype(np.uint8)
 
             display.show(rgb)
             frames += 1

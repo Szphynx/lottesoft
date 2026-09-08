@@ -60,11 +60,19 @@ chown "$TARGET_USER:$TARGET_USER" "$ENV_FILE"
 # straight into the .desktop Exec= line -- the Desktop Entry spec has its
 # own field-quoting rules (not POSIX shell quoting), so nested quotes
 # there are fragile. Both autostart mechanisms below just point at this.
+#
+# The while-loop is what makes the control page's Restart button (and a
+# plain crash) actually come back: the Python process just exits cleanly
+# when asked to restart, and this relaunches it immediately rather than
+# leaving the display dead until the next login.
 RUN_SCRIPT="$REPO_DIR/scripts/run-security-cam-hdmi.sh"
 cat > "$RUN_SCRIPT" <<EOF
 #!/bin/sh
 . "$ENV_FILE"
-exec /usr/bin/python3 $REPO_DIR/security_cam_hdmi.py --stats
+while true; do
+    /usr/bin/python3 $REPO_DIR/security_cam_hdmi.py --stats
+    sleep 1
+done
 EOF
 chmod +x "$RUN_SCRIPT"
 

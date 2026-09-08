@@ -3,13 +3,18 @@
 Pi Camera Module 3 (CSI ribbon slot) -> live display over HDMI, on a
 Raspberry Pi. Emulates the classic analog security/IR-cam look
 (blown-out monochrome, CRT scanlines, a subtle lens vignette) by default,
-with motion-blob detection boxing anything that moves.
+with motion-blob detection boxing anything that moves and giving each
+blob a stable "#N <area>px" label (a lightweight nearest-centroid
+tracker, not a real multi-object tracker).
 
 Runs as a normal fullscreen app inside the desktop session (X11 or
 Wayland) -- same technique as a fullscreen video-loop player: launched via
 a desktop autostart entry so it comes up after login, but the desktop
 itself stays usable (switch away with alt-tab, ssh in, etc). See
-scripts/install-security-cam-hdmi.sh, which installs the autostart entry.
+scripts/install-security-cam-hdmi.sh, which installs the autostart entry
+via a small wrapper script that loops around any exit and relaunches --
+that's what makes the control page's Restart button (and just plain
+crashing) come back on its own instead of leaving the display dead.
 
 Run by hand with:
     python3 security_cam_hdmi.py
@@ -23,9 +28,12 @@ Also serves a small live control page (like scripts/status_server.py's
 status page, same bind-to-tailscale-IP + basic-auth pattern) with a
 low-fps preview image and sliders/toggles for everything below that isn't
 resolution/rotation -- those still need a camera reconfigure, so they stay
-CLI-only. Set CAM_USER / CAM_PASS env vars to require a login; unset means
-anyone who can reach the port can control the camera, so set them if the
-Pi is reachable beyond your own tailnet.
+CLI-only. Every change auto-saves to ~/.config/security-cam-hdmi-settings.json
+and is loaded back automatically on the next start (CLI flags for these
+only matter the very first time, before that file exists). Set CAM_USER /
+CAM_PASS env vars to require a login; unset means anyone who can reach the
+port can control the camera, so set them if the Pi is reachable beyond
+your own tailnet.
 
 Useful flags:
     --resolution 640x480    camera capture size (lower = faster on a Pi 3)
@@ -105,6 +113,7 @@ MOTION_HISTORY = 300
 MOTION_VAR_THRESHOLD = 24
 
 CAM_CONTROL_PORT = 8790
+SETTINGS_FILE = os.path.expanduser("~/.config/security-cam-hdmi-settings.json")
 PREVIEW_INTERVAL = 0.35   # ~3 fps -- deliberately slow, this is a monitor page, not the display
 PREVIEW_WIDTH = 320
 PREVIEW_JPEG_QUALITY = 70
@@ -232,7 +241,12 @@ class Agc:
         self.hi = None
 
     def normalize(self, gray):
-        lo, hi = np.percentile(gray, [self.low_pct, self.high_pct])
+        # Percentile over a strided sample instead of every pixel -- np.percentile
+        # is a sort under the hood, so this is the priciest part of the whole
+        # per-frame pipeline at full resolution; a 1-in-16 sample gives a
+        # statistically indistinguishable cutoff for this purpose at a
+        # fraction of the cost.
+        lo, hi = np.percentile(gray[::4, ::4], [self.low_pct, self.high_pct])
         if hi - lo < self.min_span:
             mid = 0.5 * (hi + lo)
             lo, hi = mid - self.min_span / 2.0, mid + self.min_span / 2.0
@@ -305,20 +319,75 @@ class MotionDetector:
         self.kernel = np.ones((3, 3), np.uint8)
 
     def detect(self, gray):
+        """Returns a list of dicts: box (x,y,w,h), area (px^2, full-res),
+        centroid (x,y, full-res) -- all scaled back up from the downscaled
+        copy this actually runs on.
+        """
         small = cv2.resize(gray, self.small_size, interpolation=cv2.INTER_AREA)
         mask = self.bgsub.apply(small)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.dilate(mask, self.kernel, iterations=1)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = []
+        detections = []
         for c in contours:
-            if cv2.contourArea(c) < self.min_area:
+            area_small = cv2.contourArea(c)
+            if area_small < self.min_area:
                 continue
             x, y, w, h = cv2.boundingRect(c)
-            boxes.append((int(x * self.scale_back), int(y * self.scale_back),
-                          int(w * self.scale_back), int(h * self.scale_back)))
-        return boxes
+            sb = self.scale_back
+            box = (int(x * sb), int(y * sb), int(w * sb), int(h * sb))
+            detections.append({
+                "box": box,
+                "area": int(area_small * sb * sb),
+                "centroid": (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0),
+            })
+        return detections
+
+
+# ----------------------------------------------------------------------------
+# Minimal nearest-centroid tracker so each blob keeps a stable number
+# across frames instead of being renumbered every frame -- not a real
+# multi-object tracker (no motion prediction, no re-identification after a
+# long gap), just enough to put a consistent "#N" on something as it
+# moves.
+# ----------------------------------------------------------------------------
+
+class BlobTracker:
+    def __init__(self, max_distance=60.0, max_missed=8):
+        self.max_distance = max_distance
+        self.max_missed = max_missed
+        self.next_id = 1
+        self.tracks = {}   # id -> {"centroid": (x,y), "missed": int}
+
+    def update(self, detections):
+        unmatched_track_ids = set(self.tracks.keys())
+        results = []
+
+        for det in detections:
+            cx, cy = det["centroid"]
+            best_id, best_dist = None, self.max_distance
+            for tid in unmatched_track_ids:
+                tx, ty = self.tracks[tid]["centroid"]
+                dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_id, best_dist = tid, dist
+
+            if best_id is None:
+                best_id = self.next_id
+                self.next_id += 1
+            else:
+                unmatched_track_ids.discard(best_id)
+
+            self.tracks[best_id] = {"centroid": (cx, cy), "missed": 0}
+            results.append((best_id, det))
+
+        for tid in unmatched_track_ids:
+            self.tracks[tid]["missed"] += 1
+            if self.tracks[tid]["missed"] > self.max_missed:
+                del self.tracks[tid]
+
+        return results
 
 
 # ----------------------------------------------------------------------------
@@ -385,8 +454,18 @@ class Display:
 # ----------------------------------------------------------------------------
 # Live, thread-safe settings shared between the render loop and the web
 # control page. CLI flags set the starting values; everything here except
-# resolution/rotation can change while running.
+# resolution/rotation can change while running, and auto-saves to
+# SETTINGS_FILE on every change so the last arrangement survives a
+# restart -- the next startup loads it automatically, overriding the CLI
+# defaults (which then only matter for a Pi's very first run).
 # ----------------------------------------------------------------------------
+
+SETTINGS_FIELDS = (
+    "mode", "palette_name", "gamma", "agc", "fisheye", "fisheye_strength",
+    "vignette_strength", "crt_lines", "crt_strength", "motion", "hflip",
+    "vflip", "hue", "saturation", "brightness",
+)
+
 
 class Settings:
     def __init__(self, args):
@@ -406,12 +485,29 @@ class Settings:
         self.hue = 0.0
         self.saturation = 1.0
         self.brightness = 1.0
+        self._load()
 
-    def snapshot(self):
+    def to_dict(self):
         with self.lock:
-            return dict(vars(self))  # vars() includes .lock itself, harmless to copy the ref
+            return {k: getattr(self, k) for k in SETTINGS_FIELDS}
 
-    def update(self, **kwargs):
+    def _load(self):
+        try:
+            with open(SETTINGS_FILE) as f:
+                saved = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        self.update(persist=False, **saved)
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(self.to_dict(), f)
+        except OSError:
+            pass
+
+    def update(self, persist=True, **kwargs):
         with self.lock:
             if "mode" in kwargs and kwargs["mode"] in ("color", "mono", "palette"):
                 self.mode = kwargs["mode"]
@@ -434,6 +530,8 @@ class Settings:
             for flag in ("agc", "fisheye", "crt_lines", "motion", "hflip", "vflip"):
                 if flag in kwargs:
                     setattr(self, flag, bool(kwargs[flag]))
+        if persist:
+            self._save()
 
 
 def _clamp(v, lo, hi):
@@ -518,6 +616,12 @@ CONTROL_PAGE = """<!doctype html>
     <label><span>saturation</span><input type="range" name="saturation" min="0" max="3" step="0.05"><output></output></label>
     <label><span>brightness</span><input type="range" name="brightness" min="0" max="3" step="0.05"><output></output></label>
   </fieldset>
+  <fieldset>
+    <legend>service</legend>
+    <p style="margin:.2rem 0 .6rem;opacity:.7">changes save automatically and reload on the next start</p>
+    <button type="button" id="restart">restart camera service</button>
+    <span id="restart-status" style="margin-left:.6rem;opacity:.7"></span>
+  </fieldset>
 </form>
 <script>
 const PALETTES = __PALETTES__;
@@ -526,6 +630,7 @@ PALETTES.forEach(p => paletteSel.add(new Option(p, p)));
 
 const form = document.getElementById("controls");
 let applying = false;
+let lastLocalChange = 0;
 
 function setFormValues(state) {
   applying = true;
@@ -540,6 +645,10 @@ function setFormValues(state) {
 }
 
 async function refreshState() {
+  // Skip if a local edit landed in the last couple seconds, so a
+  // periodic refresh doesn't yank a slider back mid-drag before the
+  // POST it triggered has actually taken effect server-side.
+  if (Date.now() - lastLocalChange < 2000) return;
   const r = await fetch("/state");
   setFormValues(await r.json());
 }
@@ -554,6 +663,7 @@ async function sendChange(name, value) {
 
 form.addEventListener("input", (e) => {
   if (applying) return;
+  lastLocalChange = Date.now();
   const el = e.target;
   const out = el.parentElement.querySelector("output");
   if (out) out.textContent = el.value;
@@ -563,10 +673,18 @@ form.addEventListener("input", (e) => {
   sendChange(el.name, value);
 });
 
+document.getElementById("restart").addEventListener("click", async () => {
+  const status = document.getElementById("restart-status");
+  status.textContent = "restarting...";
+  await fetch("/restart", {method: "POST"});
+  setTimeout(() => { status.textContent = ""; refreshState(); }, 4000);
+});
+
 function tickPreview() {
   document.getElementById("preview").src = "/preview.jpg?t=" + Date.now();
 }
 setInterval(tickPreview, __PREVIEW_MS__);
+setInterval(refreshState, 2000);
 tickPreview();
 refreshState();
 </script>
@@ -580,8 +698,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/preview.jpg"):
             self._send(self.server.preview.get(), "image/jpeg")
         elif self.path.startswith("/state"):
-            state = {k: v for k, v in self.server.settings.snapshot().items() if k != "lock"}
-            self._send(json.dumps(state).encode(), "application/json")
+            self._send(json.dumps(self.server.settings.to_dict()).encode(), "application/json")
         elif self.path == "/" or self.path.startswith("/index"):
             palettes = sorted(PALETTES.keys()) + CV2_COLORMAPS
             html = (CONTROL_PAGE
@@ -602,8 +719,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 data = {}
             self.server.settings.update(**data)
-            state = {k: v for k, v in self.server.settings.snapshot().items() if k != "lock"}
-            self._send(json.dumps(state).encode(), "application/json")
+            self._send(json.dumps(self.server.settings.to_dict()).encode(), "application/json")
+        elif self.path.startswith("/restart"):
+            # Sets a flag the render loop checks each frame and exits on
+            # cleanly (closing the camera/display first) rather than
+            # killing the process outright -- scripts/run-security-cam-hdmi.sh
+            # loops around any clean exit and launches it again right away.
+            self.server.restart_event.set()
+            self._send(b'{"restarting": true}', "application/json")
         else:
             self.send_response(404)
             self.end_headers()
@@ -636,10 +759,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 class ControlServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, settings, preview):
+    def __init__(self, addr, settings, preview, restart_event):
         super().__init__(addr, ControlHandler)
         self.settings = settings
         self.preview = preview
+        self.restart_event = restart_event
 
 
 def tailscale_or_local_ip():
@@ -726,14 +850,16 @@ def main():
     w, h = args.resolution
     frame_size = (h, w) if rotate_k in (1, 3) else (w, h)
     motion = MotionDetector(frame_size)
+    tracker = BlobTracker()
     agc = Agc()
 
     preview = PreviewBuffer()
+    restart_event = threading.Event()
     server = None
     if not args.no_web:
         bind_ip = tailscale_or_local_ip()
         try:
-            server = ControlServer((bind_ip, args.web_port), settings, preview)
+            server = ControlServer((bind_ip, args.web_port), settings, preview, restart_event)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             print(f"control page: http://{bind_ip}:{args.web_port}/")
             if not os.environ.get("CAM_USER"):
@@ -753,8 +879,9 @@ def main():
 
     print("running -- ctrl-c (or q/Esc with a keyboard attached) to stop")
     try:
-        while True:
-            snap = settings.snapshot()
+        while not restart_event.is_set():
+            snap = settings.to_dict()
+            processed = snap["mode"] in ("mono", "palette")
 
             bgr = camera.read_bgr()
             if rotate_k:
@@ -771,12 +898,27 @@ def main():
                     cache["vignette_key"] = snap["vignette_strength"]
                     cache["vignette_3ch"] = build_vignette(frame_size, snap["vignette_strength"])[:, :, None]
                 map_x, map_y = cache["fisheye_maps"]
-                bgr = cv2.remap(bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
 
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            boxes = motion.detect(gray) if snap["motion"] else ()
+            # In mono/palette modes the color data gets thrown away right
+            # after this anyway (everything downstream works off gray), so
+            # convert to gray FIRST and warp that single channel instead of
+            # warping the full 3-channel BGR frame -- same visual result
+            # (remap only moves/interpolates within a channel, it doesn't
+            # mix channels, so warp-then-gray and gray-then-warp agree),
+            # about a third of the remap cost. Only --color needs the
+            # actual warped color pixels.
+            if processed:
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                if snap["fisheye"]:
+                    gray = cv2.remap(gray, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+            else:
+                if snap["fisheye"]:
+                    bgr = cv2.remap(bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-            processed = snap["mode"] in ("mono", "palette")
+            detections = motion.detect(gray) if snap["motion"] else []
+            tracked = tracker.update(detections) if snap["motion"] else []
+
             lut = None
             if snap["mode"] == "palette":
                 lut_key = (snap["palette_name"], snap["gamma"])
@@ -802,8 +944,12 @@ def main():
             rgb = apply_hsb(rgb, snap["hue"], snap["saturation"], snap["brightness"])
 
             box_color = tuple(int(c) for c in lut[255]) if lut is not None else (255, 255, 255)
-            for x, y, bw, bh in boxes:
+            for tid, det in tracked:
+                x, y, bw, bh = det["box"]
                 cv2.rectangle(rgb, (x, y), (x + bw, y + bh), box_color, 2)
+                label = f"#{tid} {det['area']}px"
+                cv2.putText(rgb, label, (x, max(y - 6, 10)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, box_color, 1, cv2.LINE_AA)
 
             display.set_scanlines(snap["crt_strength"] if snap["crt_lines"] else 0.0)
             display.show(rgb)
@@ -825,7 +971,7 @@ def main():
             if args.stats and now - last_report >= 1.0:
                 span = now - last_report
                 rng = f"{agc.lo:.0f}-{agc.hi:.0f}" if (processed and snap["agc"] and agc.lo is not None) else "n/a"
-                print(f"render {frames / span:5.1f} fps   range {rng}   motion boxes {len(boxes)}")
+                print(f"render {frames / span:5.1f} fps   range {rng}   tracked blobs {len(tracked)}")
                 frames = 0
                 last_report = now
     except KeyboardInterrupt:

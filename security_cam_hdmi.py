@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """
-Pi Camera Module 3 (CSI ribbon slot) -> false-color "thermal-style" display
-over HDMI, on a Raspberry Pi 4.
-
-This is a stand-in for a real thermal sensor: it takes the CSI camera's
-live grayscale luminance and runs it through the same kind of auto-contrast
-+ false-color palette pipeline used for the LED-matrix thermal project, so
-the display/controls can be built and tuned before a radiometric sensor is
-wired in. Swap out the Camera class for a real thermal source later --
-everything downstream (AGC, palette, display) stays the same.
+Pi Camera Module 3 (CSI ribbon slot) -> live display over HDMI, on a
+Raspberry Pi 4. A minimal security-cam viewer: full color by default, with
+optional grayscale/false-color modes for low-light or night-vision-style
+viewing.
 
 Needs a desktop session running on the Pi (X11 or Wayland) -- this opens a
 plain fullscreen window on whatever's plugged into HDMI. See
-scripts/install-camera-hdmi.sh for one-shot dependency setup and an
+scripts/install-security-cam-hdmi.sh for one-shot dependency setup and an
 optional autostart-on-login entry.
 
 Run with:
-    python3 thermal_camera_hdmi.py
+    python3 security_cam_hdmi.py
 
 Useful flags:
-    --palette ironbow|whitehot|blackhot|rainbow|redhot|<opencv colormap name>
-    --mono                  skip the palette, show raw grayscale (camera sanity check)
     --resolution 1280x720   camera capture size
     --rotate 0|90|180|270
     --hflip / --vflip
-    --gamma 0.7
-    --no-agc                disable auto-contrast, map the fixed 0-255 range
-    --stats                 print capture/render fps once a second
+    --mono                  grayscale instead of color (auto-contrast applied)
+    --palette ironbow|whitehot|blackhot|rainbow|redhot|<opencv colormap name>
+                            false-color night-vision-style look instead of color
+    --gamma 0.7             only affects --mono / --palette
+    --no-agc                disable auto-contrast in --mono / --palette modes
+    --stats                 print render fps once a second
     q or Esc in the window quits
 """
 
@@ -38,7 +34,7 @@ import cv2
 
 
 # ----------------------------------------------------------------------------
-# Tunables.
+# Tunables (only used by --mono / --palette).
 # ----------------------------------------------------------------------------
 
 GAMMA = 0.70
@@ -49,8 +45,7 @@ MIN_SPAN = 20.0          # never stretch a span narrower than this (0-255 units)
 
 
 # ----------------------------------------------------------------------------
-# Palettes -- same anchor format as the LED-matrix project. Anchors are
-# (position 0-1, (R, G, B)).
+# False-color palettes for --palette. Anchors are (position 0-1, (R, G, B)).
 # ----------------------------------------------------------------------------
 
 PALETTES = {
@@ -125,12 +120,11 @@ class Camera:
         self.picam2.start()
         time.sleep(1.0)  # let AE/AWB settle before the first read
 
-    def read_gray(self):
+    def read_bgr(self):
         # picamera2's "RGB888" format is actually laid out BGR (a
-        # long-standing quirk kept for OpenCV compatibility), so this is
-        # the right conversion despite the name.
-        frame = self.picam2.capture_array()
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # long-standing quirk kept for OpenCV compatibility) -- so this is
+        # already what OpenCV expects, no conversion needed.
+        return self.picam2.capture_array()
 
     def close(self):
         self.picam2.stop()
@@ -176,29 +170,33 @@ def parse_resolution(s):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--palette", default="ironbow",
-                   help="ironbow, whitehot, blackhot, rainbow, redhot, or any "
-                        "OpenCV colormap name such as inferno / magma / turbo")
-    p.add_argument("--mono", action="store_true",
-                   help="skip the palette, show raw auto-contrasted grayscale")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--mono", action="store_true",
+                       help="grayscale instead of color, with auto-contrast")
+    mode.add_argument("--palette", default=None,
+                       help="false-color night-vision-style look instead of color: "
+                            "ironbow, whitehot, blackhot, rainbow, redhot, or any "
+                            "OpenCV colormap name such as inferno / magma / turbo")
     p.add_argument("--resolution", type=parse_resolution, default=(1280, 720))
     p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270])
     p.add_argument("--hflip", action="store_true")
     p.add_argument("--vflip", action="store_true")
-    p.add_argument("--gamma", type=float, default=GAMMA)
+    p.add_argument("--gamma", type=float, default=GAMMA,
+                   help="only affects --mono / --palette")
     p.add_argument("--no-agc", action="store_true",
-                   help="disable auto-contrast, map the fixed 0-255 range as-is")
+                   help="disable auto-contrast in --mono / --palette modes")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
     rotate_k = (args.rotate // 90) % 4
-    lut = None if args.mono else get_lut(args.palette, args.gamma)
-    agc = None if args.no_agc else Agc()
+    processed = args.mono or args.palette
+    lut = get_lut(args.palette, args.gamma) if args.palette else None
+    agc = Agc() if (processed and not args.no_agc) else None
 
     print(f"starting camera at {args.resolution[0]}x{args.resolution[1]}...")
     camera = Camera(args.resolution, args.hflip, args.vflip)
 
-    window = "thermal camera (q or Esc to quit)"
+    window = "security cam (q or Esc to quit)"
     cv2.namedWindow(window, cv2.WND_PROP_FULLSCREEN)
     cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -208,16 +206,20 @@ def main():
     print("running -- q or Esc in the window to stop")
     try:
         while True:
-            gray = camera.read_gray()
+            bgr = camera.read_bgr()
             if rotate_k:
-                gray = np.rot90(gray, rotate_k)
+                bgr = np.rot90(bgr, rotate_k, axes=(0, 1))
 
-            if args.mono:
-                disp = gray
-            else:
+            if processed:
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
                 norm = agc.normalize(gray) if agc else gray.astype(np.float32) / 255.0
-                idx = (norm * 255.0).astype(np.uint8)
-                disp = cv2.cvtColor(lut[idx], cv2.COLOR_RGB2BGR)
+                if args.palette:
+                    idx = (norm * 255.0).astype(np.uint8)
+                    disp = cv2.cvtColor(lut[idx], cv2.COLOR_RGB2BGR)
+                else:
+                    disp = (norm * 255.0).astype(np.uint8)
+            else:
+                disp = bgr
 
             cv2.imshow(window, disp)
             frames += 1
@@ -229,7 +231,7 @@ def main():
             now = time.monotonic()
             if args.stats and now - last_report >= 1.0:
                 span = now - last_report
-                rng = f"{agc.lo:.0f}-{agc.hi:.0f}" if agc else "0-255"
+                rng = f"{agc.lo:.0f}-{agc.hi:.0f}" if agc else "n/a"
                 print(f"render {frames / span:5.1f} fps   range {rng}")
                 frames = 0
                 last_report = now

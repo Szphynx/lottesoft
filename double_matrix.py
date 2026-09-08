@@ -216,6 +216,11 @@ LAYOUTS = {"grid": (3, 2), "strip": (2, 3), "half": (1, 3)}
 # itself also accepts 16-52MHz, not offered here as pointless for this.
 SPI_HZ_CHOICES = (500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000)
 
+# Per-frame decay at full ("wet") trail, chosen so a pixel fades to ~10%
+# brightness in about a second at the ~20fps render loop runs at:
+# 0.1 ** (1/20) =~ 0.89.
+TRAIL_MAX_DECAY = 0.89
+
 
 def split_row_for(rows, dual_bus):
     """How many of `rows` grid-rows the first SPI bus drives when
@@ -237,6 +242,56 @@ def load_font(path, size, bold=False, italic=False):
             continue
     sys.exit("no usable font found -- pass --font /path/to/font.ttf "
               "(try: sudo apt install fonts-dejavu-core)")
+
+
+# Tried, in order, for any character the primary font doesn't actually
+# have -- kaomoji and similar mixed-script text pull in Japanese kana that
+# a Latin-focused font like DejaVu doesn't cover. Any/all of these can be
+# missing (just fewer fallbacks); only the primary font is required.
+FALLBACK_FONT_PATHS = [
+    "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",  # apt: fonts-vlgothic
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",    # apt: fonts-noto-cjk
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",       # some distros symlink this
+]
+
+
+def load_fallback_fonts(size):
+    fonts = []
+    for path in FALLBACK_FONT_PATHS:
+        try:
+            fonts.append(ImageFont.truetype(path, size))
+        except OSError:
+            continue
+    return fonts
+
+
+def _render_char(font, ch, dummy):
+    bbox = dummy.textbbox((0, 0), ch, font=font)
+    w, h = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+    img = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(img).text((-bbox[0], -bbox[1]), ch, font=font, fill=255)
+    return np.array(img)
+
+
+def glyph_font_for(ch, fonts, notdef_sigs, dummy):
+    """First font in `fonts` that actually has a real glyph for `ch`, not
+    just its own "tofu" placeholder for anything it can't render -- PIL
+    doesn't fall back between fonts on its own, so this picks per
+    character. `notdef_sigs` is each font's own rendering of a
+    guaranteed-unmapped private-use codepoint: whatever a font draws for
+    that IS its tofu box, so comparing a real character's rendering
+    against it (not just checking that *something* got drawn -- the tofu
+    box itself is plenty of ink) is how a missing glyph is actually
+    detected. Falls back to the last font if none of them have it (still
+    tofu, but no crash)."""
+    if ch.isspace():
+        return fonts[0]
+    for font in fonts:
+        arr = _render_char(font, ch, dummy)
+        sig = notdef_sigs[id(font)]
+        if arr.shape != sig.shape or not np.array_equal(arr, sig):
+            return font
+    return fonts[-1]
 
 
 def fit_frame(frame, fit, out_w, out_h):
@@ -300,6 +355,18 @@ def frame_to_bitmap(gray, threshold, dither):
     tile = np.tile(BAYER4, (math.ceil(h / 4), math.ceil(w / 4)))[:h, :w]
     bias = 128 - threshold
     return (gray.astype(np.int16) + bias) > tile
+
+
+def apply_trail(trail, gray, wet):
+    """Blend the current frame into a persistent trail buffer for the
+    "echo" effect: 0 (dry) makes decay 0, so trail = max(0, gray) = gray
+    exactly -- a fresh pixel always wins immediately, nothing lingers,
+    not a special case. Higher `wet` raises the decay, so already-lit
+    pixels fade out instead of cutting off the instant content moves past
+    them -- a soft trail behind whatever's scrolling. Returns the new
+    trail buffer (float32); render it with `.astype(np.uint8)`."""
+    decay = (wet / 100.0) * TRAIL_MAX_DECAY
+    return np.maximum(trail * decay, gray.astype(np.float32))
 
 
 class ClipSource:
@@ -481,33 +548,67 @@ class TextScroller:
     `direction` (left/right/up/down) is purely which axis the content
     slides along and which way. `stacked` picks the drawing: False is one
     normal horizontal line; True stacks it one upright character per row
-    (with `glyph_rotate` additionally rotating each character in place)."""
+    (with `glyph_rotate` additionally rotating each character in place).
 
-    def __init__(self, text, font, out_w, out_h, color, direction="left",
+    `fonts` is the primary font plus any fallback fonts (see
+    load_fallback_fonts) -- every character is looked up in each font in
+    turn and drawn with the first one that actually has it, since PIL
+    doesn't do that fallback on its own within a single draw call."""
+
+    def __init__(self, text, fonts, out_w, out_h, color, direction="left",
                  stacked=False, glyph_rotate=0):
         self.direction = direction
         self.out_w, self.out_h = out_w, out_h
         horizontal = direction in ("left", "right")
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        notdef_sigs = {id(f): _render_char(f, "", dummy) for f in fonts}
+
+        def font_for(ch):
+            return glyph_font_for(ch, fonts, notdef_sigs, dummy)
+
+        def layout_glyphs(chars):
+            """Each character rendered with whichever font actually has
+            it, placed at its own natural advance width (side bearings
+            included) so mixed-font text still spaces out like real
+            text, not like tofu-tight-bbox packing."""
+            data, pen_x, max_h = [], 0.0, 1
+            for ch in chars:
+                f = font_for(ch)
+                bbox = dummy.textbbox((0, 0), ch, font=f)
+                cw, chh = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+                glyph = Image.new("RGB", (cw, chh), (0, 0, 0))
+                ImageDraw.Draw(glyph).text((-bbox[0], -bbox[1]), ch, font=f, fill=color)
+                data.append((glyph, bbox[0], pen_x))
+                pen_x += f.getlength(ch)
+                max_h = max(max_h, chh)
+            return data, pen_x, max_h
 
         if not stacked:
-            bbox = dummy.textbbox((0, 0), text, font=font)
-            text_w, text_h = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
-            content_w, content_h = (text_w, out_h) if horizontal else (out_w, text_h)
-            img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
-            x = -bbox[0] if horizontal else (out_w - text_w) // 2 - bbox[0]
-            y = (out_h - text_h) // 2 - bbox[1] if horizontal else -bbox[1]
-            ImageDraw.Draw(img).text((x, y), text, font=font, fill=color)
+            chars = list(text) if text else [" "]
+            glyph_data, pen_w, max_h = layout_glyphs(chars)
+            if horizontal:
+                content_w, content_h = max(1, round(pen_w)), out_h
+                img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
+                for glyph, left_bearing, gx in glyph_data:
+                    gy = (out_h - glyph.height) // 2
+                    img.paste(glyph, (round(gx + left_bearing), gy))
+            else:
+                content_w, content_h = out_w, max_h
+                img = Image.new("RGB", (content_w, content_h), (0, 0, 0))
+                x0 = (out_w - round(pen_w)) // 2
+                for glyph, left_bearing, gx in glyph_data:
+                    img.paste(glyph, (round(x0 + gx + left_bearing), 0))
         else:
             chars = list(text) if text else [" "]
-            ascent, descent = font.getmetrics()
+            ascent, descent = fonts[0].getmetrics()
             line_h = max(1, ascent + descent)
             glyphs = []
             for ch in chars:
-                bbox = dummy.textbbox((0, 0), ch, font=font)
+                f = font_for(ch)
+                bbox = dummy.textbbox((0, 0), ch, font=f)
                 cw, chh = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
                 glyph = Image.new("RGB", (cw, chh), (0, 0, 0))
-                ImageDraw.Draw(glyph).text((-bbox[0], -bbox[1]), ch, font=font, fill=color)
+                ImageDraw.Draw(glyph).text((-bbox[0], -bbox[1]), ch, font=f, fill=color)
                 glyphs.append(glyph.rotate(glyph_rotate, expand=True) if glyph_rotate else glyph)
             if horizontal:
                 cell = max(g.width for g in glyphs)
@@ -574,6 +675,11 @@ class State:
         # alone is clean, and whether driving bus 2 alongside it disturbs
         # anything (shared DIN/CLK), without editing flags and restarting.
         self.dual_bus_active = True
+        # 0 (dry) = no persistence, every frame is exactly the current
+        # content, same as before this existed. Higher values fade
+        # previous frames instead of cutting them off instantly, so
+        # scrolling text (or moving video) leaves a soft trail behind it.
+        self.trail_wet = 0
         self.media_brightness = args.media_brightness
         self.media_contrast = args.media_contrast
         self.media_rotation = 0.0
@@ -644,7 +750,7 @@ class State:
                         text_stacked=self.text_stacked,
                         text_glyph_rotate=self.text_glyph_rotate,
                         brightness=self.brightness, spi_hz=self.spi_hz,
-                        dual_bus_active=self.dual_bus_active,
+                        dual_bus_active=self.dual_bus_active, trail_wet=self.trail_wet,
                         media_brightness=self.media_brightness,
                         media_contrast=self.media_contrast,
                         media_rotation=self.media_rotation,
@@ -712,6 +818,11 @@ class State:
                     pass
             if "dual_bus_active" in data:
                 self.dual_bus_active = bool(data["dual_bus_active"])
+            if "trail_wet" in data:
+                try:
+                    self.trail_wet = max(0, min(100, int(data["trail_wet"])))
+                except (TypeError, ValueError):
+                    pass
             if "media_brightness" in data:
                 try:
                     self.media_brightness = max(0.0, min(200.0, float(data["media_brightness"])))
@@ -1435,6 +1546,17 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
   </select>
 </label>
 <br><br>
+<label>Trail: <span id="wval">{snap['trail_wet']}</span><br>
+  <input type="range" min="0" max="100" value="{snap['trail_wet']}" style="width:100%"
+    oninput="state.trail_wet=parseInt(this.value); wval.textContent=this.value; sendDebounced();">
+</label>
+<span style="color:#888;font-size:.8rem">
+  0 dry (a fresh frame every time, no persistence) to 100 wet (previous
+  frames fade out instead of cutting off instantly) -- a soft echo/blur
+  behind anything moving: scrolling text, panning video. Applies to the
+  whole picture, live.
+</span>
+<br><br>
 
 <p style="color:#888;font-size:.85rem;margin-bottom:.3rem">
   Media brightness/contrast (global, software -- applies on top of each
@@ -1942,9 +2064,10 @@ def main():
     def rebuild_scroller(snap):
         if text_h <= 0 or not snap["text"]:
             return None
-        font = load_font(args.font, args.font_size or max(8, text_h - 2),
-                          bold=snap["bold"], italic=snap["italic"])
-        return TextScroller(snap["text"], font, canvas_w, text_h, TEXT_COLOR,
+        size = args.font_size or max(8, text_h - 2)
+        font = load_font(args.font, size, bold=snap["bold"], italic=snap["italic"])
+        fonts = [font] + load_fallback_fonts(size)
+        return TextScroller(snap["text"], fonts, canvas_w, text_h, TEXT_COLOR,
                              snap["text_direction"], snap["text_stacked"],
                              snap["text_glyph_rotate"])
 
@@ -1984,6 +2107,8 @@ def main():
 
     run_concurrent(boot_sweep, boot_devices, snap0["rotate180"], snap0["brightness"])
 
+    trail = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+
     frame_budget = 1.0 / 20.0  # SPI + PIL conversion is slower than the WS2812 path
     scroll_offset = 0.0
     last_t = time.monotonic()
@@ -2019,6 +2144,8 @@ def main():
                                 snap["block_orientation"], snap["brightness"])
                         last_brightness = snap["brightness"]
                         last_block_orientation = snap["block_orientation"]
+                    if (new_cw, new_ch) != (canvas_w, canvas_h):
+                        trail = np.zeros((new_ch, new_cw), dtype=np.float32)
                     canvas_w, canvas_h = new_cw, new_ch
                     text_h, video_h = new_text_h, new_video_h
                 scroller = rebuild_scroller(snap)
@@ -2056,6 +2183,11 @@ def main():
             # luminance-formula surprise where pure red/blue content looks
             # nearly black on a 1-bit display.
             gray = frame.max(axis=2)
+            if snap["calibrate"]:
+                trail[:] = gray  # keep it in sync so leaving calibration isn't a stale trail
+            else:
+                trail = apply_trail(trail, gray, snap["trail_wet"])
+                gray = trail.astype(np.uint8)
             # Dithering is for photographic gradients -- on calibration's
             # exact-pixel digits/borders it only adds noise, never helps.
             dither = snap["dither"] and not snap["calibrate"]

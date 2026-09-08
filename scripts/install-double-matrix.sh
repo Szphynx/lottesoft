@@ -23,7 +23,8 @@ AUTHKEY="${1:-}"
 
 echo "== system packages =="
 apt update
-apt install -y python3-opencv python3-pip python3-numpy python3-pil git
+apt install -y python3-opencv python3-pip python3-numpy python3-pil git \
+    fonts-dejavu-core fonts-vlgothic
 
 echo "== python packages =="
 pip3 install --break-system-packages luma.led_matrix luma.core spidev

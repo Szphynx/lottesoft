@@ -19,7 +19,7 @@ Useful flags:
     --rotate 0|90|180|270
     --hflip / --vflip
     --mono                  grayscale instead of color (auto-contrast applied)
-    --palette ironbow|whitehot|blackhot|rainbow|redhot|<opencv colormap name>
+    --palette ironbow|whitehot|blackhot|rainbow|redhot|bodyheat|colorwise|<opencv colormap name>
                             false-color night-vision-style look instead of color
     --gamma 0.7             only affects --mono / --palette
     --no-agc                disable auto-contrast in --mono / --palette modes
@@ -75,6 +75,16 @@ PALETTES = {
         (0.35, (120, 10, 5)),    (0.55, (200, 30, 10)),
         (0.72, (230, 80, 15)),   (0.85, (250, 140, 40)),
         (1.00, (255, 235, 180)),
+    ],
+    "bodyheat": [
+        (0.000, (14, 18, 30)),   (0.625, (140, 155, 180)),
+        (0.646, (200, 45, 10)),  (0.667, (255, 25, 0)),
+        (0.704, (255, 90, 10)),  (0.708, (255, 200, 130)),
+    ],
+    "colorwise": [
+        (0.000, (0, 0, 0)),      (0.625, (32, 32, 34)),
+        (0.646, (200, 45, 10)),  (0.667, (255, 25, 0)),
+        (0.704, (255, 90, 10)),  (0.708, (255, 200, 130)),
     ],
 }
 
@@ -215,7 +225,8 @@ def main():
                        help="grayscale instead of color, with auto-contrast")
     mode.add_argument("--palette", default=None,
                        help="false-color night-vision-style look instead of color: "
-                            "ironbow, whitehot, blackhot, rainbow, redhot, or any "
+                            "ironbow, whitehot, blackhot, rainbow, redhot, "
+                            "bodyheat, colorwise, or any "
                             "OpenCV colormap name such as inferno / magma / turbo")
     p.add_argument("--resolution", type=parse_resolution, default=(1280, 720))
     p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270])

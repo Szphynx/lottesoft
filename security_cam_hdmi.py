@@ -5,12 +5,13 @@ Raspberry Pi 4. A minimal security-cam viewer: full color by default, with
 optional grayscale/false-color modes for low-light or night-vision-style
 viewing.
 
-Needs a desktop session running on the Pi (X11 or Wayland) -- this opens a
-plain fullscreen window on whatever's plugged into HDMI. See
-scripts/install-security-cam-hdmi.sh for one-shot dependency setup and an
-optional autostart-on-login entry.
+Renders straight to the HDMI output via KMS/DRM (SDL's "kmsdrm" video
+driver) -- no desktop session, X11, or Wayland compositor needed. That
+means it can run as a plain systemd service that comes up on boot with
+nobody logged in: see scripts/install-security-cam-hdmi.sh, which installs
+it as the "security-cam-hdmi" service.
 
-Run with:
+Run by hand with:
     python3 security_cam_hdmi.py
 
 Useful flags:
@@ -23,14 +24,19 @@ Useful flags:
     --gamma 0.7             only affects --mono / --palette
     --no-agc                disable auto-contrast in --mono / --palette modes
     --stats                 print render fps once a second
-    q or Esc in the window quits
+    q, Esc, or ctrl-c quits (q/Esc only work if a keyboard is attached)
 """
 
 import argparse
+import os
 import time
 
 import numpy as np
 import cv2
+
+# Must be set before pygame's display module initializes -- this is what
+# lets it draw directly to the HDMI output with no X11/Wayland running.
+os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
 
 
 # ----------------------------------------------------------------------------
@@ -122,8 +128,7 @@ class Camera:
 
     def read_bgr(self):
         # picamera2's "RGB888" format is actually laid out BGR (a
-        # long-standing quirk kept for OpenCV compatibility) -- so this is
-        # already what OpenCV expects, no conversion needed.
+        # long-standing quirk kept for OpenCV compatibility).
         return self.picam2.capture_array()
 
     def close(self):
@@ -157,6 +162,41 @@ class Agc:
             self.hi += self.alpha * (hi - self.hi)
 
         return np.clip((gray.astype(np.float32) - self.lo) / max(self.hi - self.lo, 1e-6), 0.0, 1.0)
+
+
+# ----------------------------------------------------------------------------
+# Display (direct-to-HDMI via SDL/kmsdrm, set up at import time above).
+# ----------------------------------------------------------------------------
+
+class Display:
+    def __init__(self):
+        import pygame
+        self.pygame = pygame
+        pygame.display.init()
+        pygame.mouse.set_visible(False)
+        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        self.size = self.screen.get_size()
+
+    def show(self, rgb):
+        h, w = rgb.shape[:2]
+        surf = self.pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
+        if (w, h) != self.size:
+            surf = self.pygame.transform.scale(surf, self.size)
+        self.screen.blit(surf, (0, 0))
+        self.pygame.display.flip()
+
+    def quit_requested(self):
+        for event in self.pygame.event.get():
+            if event.type == self.pygame.QUIT:
+                return True
+            if event.type == self.pygame.KEYDOWN and event.key in (
+                self.pygame.K_ESCAPE, self.pygame.K_q,
+            ):
+                return True
+        return False
+
+    def close(self):
+        self.pygame.quit()
 
 
 # ----------------------------------------------------------------------------
@@ -196,14 +236,14 @@ def main():
     print(f"starting camera at {args.resolution[0]}x{args.resolution[1]}...")
     camera = Camera(args.resolution, args.hflip, args.vflip)
 
-    window = "security cam (q or Esc to quit)"
-    cv2.namedWindow(window, cv2.WND_PROP_FULLSCREEN)
-    cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    print("opening display (kmsdrm)...")
+    display = Display()
+    print(f"  {display.size[0]}x{display.size[1]}")
 
     frames = 0
     last_report = time.monotonic()
 
-    print("running -- q or Esc in the window to stop")
+    print("running -- ctrl-c (or q/Esc with a keyboard attached) to stop")
     try:
         while True:
             bgr = camera.read_bgr()
@@ -215,17 +255,17 @@ def main():
                 norm = agc.normalize(gray) if agc else gray.astype(np.float32) / 255.0
                 if args.palette:
                     idx = (norm * 255.0).astype(np.uint8)
-                    disp = cv2.cvtColor(lut[idx], cv2.COLOR_RGB2BGR)
+                    rgb = lut[idx]
                 else:
-                    disp = (norm * 255.0).astype(np.uint8)
+                    g = (norm * 255.0).astype(np.uint8)
+                    rgb = np.dstack([g, g, g])
             else:
-                disp = bgr
+                rgb = bgr[:, :, ::-1]  # BGR -> RGB
 
-            cv2.imshow(window, disp)
+            display.show(rgb)
             frames += 1
 
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+            if display.quit_requested():
                 break
 
             now = time.monotonic()
@@ -239,7 +279,7 @@ def main():
         pass
     finally:
         camera.close()
-        cv2.destroyAllWindows()
+        display.close()
         print("\nstopped")
 
 

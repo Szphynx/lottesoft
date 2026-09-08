@@ -242,7 +242,7 @@ def main():
     print(f"starting camera at {args.resolution[0]}x{args.resolution[1]}...")
     camera = Camera(args.resolution, args.hflip, args.vflip)
 
-    print("opening display (kmsdrm)...")
+    print("opening display...")
     display = Display()
     print(f"  {display.size[0]}x{display.size[1]}")
 

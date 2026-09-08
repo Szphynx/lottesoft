@@ -14,15 +14,25 @@ scripts/install-security-cam-hdmi.sh, which installs the autostart entry.
 Run by hand with:
     python3 security_cam_hdmi.py
 
+Runs with motion-blob detection and a fake fisheye lens effect ON by
+default -- this is tuned to be cheap enough for a Raspberry Pi 3 with no
+extra hardware (no Coral/TPU), not just the Pi 4. There's no real person
+detector here: a moving-blob box is a cheap stand-in, not a person
+classifier, so it'll also box pets, shadows, and waving branches.
+
 Useful flags:
-    --resolution 1280x720   camera capture size
+    --resolution 640x480    camera capture size (lower = faster on a Pi 3)
     --rotate 0|90|180|270
     --hflip / --vflip
     --mono                  grayscale instead of color (auto-contrast applied)
-    --palette ironbow|whitehot|blackhot|rainbow|redhot|bodyheat|colorwise|nightvision|<opencv colormap name>
+    --palette ironbow|whitehot|blackhot|rainbow|redhot|bodyheat|colorwise|infrared|<opencv colormap name>
                             false-color night-vision-style look instead of color
     --gamma 0.7             only affects --mono / --palette
     --no-agc                disable auto-contrast in --mono / --palette modes
+    --no-fisheye            disable the fisheye warp (on by default) -- toggle
+                            this to check how much it costs on your hardware
+    --fisheye-strength 0.4  0 = none, higher = more barrel distortion
+    --no-motion             disable motion-blob detection (on by default)
     --stats                 print render fps once a second
     q or Esc in the window quits
 """
@@ -43,6 +53,15 @@ AGC_LOW_PCT = 2.0
 AGC_HIGH_PCT = 98.0
 AGC_ALPHA = 0.1          # EMA on the range; lower = steadier, slower to adapt
 MIN_SPAN = 20.0          # never stretch a span narrower than this (0-255 units)
+
+FISHEYE_STRENGTH = 0.4
+
+# Motion/blob detection runs on a downscaled copy to stay cheap on a Pi 3;
+# boxes are scaled back up to full frame size afterward.
+MOTION_SCALE = 0.35
+MOTION_MIN_AREA_FRAC = 0.02   # fraction of the *downscaled* frame area
+MOTION_HISTORY = 300
+MOTION_VAR_THRESHOLD = 24
 
 
 # ----------------------------------------------------------------------------
@@ -81,10 +100,14 @@ PALETTES = {
         (0.646, (200, 45, 10)),  (0.667, (255, 25, 0)),
         (0.704, (255, 90, 10)),  (0.708, (255, 200, 130)),
     ],
-    "nightvision": [
-        (0.00, (0, 0, 0)),       (0.20, (5, 15, 30)),
-        (0.45, (10, 45, 95)),    (0.70, (30, 100, 190)),
-        (0.88, (100, 170, 235)), (1.00, (200, 225, 255)),
+    "infrared": [
+        # Classic analog IR security-cam look: mostly black, but brightness
+        # rises fast and clips to blown-out white well before full scale,
+        # so reflective/warm surfaces bloom out white instead of just
+        # looking bright grey.
+        (0.00, (0, 0, 0)),       (0.30, (60, 60, 60)),
+        (0.50, (150, 150, 150)), (0.65, (220, 220, 220)),
+        (0.80, (255, 255, 255)), (1.00, (255, 255, 255)),
     ],
 }
 
@@ -175,7 +198,65 @@ class Agc:
 
 
 # ----------------------------------------------------------------------------
-# Display (direct-to-HDMI via SDL/kmsdrm, set up at import time above).
+# Fake fisheye lens effect -- purely cosmetic barrel distortion, applied
+# via a remap table built once per frame size (not per frame).
+# ----------------------------------------------------------------------------
+
+def build_fisheye_maps(size, strength):
+    w, h = size
+    cx, cy = w / 2.0, h / 2.0
+    radius = min(cx, cy)
+
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx = (xs - cx) / radius
+    dy = (ys - cy) / radius
+    r = np.sqrt(dx * dx + dy * dy)
+    factor = 1.0 + strength * (r ** 2)
+
+    map_x = (dx * factor) * radius + cx
+    map_y = (dy * factor) * radius + cy
+    return map_x.astype(np.float32), map_y.astype(np.float32)
+
+
+# ----------------------------------------------------------------------------
+# Motion/blob detection: background subtraction on a downscaled copy, so
+# it stays cheap enough for a Pi 3. Not a person detector -- any moving
+# blob above the size threshold gets boxed.
+# ----------------------------------------------------------------------------
+
+class MotionDetector:
+    def __init__(self, frame_size, scale=MOTION_SCALE,
+                 min_area_frac=MOTION_MIN_AREA_FRAC):
+        w, h = frame_size
+        self.small_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        self.scale_back = 1.0 / scale
+        self.min_area = min_area_frac * self.small_size[0] * self.small_size[1]
+        self.bgsub = cv2.createBackgroundSubtractorMOG2(
+            history=MOTION_HISTORY, varThreshold=MOTION_VAR_THRESHOLD,
+            detectShadows=False,
+        )
+        self.kernel = np.ones((3, 3), np.uint8)
+
+    def detect(self, gray):
+        small = cv2.resize(gray, self.small_size, interpolation=cv2.INTER_AREA)
+        mask = self.bgsub.apply(small)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
+        mask = cv2.dilate(mask, self.kernel, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in contours:
+            if cv2.contourArea(c) < self.min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            boxes.append((int(x * self.scale_back), int(y * self.scale_back),
+                          int(w * self.scale_back), int(h * self.scale_back)))
+        return boxes
+
+
+# ----------------------------------------------------------------------------
+# Display (a plain fullscreen window via pygame/SDL -- x11/wayland when run
+# inside a desktop session).
 # ----------------------------------------------------------------------------
 
 class Display:
@@ -226,9 +307,11 @@ def main():
     mode.add_argument("--palette", default=None,
                        help="false-color night-vision-style look instead of color: "
                             "ironbow, whitehot, blackhot, rainbow, redhot, "
-                            "bodyheat, colorwise, nightvision, or any "
+                            "bodyheat, colorwise, infrared, or any "
                             "OpenCV colormap name such as inferno / magma / turbo")
-    p.add_argument("--resolution", type=parse_resolution, default=(1280, 720))
+    p.add_argument("--resolution", type=parse_resolution, default=(640, 480),
+                   help="lower is faster -- default is chosen to run in "
+                        "real time on a Pi 3 with motion+fisheye on")
     p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270])
     p.add_argument("--hflip", action="store_true")
     p.add_argument("--vflip", action="store_true")
@@ -236,6 +319,11 @@ def main():
                    help="only affects --mono / --palette")
     p.add_argument("--no-agc", action="store_true",
                    help="disable auto-contrast in --mono / --palette modes")
+    p.add_argument("--no-fisheye", action="store_true",
+                   help="disable the fisheye warp (on by default)")
+    p.add_argument("--fisheye-strength", type=float, default=FISHEYE_STRENGTH)
+    p.add_argument("--no-motion", action="store_true",
+                   help="disable motion-blob detection (on by default)")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
@@ -243,6 +331,8 @@ def main():
     processed = args.mono or args.palette
     lut = get_lut(args.palette, args.gamma) if args.palette else None
     agc = Agc() if (processed and not args.no_agc) else None
+    fisheye = not args.no_fisheye
+    motion_on = not args.no_motion
 
     print(f"starting camera at {args.resolution[0]}x{args.resolution[1]}...")
     camera = Camera(args.resolution, args.hflip, args.vflip)
@@ -250,6 +340,15 @@ def main():
     print("opening display...")
     display = Display()
     print(f"  {display.size[0]}x{display.size[1]}")
+
+    # Frame size after rotation -- rot90 swaps width/height on a 90/270
+    # turn, and both the fisheye map and the motion detector are built
+    # once for that fixed size rather than recomputed every frame.
+    w, h = args.resolution
+    frame_size = (h, w) if rotate_k in (1, 3) else (w, h)
+    fisheye_maps = build_fisheye_maps(frame_size, args.fisheye_strength) if fisheye else None
+    motion = MotionDetector(frame_size) if motion_on else None
+    box_color = (255, 60, 60)
 
     frames = 0
     last_report = time.monotonic()
@@ -260,9 +359,14 @@ def main():
             bgr = camera.read_bgr()
             if rotate_k:
                 bgr = np.rot90(bgr, rotate_k, axes=(0, 1))
+            if fisheye:
+                map_x, map_y = fisheye_maps
+                bgr = cv2.remap(bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            boxes = motion.detect(gray) if motion_on else ()
 
             if processed:
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
                 norm = agc.normalize(gray) if agc else gray.astype(np.float32) / 255.0
                 if args.palette:
                     idx = (norm * 255.0).astype(np.uint8)
@@ -271,7 +375,10 @@ def main():
                     g = (norm * 255.0).astype(np.uint8)
                     rgb = np.dstack([g, g, g])
             else:
-                rgb = bgr[:, :, ::-1]  # BGR -> RGB
+                rgb = bgr[:, :, ::-1].copy()  # BGR -> RGB
+
+            for x, y, bw, bh in boxes:
+                cv2.rectangle(rgb, (x, y), (x + bw, y + bh), box_color, 2)
 
             display.show(rgb)
             frames += 1
@@ -283,7 +390,7 @@ def main():
             if args.stats and now - last_report >= 1.0:
                 span = now - last_report
                 rng = f"{agc.lo:.0f}-{agc.hi:.0f}" if agc else "n/a"
-                print(f"render {frames / span:5.1f} fps   range {rng}")
+                print(f"render {frames / span:5.1f} fps   range {rng}   motion boxes {len(boxes)}")
                 frames = 0
                 last_report = now
     except KeyboardInterrupt:

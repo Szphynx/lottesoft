@@ -40,6 +40,9 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUTHKEY="${1:-}"
 
+echo "== git safe.directory (repo is owned by a regular user, but root touches it via sudo/systemd) =="
+git config --global --add safe.directory "$REPO_DIR"
+
 echo "== system packages =="
 apt update
 apt install -y mpv ffmpeg socat python3-pip

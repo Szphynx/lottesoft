@@ -4,32 +4,23 @@
 # Run once per Pi, from the repo root:
 #   sudo bash scripts/install-security-cam-hdmi.sh
 #
-# This keeps the Pi booting to its normal desktop (unlike the LED-matrix
-# Pi's headless setup) -- the viewer needs a live desktop session (X11 or
-# Wayland) to draw into, so it's installed as a systemd --user service
-# instead of a system-wide one, tied to the desktop session starting
-# rather than the machine booting. Requires desktop auto-login:
+# Same pattern as a fullscreen video-loop player: a desktop autostart
+# entry launches it when you log into the desktop, no systemd involved.
+# Requires desktop auto-login to come up with nobody touching the keyboard:
 #   sudo raspi-config -> System Options -> Boot / Auto Login -> Desktop Autologin
 #
-# Then, logged in as the desktop user (not root):
-#   systemctl --user enable --now security-cam-hdmi
-#   systemctl --user status security-cam-hdmi   # is it running
-#   journalctl --user -u security-cam-hdmi -f   # live logs / --stats output
-#   systemctl --user stop security-cam-hdmi     # stop it
-#
-# Flags (--palette, --mono, --rotate, ...) live in
-# ~/.config/security-cam-hdmi.env -- edit that file, then
-# `systemctl --user restart security-cam-hdmi` to pick it up.
+# To change flags (--palette, --mono, --rotate, ...), edit the Exec= line
+# in ~/.config/autostart/security-cam-hdmi.desktop, then log out and back
+# in (or reboot) to pick it up.
 #
 # Note: testing security_cam_hdmi.py by hand over SSH won't show anything
 # -- SSH has no route to the desktop's screen. Run it from a terminal
-# opened on the Pi's own desktop, or just use the service above.
+# opened on the Pi's own desktop instead.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_USER="${SUDO_USER:-$USER}"
-TARGET_UID="$(id -u "$TARGET_USER")"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 
 echo "== system packages =="
@@ -43,42 +34,20 @@ else
     echo "rpicam-hello not found (rpicam-apps) -- can't sanity-check the camera here, try it after reboot"
 fi
 
-echo "== systemd --user service =="
-# Lets the user's systemd instance run even without an active login, so
-# the service is reachable right after this script runs, not just after
-# the next desktop login.
-loginctl enable-linger "$TARGET_USER"
-
-FLAGS_FILE="$TARGET_HOME/.config/security-cam-hdmi.env"
-[ -f "$FLAGS_FILE" ] || echo 'FLAGS="--stats"' > "$FLAGS_FILE"
-
-mkdir -p "$TARGET_HOME/.config/systemd/user"
-cat > "$TARGET_HOME/.config/systemd/user/security-cam-hdmi.service" <<EOF
-[Unit]
-Description=Security cam HDMI display
-After=graphical-session.target
-PartOf=graphical-session.target
-
-[Service]
-Type=simple
-EnvironmentFile=$FLAGS_FILE
-ExecStart=/bin/bash -c '/usr/bin/python3 $REPO_DIR/security_cam_hdmi.py \$FLAGS'
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=graphical-session.target
+echo "== desktop autostart =="
+AUTOSTART_DIR="$TARGET_HOME/.config/autostart"
+mkdir -p "$AUTOSTART_DIR"
+cat > "$AUTOSTART_DIR/security-cam-hdmi.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Security cam HDMI display
+Exec=/usr/bin/python3 $REPO_DIR/security_cam_hdmi.py --stats
+X-GNOME-Autostart-enabled=true
 EOF
-
-chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.config/systemd" "$FLAGS_FILE"
-
-sudo -u "$TARGET_USER" XDG_RUNTIME_DIR="/run/user/$TARGET_UID" systemctl --user daemon-reload
-sudo -u "$TARGET_USER" XDG_RUNTIME_DIR="/run/user/$TARGET_UID" systemctl --user enable security-cam-hdmi
+chown "$TARGET_USER:$TARGET_USER" "$AUTOSTART_DIR/security-cam-hdmi.desktop"
 
 echo
-echo "done. it'll start automatically next time the desktop session starts."
+echo "done. wrote $AUTOSTART_DIR/security-cam-hdmi.desktop"
 echo "make sure desktop auto-login is on (sudo raspi-config -> Boot / Auto Login -> Desktop Autologin), then:"
 echo "  sudo reboot"
-echo "after that, as $TARGET_USER (not root):"
-echo "  systemctl --user status security-cam-hdmi"
-echo "  journalctl --user -u security-cam-hdmi -f"
+echo "it'll launch fullscreen automatically after login."

@@ -32,8 +32,8 @@ Useful flags:
     --no-fisheye            disable the fisheye warp + vignette (on by
                             default) -- toggle this to check how much it
                             costs on your hardware
-    --fisheye-strength 0.015   0 = none, higher = more barrel distortion
-    --vignette-strength 0.45   0 = none, higher = darker corners
+    --fisheye-strength 0.03    0 = none, higher = more barrel distortion
+    --vignette-strength 0.35   0 = none, higher = darker corners
     --no-motion             disable motion-blob detection (on by default)
     --no-crt-lines          disable the fine scanline overlay (on by default)
     --stats                 print render fps once a second
@@ -61,14 +61,18 @@ DEFAULT_PALETTE = "infrared"
 
 # Power law (not r^2) so the warp stays nearly flat near the center and
 # only bends noticeably toward the corners, like a mild real lens rather
-# than a fully spherical fisheye.
-FISHEYE_STRENGTH = 0.015
+# than a fully spherical fisheye. dx/dy are normalized by each axis's own
+# half-extent (not a shared min(cx,cy) radius), so r=1 lands evenly on
+# all four edge midpoints regardless of the frame's aspect ratio -- that's
+# what keeps the bulge reading as circular instead of stretched
+# horizontally on a wide rectangular frame.
+FISHEYE_STRENGTH = 0.03
 FISHEYE_POWER = 4
 
-VIGNETTE_STRENGTH = 0.45
-VIGNETTE_MIN = 0.55     # corners never darken past this fraction of brightness
+VIGNETTE_STRENGTH = 0.35
+VIGNETTE_MIN = 0.25     # corners never darken past this fraction of brightness
 
-SCANLINE_STRENGTH = 0.15   # every other row is darkened by this fraction
+SCANLINE_STRENGTH = 0.15   # scanline darkness, applied at native display resolution
 
 # Motion/blob detection runs on a downscaled copy to stay cheap on a Pi 3;
 # boxes are scaled back up to full frame size afterward.
@@ -217,31 +221,36 @@ class Agc:
 # ----------------------------------------------------------------------------
 
 def _radial_grid(size):
-    """Normalised (dx, dy, r) grids; r=1 at the shorter dimension's edge."""
+    """Normalised (dx, dy, r) grids. dx/dy are each divided by their OWN
+    half-extent (cx/cy independently, not a shared min(cx,cy) radius), so
+    r=1 lands evenly on all four edge midpoints and r=sqrt(2) on all four
+    corners regardless of the frame's aspect ratio -- an isotropic, evenly
+    "circular" falloff instead of one that reaches further on the wide
+    axis of a rectangular frame.
+    """
     w, h = size
     cx, cy = w / 2.0, h / 2.0
-    radius = min(cx, cy)
 
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    dx = (xs - cx) / radius
-    dy = (ys - cy) / radius
+    dx = (xs - cx) / cx
+    dy = (ys - cy) / cy
     r = np.sqrt(dx * dx + dy * dy)
-    return dx, dy, r, cx, cy, radius
+    return dx, dy, r, cx, cy
 
 
 def build_fisheye_maps(size, strength, power=FISHEYE_POWER):
-    dx, dy, r, cx, cy, radius = _radial_grid(size)
+    dx, dy, r, cx, cy = _radial_grid(size)
     factor = 1.0 + strength * (r ** power)
 
-    map_x = (dx * factor) * radius + cx
-    map_y = (dy * factor) * radius + cy
+    map_x = (dx * factor) * cx + cx
+    map_y = (dy * factor) * cy + cy
     return map_x.astype(np.float32), map_y.astype(np.float32)
 
 
 def build_vignette(size, strength=VIGNETTE_STRENGTH, min_mult=VIGNETTE_MIN):
     """(h, w) float32 brightness multiplier, 1.0 at center, darker at corners."""
-    _, _, r, _, _, _ = _radial_grid(size)
-    mask = 1.0 - strength * np.clip(r, 0.0, 1.0) ** 2
+    _, _, r, _, _ = _radial_grid(size)
+    mask = 1.0 - strength * (r ** 2)
     return np.clip(mask, min_mult, 1.0).astype(np.float32)
 
 
@@ -287,7 +296,7 @@ class MotionDetector:
 # ----------------------------------------------------------------------------
 
 class Display:
-    def __init__(self):
+    def __init__(self, scanline_strength=0.0):
         import pygame
         self.pygame = pygame
         pygame.display.init()
@@ -295,12 +304,28 @@ class Display:
         self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
         self.size = self.screen.get_size()
 
+        # Built once at the display's real pixel resolution (not the
+        # camera's, which is usually much smaller and would otherwise
+        # scale each source row into a chunky multi-pixel band): a
+        # single alpha-blended overlay is far cheaper per frame than
+        # darkening rows on every source frame before the upscale.
+        self.scanlines = None
+        if scanline_strength > 0:
+            w, h = self.size
+            overlay = pygame.Surface(self.size, pygame.SRCALPHA)
+            alpha = int(255 * scanline_strength)
+            for y in range(1, h, 2):
+                pygame.draw.line(overlay, (0, 0, 0, alpha), (0, y), (w, y))
+            self.scanlines = overlay
+
     def show(self, rgb):
         h, w = rgb.shape[:2]
         surf = self.pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
         if (w, h) != self.size:
             surf = self.pygame.transform.scale(surf, self.size)
         self.screen.blit(surf, (0, 0))
+        if self.scanlines is not None:
+            self.screen.blit(self.scanlines, (0, 0))
         self.pygame.display.flip()
 
     def quit_requested(self):
@@ -380,7 +405,7 @@ def main():
     camera = Camera(args.resolution, args.hflip, args.vflip)
 
     print("opening display...")
-    display = Display()
+    display = Display(scanline_strength=SCANLINE_STRENGTH if crt_lines else 0.0)
     print(f"  {display.size[0]}x{display.size[1]}")
 
     # Frame size after rotation -- rot90 swaps width/height on a 90/270
@@ -425,9 +450,6 @@ def main():
 
             for x, y, bw, bh in boxes:
                 cv2.rectangle(rgb, (x, y), (x + bw, y + bh), box_color, 2)
-
-            if crt_lines:
-                rgb[1::2] = (rgb[1::2].astype(np.float32) * (1.0 - SCANLINE_STRENGTH)).astype(np.uint8)
 
             display.show(rgb)
             frames += 1

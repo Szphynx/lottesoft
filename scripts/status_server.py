@@ -27,6 +27,9 @@ PREVIEW_JPEG = "/run/thermal-matrix/preview.jpg"
 PREVIEW_STATS = "/run/thermal-matrix/stats.json"
 PREVIEW_MAX_AGE = 5.0
 
+PRESETS_DIR = "/etc/thermal-matrix/presets"
+LAST_PRESET_FILE = os.path.join(PRESETS_DIR, ".last")
+
 # Mirrors thermal_matrix.py's BODYHEAT_* defaults -- kept as plain literals
 # here so this lightweight server doesn't have to import numpy/cv2/rgbmatrix.
 DEFAULT_COLD_MAX_C = 25.0
@@ -160,6 +163,51 @@ def restart_service():
 
 
 # ----------------------------------------------------------------------------
+# Presets -- named snapshots of the config dict, saved as JSON files so you
+# can jump back to a known-good setup instead of re-dialing every field.
+# ----------------------------------------------------------------------------
+
+def safe_preset_name(name):
+    name = re.sub(r"[^A-Za-z0-9 _-]", "", name or "").strip()
+    return re.sub(r"\s+", "_", name)[:64]
+
+
+def list_presets():
+    try:
+        return sorted(f[:-5] for f in os.listdir(PRESETS_DIR) if f.endswith(".json"))
+    except FileNotFoundError:
+        return []
+
+
+def read_last_preset_name():
+    try:
+        with open(LAST_PRESET_FILE) as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def save_preset(name, cfg):
+    safe = safe_preset_name(name)
+    if not safe:
+        return None
+    os.makedirs(PRESETS_DIR, exist_ok=True)
+    with open(os.path.join(PRESETS_DIR, safe + ".json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    with open(LAST_PRESET_FILE, "w") as f:
+        f.write(safe)
+    return safe
+
+
+def load_preset(name):
+    safe = safe_preset_name(name)
+    if not safe:
+        raise FileNotFoundError(name)
+    with open(os.path.join(PRESETS_DIR, safe + ".json")) as f:
+        return json.load(f)
+
+
+# ----------------------------------------------------------------------------
 # HTTP
 # ----------------------------------------------------------------------------
 
@@ -173,6 +221,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(status_payload())
         if self.path == "/api/config":
             return self._json(parse_config(read_flag_tokens()))
+        if self.path == "/api/presets":
+            return self._json({"names": list_presets(), "last": read_last_preset_name()})
         self._send(DASHBOARD_HTML.encode(), "text/html")
 
     def do_POST(self):
@@ -199,6 +249,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/restart":
             restart_service()
             return self._json({"ok": True})
+
+        if self.path == "/api/presets/save":
+            try:
+                incoming = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                return
+            cfg = {k: incoming[k] for k in DEFAULT_CONFIG if k in incoming}
+            cfg["extra"] = parse_config(read_flag_tokens())["extra"]
+            safe = save_preset(incoming.get("name", ""), cfg)
+            if not safe:
+                self.send_response(400)
+                self.end_headers()
+                return
+            return self._json({"ok": True, "name": safe})
+
+        if self.path == "/api/presets/load":
+            try:
+                incoming = json.loads(body)
+                cfg = load_preset(incoming.get("name", ""))
+            except (json.JSONDecodeError, FileNotFoundError):
+                self.send_response(404)
+                self.end_headers()
+                return
+            full_cfg = dict(DEFAULT_CONFIG)
+            full_cfg.update({k: cfg[k] for k in DEFAULT_CONFIG if k in cfg})
+            full_cfg["extra"] = cfg.get("extra", [])
+            write_flags(full_cfg)
+            restart_service()
+            return self._json({"ok": True, "config": full_cfg})
 
         self.send_response(404)
         self.end_headers()
@@ -297,6 +378,7 @@ DASHBOARD_HTML = """<!doctype html>
   button.secondary { background: #2a3430; }
   button:active { transform: translateY(1px); }
   .msg { font-size: 0.8rem; color: #7f9088; min-height: 1.2em; }
+  .preset-row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: end; margin-bottom: 0.6rem; }
 </style>
 <h1 id="host">thermal-matrix</h1>
 <div class="grid">
@@ -353,6 +435,24 @@ DASHBOARD_HTML = """<!doctype html>
       <button type="submit">Apply &amp; restart</button>
       <div class="msg" id="cfg-msg"></div>
     </form>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1">
+    <h2>Presets</h2>
+    <div class="preset-row">
+      <label style="flex:1; min-width:160px">Name
+        <input type="text" id="preset-name" placeholder="e.g. night-mode">
+      </label>
+      <button type="button" id="preset-save">Save current settings</button>
+    </div>
+    <div class="preset-row">
+      <label style="flex:1; min-width:160px">Load preset
+        <select id="preset-select"></select>
+      </label>
+      <button type="button" class="secondary" id="preset-load">Load &amp; apply</button>
+      <button type="button" class="secondary" id="preset-load-last">Load last saved</button>
+    </div>
+    <div class="msg" id="preset-msg"></div>
   </div>
 
 </div>
@@ -442,8 +542,82 @@ document.getElementById("restart").addEventListener("click", async () => {
   setTimeout(() => { msg.textContent = "restarted"; pollStatus(); }, 1500);
 });
 
+function currentFormConfig() {
+  return {
+    mode: document.getElementById("mode").value,
+    palette: document.getElementById("palette").value,
+    fit: document.getElementById("fit").value,
+    rotate: parseInt(document.getElementById("rotate").value),
+    brightness: parseInt(document.getElementById("brightness").value),
+    cold_max: parseFloat(document.getElementById("cold_max").value),
+    hot_min: parseFloat(document.getElementById("hot_min").value),
+    hot_max: parseFloat(document.getElementById("hot_max").value),
+  };
+}
+
+function applyConfigToForm(c) {
+  document.getElementById("mode").value = c.mode;
+  document.getElementById("palette").value = c.palette;
+  document.getElementById("fit").value = c.fit;
+  document.getElementById("rotate").value = c.rotate;
+  document.getElementById("brightness").value = c.brightness;
+  document.getElementById("brightness-val").textContent = c.brightness;
+  document.getElementById("cold_max").value = c.cold_max;
+  document.getElementById("hot_min").value = c.hot_min;
+  document.getElementById("hot_max").value = c.hot_max;
+  toggleModeFields();
+}
+
+async function refreshPresetList(selectName) {
+  const r = await fetch("/api/presets", {cache: "no-store"});
+  const data = await r.json();
+  const sel = document.getElementById("preset-select");
+  sel.innerHTML = "";
+  data.names.forEach(n => {
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n;
+    sel.appendChild(o);
+  });
+  if (selectName) sel.value = selectName;
+  return data;
+}
+
+async function loadPresetByName(name) {
+  const msg = document.getElementById("preset-msg");
+  msg.textContent = `loading "${name}", service is restarting...`;
+  const r = await fetch("/api/presets/load", {method: "POST", body: JSON.stringify({name})});
+  if (!r.ok) { msg.textContent = `couldn't load "${name}"`; return; }
+  const result = await r.json();
+  applyConfigToForm(result.config);
+  setTimeout(() => { msg.textContent = `loaded "${name}"`; pollStatus(); }, 1500);
+}
+
+document.getElementById("preset-save").addEventListener("click", async () => {
+  const name = document.getElementById("preset-name").value.trim();
+  const msg = document.getElementById("preset-msg");
+  if (!name) { msg.textContent = "give it a name first"; return; }
+  const body = { name, ...currentFormConfig() };
+  const r = await fetch("/api/presets/save", {method: "POST", body: JSON.stringify(body)});
+  if (!r.ok) { msg.textContent = "couldn't save that name"; return; }
+  const result = await r.json();
+  msg.textContent = `saved as "${result.name}"`;
+  refreshPresetList(result.name);
+});
+
+document.getElementById("preset-load").addEventListener("click", () => {
+  const name = document.getElementById("preset-select").value;
+  if (name) loadPresetByName(name);
+});
+
+document.getElementById("preset-load-last").addEventListener("click", async () => {
+  const data = await refreshPresetList();
+  if (!data.last) { document.getElementById("preset-msg").textContent = "nothing saved yet"; return; }
+  loadPresetByName(data.last);
+});
+
 loadConfig();
 pollStatus();
+refreshPresetList();
 setInterval(pollStatus, 1000);
 setInterval(refreshPreview, 500);
 </script>

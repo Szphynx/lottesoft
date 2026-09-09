@@ -94,6 +94,32 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+echo "== autoupdate timer (off by default -- toggle from the control page) =="
+cat > /etc/systemd/system/video-fracture-led-autoupdate.service <<EOF
+[Unit]
+Description=Pull latest video-fracture-led code (does not restart/reboot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$REPO_DIR
+ExecStart=/bin/bash $REPO_DIR/scripts/video-fracture-led/auto-update.sh
+EOF
+
+cat > /etc/systemd/system/video-fracture-led-autoupdate.timer <<'EOF'
+[Unit]
+Description=Check for video-fracture-led updates periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 
 echo
@@ -104,3 +130,6 @@ echo "  3. control page: http://\$(tailscale ip -4):8099/"
 echo
 echo "if the image looks wrong (color tint, scrambled/checkerboard), fix it"
 echo "live from the control page's 'panel hardware' section -- no SSH needed."
+echo
+echo "code auto-update (git pull, no auto-restart) and a Reboot button are"
+echo "both on the control page under 'system' -- nothing to enable by hand."

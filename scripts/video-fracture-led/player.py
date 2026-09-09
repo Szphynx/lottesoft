@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +43,8 @@ from rgbmatrix import RGBMatrix, RGBMatrixOptions
 CURRENT_VIDEO = "/var/lib/video-fracture/current.mp4"
 CONFIG_FILE = "/var/lib/video-fracture/led-config.json"       # current/last-loaded state, autosaved
 CONFIGS_DIR = "/var/lib/video-fracture/led-configs"            # named, explicitly-saved presets
+UPDATE_PENDING_FILE = "/var/lib/video-fracture/led-update-pending"  # written by auto-update.sh
+AUTOUPDATE_TIMER = "video-fracture-led-autoupdate.timer"
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 
@@ -167,6 +170,48 @@ class State:
         if not os.path.isdir(CONFIGS_DIR):
             return []
         return sorted(f[:-5] for f in os.listdir(CONFIGS_DIR) if f.endswith(".json"))
+
+
+def update_pending():
+    """Short commit sha auto-update.sh pulled but hasn't been rebooted into
+    yet, or None if there's nothing pending."""
+    try:
+        with open(UPDATE_PENDING_FILE) as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def autoupdate_status():
+    """True/False if the systemd timer's state is known, None if systemd
+    or the unit isn't there -- same pattern as media_matrix.py's
+    autoupdate_status()."""
+    try:
+        out = subprocess.run(["systemctl", "is-active", AUTOUPDATE_TIMER],
+                              capture_output=True, text=True, timeout=3)
+        return out.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def set_autoupdate(enabled):
+    """enable/disable --now so the choice also survives a reboot."""
+    try:
+        subprocess.run(["systemctl", "enable" if enabled else "disable", "--now",
+                         AUTOUPDATE_TIMER], capture_output=True, text=True, timeout=5)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def reboot():
+    """Fire-and-forget -- the process (and this HTTP response) doesn't
+    need to survive systemctl actually completing the shutdown."""
+    try:
+        subprocess.Popen(["systemctl", "reboot"])
+        return True
+    except OSError:
+        return False
 
 
 class Preview:
@@ -302,6 +347,10 @@ PAGE = """<!doctype html>
 <title>video-fracture-led</title>
 <body style="font:16px sans-serif;background:#111;color:#eee;padding:2rem;max-width:640px;margin:auto">
 <h1>video-fracture-led</h1>
+<div id="update_banner" hidden style="background:#3a2f00;border:1px solid #a87c00;border-radius:6px;padding:.75rem 1rem;margin-bottom:1rem">
+  update pulled (<span id="update_sha"></span>) -- reboot to apply.
+  <button id="banner_reboot_btn" style="margin-left:.5rem">Reboot now</button>
+</div>
 <p>video: <b id="video">-</b></p>
 <canvas id="prev" width="64" height="64" style="width:256px;height:256px;image-rendering:pixelated;border:1px solid #444;background:#000"></canvas>
 
@@ -382,6 +431,20 @@ PAGE = """<!doctype html>
 </div>
 <p id="preset_msg" style="color:#888;font-size:.8rem;min-height:1.2em"></p>
 
+<h2 style="margin-top:2rem;font-size:1rem;color:#aaa">system</h2>
+<div style="margin-top:.5rem">
+  <label><input id="autoupdate" type="checkbox"> check for code updates automatically</label>
+  <p style="color:#888;font-size:.8rem;margin:.25rem 0 0">
+    When on, this Pi checks GitHub every couple minutes and pulls new
+    commits -- it does NOT restart or reboot on its own; a banner appears
+    up top when a reboot is needed to apply what it pulled.
+  </p>
+</div>
+<div style="margin-top:1rem">
+  <button id="reboot_btn">Reboot this Pi</button>
+</div>
+<p id="system_msg" style="color:#888;font-size:.8rem;min-height:1.2em"></p>
+
 <script>
 const ctx = document.getElementById('prev').getContext('2d');
 const RANGE_FIELDS = ['brightness', 'scale_pct', 'offset_x', 'offset_y', 'multiplexing', 'row_address_type'];
@@ -444,6 +507,14 @@ async function pollStatus() {
     if (v) v.textContent = s[id];
   }
   applying = false;
+
+  const banner = document.getElementById('update_banner');
+  banner.hidden = !s.update_pending;
+  if (s.update_pending) document.getElementById('update_sha').textContent = s.update_pending;
+
+  const cb = document.getElementById('autoupdate');
+  cb.disabled = s.autoupdate_enabled === null;
+  if (!cb.matches(':focus')) cb.checked = !!s.autoupdate_enabled;
 }
 
 async function pollFrame() {
@@ -485,6 +556,23 @@ document.getElementById('load_btn').onclick = async () => {
   if (r.ok) pollStatus();
 };
 
+document.getElementById('autoupdate').onchange = async e => {
+  const msg = document.getElementById('system_msg');
+  const r = await fetch('/autoupdate', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                         body: JSON.stringify({enabled: e.target.checked})});
+  const body = await r.json();
+  msg.textContent = body.ok ? '' : 'failed to change -- check systemd/journalctl on the Pi';
+  pollStatus();
+};
+
+async function doReboot() {
+  if (!confirm('Reboot this Pi now? The display and this page will go down for a bit.')) return;
+  await fetch('/reboot', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  document.getElementById('system_msg').textContent = 'rebooting...';
+}
+document.getElementById('reboot_btn').onclick = doReboot;
+document.getElementById('banner_reboot_btn').onclick = doReboot;
+
 pollStatus();
 refreshPresets();
 setInterval(pollStatus, 2000);
@@ -512,6 +600,8 @@ class ControlHandler(BaseHTTPRequestHandler):
         elif self.path == "/status.json":
             snap = self.state.snapshot()
             snap["video"] = os.path.basename(self.source_path) if os.path.exists(self.source_path) else None
+            snap["update_pending"] = update_pending()
+            snap["autoupdate_enabled"] = autoupdate_status()
             self._send(json.dumps(snap), "application/json")
         elif self.path == "/frame.json":
             frame = self.preview.snapshot()
@@ -554,6 +644,11 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send("ok", "text/plain")
             except (ValueError, OSError, json.JSONDecodeError):
                 self._send("not found", "text/plain", code=404)
+        elif self.path == "/autoupdate":
+            ok = set_autoupdate(bool(data.get("enabled")))
+            self._send(json.dumps({"ok": ok, "enabled": autoupdate_status()}), "application/json")
+        elif self.path == "/reboot":
+            self._send(json.dumps({"ok": reboot()}), "application/json")
         else:
             self.send_response(404)
             self.end_headers()
@@ -601,6 +696,14 @@ def main():
     }
     state = State(seed=seed)
     preview = Preview()
+
+    # A fresh process start means we're already running whatever
+    # auto-update.sh last pulled (a full reboot restarts this service too),
+    # so any pending-update marker from before is stale.
+    try:
+        os.remove(UPDATE_PENDING_FILE)
+    except FileNotFoundError:
+        pass
 
     hw = state.hw_snapshot()
     matrix = build_matrix(args.panel, args.gpio_mapping, args.gpio_slowdown,

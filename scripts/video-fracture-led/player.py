@@ -2,7 +2,13 @@
 """
 Loop the shared video-fracture video onto a HUB75 RGB LED matrix (Joy-IT
 RB-MatrixCtrl + rgbmatrix) -- the same controller/library thermal_matrix.py
-uses -- with a live web control page for brightness/rotation/fit/position.
+uses -- with a live web control page for image controls
+(brightness/rotation/fit/scale/position) and panel hardware calibration
+(led-rgb-sequence/multiplexing/row-address-type/panel-type/pixel-mapper),
+all real-time and all saveable/loadable as named presets. The current
+state autosaves on every change and autoloads on startup, so whatever was
+last in effect (including the last preset you loaded) is what comes back
+after a restart/reboot -- no SSH needed for day-to-day calibration.
 
 Reads /var/lib/video-fracture/current.mp4: the file
 video-fracture-fetch.timer already keeps up to date from whatever
@@ -22,6 +28,7 @@ Control page: http://<tailscale-ip>:8099/
 import argparse
 import json
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,10 +40,15 @@ from PIL import Image
 from rgbmatrix import RGBMatrix, RGBMatrixOptions
 
 CURRENT_VIDEO = "/var/lib/video-fracture/current.mp4"
-CONFIG_FILE = "/var/lib/video-fracture/led-config.json"
+CONFIG_FILE = "/var/lib/video-fracture/led-config.json"       # current/last-loaded state, autosaved
+CONFIGS_DIR = "/var/lib/video-fracture/led-configs"            # named, explicitly-saved presets
 
-DEFAULTS = {
-    "brightness": 60,     # 1-100, live-applied every frame
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
+
+# Fields that only change how an already-open frame is drawn -- applied
+# live every frame, no rebuild.
+IMAGE_FIELDS = {
+    "brightness": 60,     # 1-100
     "rotation": 0,        # 0/90/180/270
     "fit": "letterbox",   # letterbox (full frame, may letterbox) | fill (crop to fill)
     "scale_pct": 100,
@@ -44,15 +56,36 @@ DEFAULTS = {
     "offset_y": 0,
 }
 
+# Fields that are RGBMatrixOptions construction-time-only in the underlying
+# library -- changing one of these can't be live-applied to the existing
+# RGBMatrix object, so the main loop tears it down and builds a fresh one
+# (see main()'s hw-change check) whenever any of these actually change.
+HW_FIELDS = {
+    "led_rgb_sequence": "RGB",   # e.g. RGB/RBG/GRB/BGR -- wrong value = color tint/swap
+    "multiplexing": 0,            # 0-17 -- wrong value = scrambled/checkerboard image
+    "row_address_type": 0,        # 0-4
+    "panel_type": "",             # e.g. "FM6126A" for some clone chipsets, else blank
+    "pixel_mapper": "",           # e.g. "Rotate:180", passed straight through
+}
+
+DEFAULTS = {**IMAGE_FIELDS, **HW_FIELDS}
+
 
 class State:
-    """Lock-protected live config, persisted to CONFIG_FILE so it survives
-    a restart/reboot -- same idea as media_matrix.py's State, minus the
-    parts (queue, text scroller, panel wiring) that don't apply here."""
+    """Lock-protected live config. Autosaved to CONFIG_FILE on every change
+    and autoloaded from it at startup -- so whatever was in effect last
+    (including a named preset you Load, since loading just applies it into
+    this same State) is what comes back after a restart/reboot. Named
+    presets under CONFIGS_DIR are separate, explicit snapshots you can
+    save/load on top of that -- same idea as media_matrix.py's State,
+    minus the parts (queue, text scroller, panel wiring) that don't apply
+    here."""
 
-    def __init__(self):
+    def __init__(self, seed=None):
         self.lock = threading.Lock()
         self.values = dict(DEFAULTS)
+        if seed:
+            self.values.update({k: v for k, v in seed.items() if k in DEFAULTS})
         self._load()
 
     def _load(self):
@@ -66,6 +99,7 @@ class State:
 
     def save(self):
         try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             tmp = CONFIG_FILE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self.values, f)
@@ -96,7 +130,43 @@ class State:
                 self.values["offset_x"] = max(-64, min(64, int(data["offset_x"])))
             if "offset_y" in data:
                 self.values["offset_y"] = max(-64, min(64, int(data["offset_y"])))
+            if "led_rgb_sequence" in data:
+                seq = str(data["led_rgb_sequence"]).upper()
+                if sorted(seq) == ["B", "G", "R"]:
+                    self.values["led_rgb_sequence"] = seq
+            if "multiplexing" in data:
+                self.values["multiplexing"] = max(0, min(17, int(data["multiplexing"])))
+            if "row_address_type" in data:
+                self.values["row_address_type"] = max(0, min(4, int(data["row_address_type"])))
+            if "panel_type" in data:
+                self.values["panel_type"] = str(data["panel_type"])[:32]
+            if "pixel_mapper" in data:
+                self.values["pixel_mapper"] = str(data["pixel_mapper"])[:64]
         self.save()
+
+    def hw_snapshot(self):
+        with self.lock:
+            return {k: self.values[k] for k in HW_FIELDS}
+
+    def save_preset(self, name):
+        if not NAME_RE.match(name):
+            raise ValueError("bad name")
+        os.makedirs(CONFIGS_DIR, exist_ok=True)
+        with open(os.path.join(CONFIGS_DIR, f"{name}.json"), "w") as f:
+            json.dump(self.snapshot(), f, indent=2)
+
+    def load_preset(self, name):
+        if not NAME_RE.match(name):
+            raise ValueError("bad name")
+        with open(os.path.join(CONFIGS_DIR, f"{name}.json")) as f:
+            data = json.load(f)
+        self.apply(data)  # also autosaves -- this becomes what autoloads next boot
+
+    @staticmethod
+    def list_presets():
+        if not os.path.isdir(CONFIGS_DIR):
+            return []
+        return sorted(f[:-5] for f in os.listdir(CONFIGS_DIR) if f.endswith(".json"))
 
 
 class Preview:
@@ -117,43 +187,39 @@ class Preview:
             return self.frame
 
 
-def build_matrix(args, brightness):
+def build_matrix(panel, gpio_mapping, gpio_slowdown, pwm_bits, brightness, hw):
     """Same base RGBMatrixOptions as thermal_matrix.py's build_matrix() --
     single 64x64 panel, chain=1, parallel=1, root-owned
     (drop_privileges=False) -- plus the panel-identity options
     thermal_matrix.py doesn't need to set because its panel happens to
     match the library defaults.
 
-    A wrong color order (blue tint) or wrong multiplexing (checkerboard
-    of black squares, image scrambled) is a panel/wiring calibration
-    mismatch, not something the render loop or web page can cause --
-    every panel batch/chip needs its own values here, found by trying
-    the common options against the real hardware. Set them via
-    /etc/default/video-fracture-led (FLAGS=...) and restart the service;
-    no code change needed:
-        --led-rgb-sequence RBG   (or BGR, GRB, ... -- fixes color-swapped output)
-        --multiplexing 1         (try 1-17 -- fixes scrambled/checkerboard output)
-        --row-address-type 1     (some panels need 1-4 instead of the default 0)
-        --panel-type FM6126A     (some clone panels need an explicit init sequence)
-    """
+    `hw` (a dict shaped like HW_FIELDS) is the part that's live-adjustable
+    from the control page -- a wrong color order (blue tint) or wrong
+    multiplexing (checkerboard of black squares, scrambled image) is a
+    panel/wiring calibration mismatch that varies per panel/chipset, so
+    these are exposed as controls rather than hardcoded. They're
+    construction-time-only in the underlying library, so the caller is
+    expected to rebuild the whole RGBMatrix object (see main()) whenever
+    any of them changes, instead of mutating it live."""
     opts = RGBMatrixOptions()
-    opts.rows = args.panel
-    opts.cols = args.panel
+    opts.rows = panel
+    opts.cols = panel
     opts.chain_length = 1
     opts.parallel = 1
-    opts.hardware_mapping = args.gpio_mapping
-    opts.gpio_slowdown = args.gpio_slowdown
-    opts.pwm_bits = args.pwm_bits
+    opts.hardware_mapping = gpio_mapping
+    opts.gpio_slowdown = gpio_slowdown
+    opts.pwm_bits = pwm_bits
     opts.brightness = brightness
     opts.pwm_lsb_nanoseconds = 130
     opts.drop_privileges = False
-    opts.led_rgb_sequence = args.led_rgb_sequence
-    opts.multiplexing = args.multiplexing
-    opts.row_address_type = args.row_address_type
-    if args.panel_type:
-        opts.panel_type = args.panel_type
-    if args.pixel_mapper:
-        opts.pixel_mapper_config = args.pixel_mapper
+    opts.led_rgb_sequence = hw["led_rgb_sequence"]
+    opts.multiplexing = hw["multiplexing"]
+    opts.row_address_type = hw["row_address_type"]
+    if hw["panel_type"]:
+        opts.panel_type = hw["panel_type"]
+    if hw["pixel_mapper"]:
+        opts.pixel_mapper_config = hw["pixel_mapper"]
     return RGBMatrix(options=opts)
 
 
@@ -238,18 +304,9 @@ PAGE = """<!doctype html>
 <h1>video-fracture-led</h1>
 <p>video: <b id="video">-</b></p>
 <canvas id="prev" width="64" height="64" style="width:256px;height:256px;image-rendering:pixelated;border:1px solid #444;background:#000"></canvas>
-<p style="color:#888;font-size:.8rem;margin-top:.5rem">
-  panel hardware: <span id="hw">-</span><br>
-  Wrong colors (e.g. blue tint) or a scrambled/checkerboard image is a
-  panel calibration mismatch, not something this page can fix live --
-  edit <code>/etc/default/video-fracture-led</code>
-  (<code>--led-rgb-sequence</code>, <code>--multiplexing</code>,
-  <code>--row-address-type</code>, <code>--panel-type</code>) and
-  <code>sudo systemctl restart video-fracture-led</code> to try different
-  values against the real hardware.
-</p>
 
-<div style="margin-top:1.5rem">
+<h2 style="margin-top:2rem;font-size:1rem;color:#aaa">image</h2>
+<div style="margin-top:1rem">
   <label>brightness <span id="brightness-v"></span></label><br>
   <input id="brightness" type="range" min="1" max="100" style="width:100%">
 </div>
@@ -280,9 +337,57 @@ PAGE = """<!doctype html>
   <input id="offset_y" type="range" min="-32" max="32" style="width:100%">
 </div>
 
+<h2 style="margin-top:2rem;font-size:1rem;color:#aaa">panel hardware</h2>
+<p style="color:#888;font-size:.8rem">
+  Wrong colors (tint/swap) or a scrambled/checkerboard image is a panel
+  calibration mismatch, not a video problem -- these apply live (the
+  panel briefly blanks while it rebuilds) so you can dial them in by eye.
+</p>
+<div style="margin-top:1rem">
+  <label>led-rgb-sequence</label><br>
+  <select id="led_rgb_sequence" style="width:100%">
+    <option>RGB</option><option>RBG</option><option>GRB</option>
+    <option>GBR</option><option>BRG</option><option>BGR</option>
+  </select>
+</div>
+<div style="margin-top:1rem">
+  <label>multiplexing <span id="multiplexing-v"></span></label><br>
+  <input id="multiplexing" type="range" min="0" max="17" style="width:100%">
+</div>
+<div style="margin-top:1rem">
+  <label>row-address-type <span id="row_address_type-v"></span></label><br>
+  <input id="row_address_type" type="range" min="0" max="4" style="width:100%">
+</div>
+<div style="margin-top:1rem">
+  <label>panel-type (blank unless needed, e.g. FM6126A)</label><br>
+  <input id="panel_type" type="text" style="width:100%;box-sizing:border-box">
+</div>
+<div style="margin-top:1rem">
+  <label>pixel-mapper (blank unless needed, e.g. Rotate:180)</label><br>
+  <input id="pixel_mapper" type="text" style="width:100%;box-sizing:border-box">
+</div>
+
+<h2 style="margin-top:2rem;font-size:1rem;color:#aaa">presets</h2>
+<p style="color:#888;font-size:.8rem">
+  Save the settings above under a name; Load applies a saved preset (and
+  it becomes what auto-loads next boot, same as any other change here).
+</p>
+<div style="display:flex;gap:.5rem;margin-top:.5rem">
+  <input id="preset_name" type="text" placeholder="preset name" style="flex:1">
+  <button id="save_btn">Save</button>
+</div>
+<div style="display:flex;gap:.5rem;margin-top:.5rem">
+  <select id="preset_list" style="flex:1"></select>
+  <button id="load_btn">Load</button>
+</div>
+<p id="preset_msg" style="color:#888;font-size:.8rem;min-height:1.2em"></p>
+
 <script>
 const ctx = document.getElementById('prev').getContext('2d');
-const fields = ['brightness', 'rotation', 'fit', 'scale_pct', 'offset_x', 'offset_y'];
+const RANGE_FIELDS = ['brightness', 'scale_pct', 'offset_x', 'offset_y', 'multiplexing', 'row_address_type'];
+const SELECT_FIELDS = ['rotation', 'fit', 'led_rgb_sequence'];
+const TEXT_FIELDS = ['panel_type', 'pixel_mapper'];
+const ALL_FIELDS = [...RANGE_FIELDS, ...SELECT_FIELDS, ...TEXT_FIELDS];
 const state = {};
 let applying = false;
 let debounceTimer;
@@ -293,17 +398,18 @@ let debounceTimer;
 // of two field updates racing each other out of order.
 function send() {
   fetch('/update', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                     body: JSON.stringify(state)});
+                     body: JSON.stringify(state)}).then(pollStatus);
 }
 function sendDebounced() {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(send, 200);
 }
 
-for (const id of ['brightness', 'scale_pct', 'offset_x', 'offset_y']) {
+for (const id of RANGE_FIELDS) {
   const el = document.getElementById(id);
   el.oninput = () => {
-    document.getElementById(id + '-v').textContent = el.value;
+    const v = document.getElementById(id + '-v');
+    if (v) v.textContent = el.value;
     state[id] = Number(el.value);
     if (!applying) sendDebounced();
   };
@@ -316,16 +422,22 @@ document.getElementById('fit').onchange = e => {
   state.fit = e.target.value;
   if (!applying) sendDebounced();
 };
+document.getElementById('led_rgb_sequence').onchange = e => {
+  state.led_rgb_sequence = e.target.value;
+  if (!applying) sendDebounced();
+};
+for (const id of TEXT_FIELDS) {
+  document.getElementById(id).onchange = e => {
+    state[id] = e.target.value;
+    if (!applying) sendDebounced();
+  };
+}
 
 async function pollStatus() {
   const s = await (await fetch('/status.json')).json();
   document.getElementById('video').textContent = s.video || '(none found yet)';
-  document.getElementById('hw').textContent =
-    `${s.hw.gpio_mapping}, rgb-sequence=${s.hw.led_rgb_sequence}, ` +
-    `multiplexing=${s.hw.multiplexing}, row-address-type=${s.hw.row_address_type}` +
-    (s.hw.panel_type ? `, panel-type=${s.hw.panel_type}` : '');
   applying = true;
-  for (const id of ['brightness', 'rotation', 'fit', 'scale_pct', 'offset_x', 'offset_y']) {
+  for (const id of ALL_FIELDS) {
     state[id] = s[id];
     document.getElementById(id).value = s[id];
     const v = document.getElementById(id + '-v');
@@ -346,7 +458,35 @@ async function pollFrame() {
   }
 }
 
+async function refreshPresets() {
+  const names = await (await fetch('/configs.json')).json();
+  const sel = document.getElementById('preset_list');
+  sel.innerHTML = names.length
+    ? names.map(n => `<option>${n}</option>`).join('')
+    : '<option disabled>(no presets saved yet)</option>';
+}
+
+document.getElementById('save_btn').onclick = async () => {
+  const name = document.getElementById('preset_name').value.trim();
+  const msg = document.getElementById('preset_msg');
+  if (!name) { msg.textContent = 'enter a name first'; return; }
+  const r = await fetch('/save-config', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify({name})});
+  msg.textContent = r.ok ? `saved "${name}"` : 'save failed (invalid name?)';
+  if (r.ok) refreshPresets();
+};
+document.getElementById('load_btn').onclick = async () => {
+  const sel = document.getElementById('preset_list');
+  const msg = document.getElementById('preset_msg');
+  if (!sel.value) { msg.textContent = 'no preset selected'; return; }
+  const r = await fetch('/load-config', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify({name: sel.value})});
+  msg.textContent = r.ok ? `loaded "${sel.value}"` : 'load failed';
+  if (r.ok) pollStatus();
+};
+
 pollStatus();
+refreshPresets();
 setInterval(pollStatus, 2000);
 setInterval(pollFrame, 200);
 </script>
@@ -357,7 +497,6 @@ class ControlHandler(BaseHTTPRequestHandler):
     state: State = None
     preview: Preview = None
     source_path = None
-    hw_info = None
 
     def _send(self, body, content_type, code=200):
         body = body if isinstance(body, bytes) else body.encode()
@@ -373,7 +512,6 @@ class ControlHandler(BaseHTTPRequestHandler):
         elif self.path == "/status.json":
             snap = self.state.snapshot()
             snap["video"] = os.path.basename(self.source_path) if os.path.exists(self.source_path) else None
-            snap["hw"] = self.hw_info
             self._send(json.dumps(snap), "application/json")
         elif self.path == "/frame.json":
             frame = self.preview.snapshot()
@@ -383,34 +521,51 @@ class ControlHandler(BaseHTTPRequestHandler):
                 h, w = frame.shape[:2]
                 body = json.dumps({"w": w, "h": h, "pixels": frame.reshape(-1, 3).tolist()})
             self._send(body, "application/json")
+        elif self.path == "/configs.json":
+            self._send(json.dumps(self.state.list_presets()), "application/json")
         else:
             self.send_response(404)
             self.end_headers()
 
-    def do_POST(self):
-        if self.path != "/update":
-            self.send_response(404)
-            self.end_headers()
-            return
+    def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length).decode()) if length else {}
+
+    def do_POST(self):
         try:
-            data = json.loads(self.rfile.read(length).decode()) if length else {}
+            data = self._read_json()
         except ValueError:
             self.send_response(400)
             self.end_headers()
             return
-        self.state.apply(data)
-        self._send("ok", "text/plain")
+
+        if self.path == "/update":
+            self.state.apply(data)
+            self._send("ok", "text/plain")
+        elif self.path == "/save-config":
+            try:
+                self.state.save_preset(str(data.get("name", "")).strip())
+                self._send("ok", "text/plain")
+            except (ValueError, OSError):
+                self._send("bad name", "text/plain", code=400)
+        elif self.path == "/load-config":
+            try:
+                self.state.load_preset(str(data.get("name", "")).strip())
+                self._send("ok", "text/plain")
+            except (ValueError, OSError, json.JSONDecodeError):
+                self._send("not found", "text/plain", code=404)
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, *a):
         pass
 
 
-def make_control_server(state, preview, source_path, hw_info, port):
+def make_control_server(state, preview, source_path, port):
     ControlHandler.state = state
     ControlHandler.preview = preview
     ControlHandler.source_path = source_path
-    ControlHandler.hw_info = hw_info
     server = ThreadingHTTPServer(("0.0.0.0", port), ControlHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -429,38 +584,31 @@ def main():
     p.add_argument("--web-port", type=int, default=8099)
     p.add_argument("--fps-cap", type=float, default=30.0)
     p.add_argument("--led-rgb-sequence", default="RGB",
-                   help="color-channel order the panel actually expects, e.g. "
-                        "RBG/GRB/BGR -- wrong value shows as a color tint/swap")
-    p.add_argument("--multiplexing", type=int, default=0,
-                   help="0 for a normal/direct panel; some clone 64x64 panels "
-                        "need 1-17 -- wrong value shows as a scrambled/"
-                        "checkerboard image")
-    p.add_argument("--row-address-type", type=int, default=0,
-                   help="0 for most panels; some need 1-4 for correct row "
-                        "addressing")
-    p.add_argument("--panel-type", default="",
-                   help="explicit init sequence for some clone chipsets, "
-                        "e.g. FM6126A -- leave blank unless the panel needs it")
-    p.add_argument("--pixel-mapper", default="",
-                   help="e.g. 'Rotate:180' -- passed straight to "
-                        "RGBMatrixOptions.pixel_mapper_config")
+                   help="first-boot seed only -- once the control page has "
+                        "saved a config, that wins; edit it there instead")
+    p.add_argument("--multiplexing", type=int, default=0, help="first-boot seed only")
+    p.add_argument("--row-address-type", type=int, default=0, help="first-boot seed only")
+    p.add_argument("--panel-type", default="", help="first-boot seed only")
+    p.add_argument("--pixel-mapper", default="", help="first-boot seed only")
     args = p.parse_args()
 
-    state = State()
-    preview = Preview()
-
-    matrix = build_matrix(args, state.snapshot()["brightness"])
-    canvas = matrix.CreateFrameCanvas()
-
-    source = VideoSource(args.video)
-    hw_info = {
-        "gpio_mapping": args.gpio_mapping,
+    seed = {
         "led_rgb_sequence": args.led_rgb_sequence,
         "multiplexing": args.multiplexing,
         "row_address_type": args.row_address_type,
         "panel_type": args.panel_type,
+        "pixel_mapper": args.pixel_mapper,
     }
-    make_control_server(state, preview, args.video, hw_info, args.web_port)
+    state = State(seed=seed)
+    preview = Preview()
+
+    hw = state.hw_snapshot()
+    matrix = build_matrix(args.panel, args.gpio_mapping, args.gpio_slowdown,
+                           args.pwm_bits, state.snapshot()["brightness"], hw)
+    canvas = matrix.CreateFrameCanvas()
+
+    source = VideoSource(args.video)
+    make_control_server(state, preview, args.video, args.web_port)
 
     print(f"running -- control page on :{args.web_port}, ctrl-c to stop")
     frame_budget = 1.0 / args.fps_cap if args.fps_cap else 0.0
@@ -468,6 +616,21 @@ def main():
         while True:
             t0 = time.monotonic()
             snap = state.snapshot()
+
+            new_hw = state.hw_snapshot()
+            if new_hw != hw:
+                # A calibration field changed on the control page -- these
+                # are construction-time-only in the underlying library, so
+                # the only way to apply them live is to tear down and
+                # rebuild the whole RGBMatrix object. Briefly blanks the
+                # panel; that's expected and fine for a rare calibration
+                # tweak, not something that happens during normal playback.
+                hw = new_hw
+                matrix.Clear()
+                matrix = build_matrix(args.panel, args.gpio_mapping, args.gpio_slowdown,
+                                       args.pwm_bits, snap["brightness"], hw)
+                canvas = matrix.CreateFrameCanvas()
+
             frame = source.next_frame()
             if frame is not None:
                 rgb = fit_frame(frame, snap["fit"], args.panel)

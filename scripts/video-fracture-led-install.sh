@@ -65,11 +65,13 @@ echo "== config =="
 FLAGS_FILE=/etc/default/video-fracture-led
 if [ ! -f "$FLAGS_FILE" ]; then
     cat > "$FLAGS_FILE" <<'EOF'
-# Panel calibration -- every HUB75 panel/chipset needs its own values here.
-# A blue/wrong-color tint means --led-rgb-sequence is wrong (try RBG, GRB,
-# BGR, ...). A scrambled/checkerboard image means --multiplexing is wrong
-# (try 1 through 17). After changing this file:
-#   sudo systemctl restart video-fracture-led
+# First-boot-only seed for panel calibration (led-rgb-sequence,
+# multiplexing, row-address-type, panel-type, pixel-mapper). Once the
+# control page (http://<tailscale-ip>:8099/) saves any config -- which it
+# does automatically on every change -- THIS FILE IS IGNORED from then on;
+# use the "panel hardware" section of the control page instead, no SSH or
+# restart needed. Only relevant again if you delete
+# /var/lib/video-fracture/led-config.json to start over.
 FLAGS="--led-rgb-sequence RGB --multiplexing 0 --row-address-type 0"
 EOF
 fi
@@ -100,5 +102,5 @@ echo "  1. sudo reboot                                    # audio-disable needs 
 echo "  2. sudo systemctl enable --now video-fracture-led"
 echo "  3. control page: http://\$(tailscale ip -4):8099/"
 echo
-echo "if the image looks wrong (color tint, scrambled/checkerboard), edit"
-echo "$FLAGS_FILE and restart the service -- see the comments in that file."
+echo "if the image looks wrong (color tint, scrambled/checkerboard), fix it"
+echo "live from the control page's 'panel hardware' section -- no SSH needed."

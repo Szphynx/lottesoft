@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Per-Pi control panel: service status, camera detection, live low-fps
 preview, and the config knobs from thermal_matrix.py's --palette/--fit/
---rotate/etc flags. Changing a setting rewrites /etc/default/thermal-matrix
-and restarts the thermal-matrix service to pick it up.
+--rotate/etc flags. Changing a setting writes /run/thermal-matrix/live-config.json,
+which the running thermal_matrix.py process polls every frame and applies
+immediately -- no restart. /etc/default/thermal-matrix is kept in sync too,
+so a reboot or manual restart comes back up with the same settings.
 
 Binds to the Tailscale IP only (falls back to localhost if Tailscale isn't
 up) -- reachable from your tailnet, not the open LAN or internet.
@@ -25,6 +27,7 @@ PASS = os.environ.get("STATUS_PASS", "")
 FLAGS_FILE = "/etc/default/thermal-matrix"
 PREVIEW_JPEG = "/run/thermal-matrix/preview.jpg"
 PREVIEW_STATS = "/run/thermal-matrix/stats.json"
+LIVE_CONFIG_FILE = "/run/thermal-matrix/live-config.json"
 PREVIEW_MAX_AGE = 5.0
 
 PRESETS_DIR = "/etc/thermal-matrix/presets"
@@ -162,6 +165,32 @@ def restart_service():
     subprocess.run(["systemctl", "restart", SERVICE], timeout=10)
 
 
+def read_config():
+    """Current live state if thermal-matrix is running and has published
+    one, otherwise whatever's parked in the flags file (e.g. before first
+    start)."""
+    try:
+        with open(LIVE_CONFIG_FILE) as f:
+            data = json.load(f)
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update({k: data[k] for k in DEFAULT_CONFIG if k in data})
+        cfg["extra"] = parse_config(read_flag_tokens())["extra"]
+        return cfg
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError):
+        return parse_config(read_flag_tokens())
+
+
+def apply_live(cfg):
+    """Push a config live (thermal_matrix.py picks it up within one render
+    frame, no restart) and persist it so a future restart/reboot matches."""
+    write_flags(cfg)
+    os.makedirs(os.path.dirname(LIVE_CONFIG_FILE), exist_ok=True)
+    tmp = LIVE_CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({k: cfg[k] for k in DEFAULT_CONFIG}, f)
+    os.replace(tmp, LIVE_CONFIG_FILE)
+
+
 # ----------------------------------------------------------------------------
 # Presets -- named snapshots of the config dict, saved as JSON files so you
 # can jump back to a known-good setup instead of re-dialing every field.
@@ -220,7 +249,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/status":
             return self._json(status_payload())
         if self.path == "/api/config":
-            return self._json(parse_config(read_flag_tokens()))
+            return self._json(read_config())
         if self.path == "/api/presets":
             return self._json({"names": list_presets(), "last": read_last_preset_name()})
         self._send(DASHBOARD_HTML.encode(), "text/html")
@@ -238,13 +267,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
-            cfg = parse_config(read_flag_tokens())
+            cfg = read_config()
             for key in DEFAULT_CONFIG:
                 if key in incoming:
                     cfg[key] = incoming[key]
-            write_flags(cfg)
-            restart_service()
-            return self._json({"ok": True})
+            apply_live(cfg)
+            return self._json({"ok": True, "config": cfg})
 
         if self.path == "/api/restart":
             restart_service()
@@ -258,7 +286,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             cfg = {k: incoming[k] for k in DEFAULT_CONFIG if k in incoming}
-            cfg["extra"] = parse_config(read_flag_tokens())["extra"]
+            cfg["extra"] = read_config()["extra"]
             safe = save_preset(incoming.get("name", ""), cfg)
             if not safe:
                 self.send_response(400)
@@ -277,8 +305,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             full_cfg = dict(DEFAULT_CONFIG)
             full_cfg.update({k: cfg[k] for k in DEFAULT_CONFIG if k in cfg})
             full_cfg["extra"] = cfg.get("extra", [])
-            write_flags(full_cfg)
-            restart_service()
+            apply_live(full_cfg)
             return self._json({"ok": True, "config": full_cfg})
 
         self.send_response(404)
@@ -337,7 +364,16 @@ DASHBOARD_HTML = """<!doctype html>
     background: #0e1210; color: #d8e0dc;
     margin: 0; padding: 1.5rem;
   }
-  h1 { font-size: 1.1rem; margin: 0 0 1.25rem; color: #eef4f0; }
+  h1 {
+    font-size: 1.1rem; margin: 0 0 1.25rem; color: #eef4f0;
+    display: flex; align-items: center; gap: 0.55rem;
+  }
+  .dot {
+    width: 11px; height: 11px; border-radius: 50%; flex: none;
+    background: #4a5750; transition: background 0.2s, box-shadow 0.2s;
+  }
+  .dot.ok { background: #4fd18f; box-shadow: 0 0 8px 1px #4fd18f80; }
+  .dot.bad { background: #e2574c; box-shadow: 0 0 8px 1px #e2574c80; }
   .grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
     gap: 1rem; max-width: 960px;
@@ -362,7 +398,7 @@ DASHBOARD_HTML = """<!doctype html>
     width: 100%; aspect-ratio: 1; image-rendering: pixelated;
     background: #000; border-radius: 6px; display: block;
   }
-  form { display: flex; flex-direction: column; gap: 0.7rem; }
+  form, .stack { display: flex; flex-direction: column; gap: 0.7rem; }
   label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.82rem; color: #9fb0a8; }
   select, input {
     background: #0e1210; border: 1px solid #2a3430; color: #d8e0dc;
@@ -380,7 +416,7 @@ DASHBOARD_HTML = """<!doctype html>
   .msg { font-size: 0.8rem; color: #7f9088; min-height: 1.2em; }
   .preset-row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: end; margin-bottom: 0.6rem; }
 </style>
-<h1 id="host">thermal-matrix</h1>
+<h1><span id="svc-dot" class="dot"></span><span id="host">thermal-matrix</span></h1>
 <div class="grid">
 
   <div class="card">
@@ -400,8 +436,8 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 
   <div class="card" style="grid-column: 1 / -1">
-    <h2>Image</h2>
-    <form id="cfg">
+    <h2>Image <span style="text-transform:none; letter-spacing:normal; font-weight:400">-- applies instantly, no restart</span></h2>
+    <div id="cfg" class="stack">
       <label>Mode
         <select name="mode" id="mode">
           <option value="auto">Auto-range (scene-relative)</option>
@@ -432,9 +468,8 @@ DASHBOARD_HTML = """<!doctype html>
       <label>Brightness <span id="brightness-val"></span>
         <input type="range" min="10" max="100" name="brightness" id="brightness">
       </label>
-      <button type="submit">Apply &amp; restart</button>
       <div class="msg" id="cfg-msg"></div>
-    </form>
+    </div>
   </div>
 
   <div class="card" style="grid-column: 1 / -1">
@@ -475,7 +510,9 @@ async function pollStatus() {
     const r = await fetch("/api/status", {cache: "no-store"});
     const s = await r.json();
     document.getElementById("host").textContent = "thermal-matrix - " + s.host;
-    setPill(document.getElementById("svc"), s.active === "active", "online", "offline");
+    const online = s.active === "active";
+    setPill(document.getElementById("svc"), online, "online", "offline");
+    document.getElementById("svc-dot").className = "dot " + (online ? "ok" : "bad");
     setPill(document.getElementById("cam"), s.camera, "connected", "not detected");
     document.getElementById("uptime").textContent = s.uptime || "-";
     if (s.preview) {
@@ -515,24 +552,33 @@ async function loadConfig() {
   toggleModeFields();
 }
 
-document.getElementById("mode").addEventListener("change", toggleModeFields);
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+async function applyLive() {
+  const msg = document.getElementById("cfg-msg");
+  msg.textContent = "applying...";
+  try {
+    const r = await fetch("/api/config", {method: "POST", body: JSON.stringify(currentFormConfig())});
+    msg.textContent = r.ok ? "live" : "failed to apply";
+  } catch (e) {
+    msg.textContent = "failed to apply";
+  }
+}
+const applyLiveDebounced = debounce(applyLive, 150);
+
+document.getElementById("mode").addEventListener("change", () => { toggleModeFields(); applyLive(); });
+["palette", "fit", "rotate"].forEach(id => {
+  document.getElementById(id).addEventListener("change", applyLive);
+});
+["cold_max", "hot_min", "hot_max"].forEach(id => {
+  document.getElementById(id).addEventListener("change", applyLive);
+});
 document.getElementById("brightness").addEventListener("input", e => {
   document.getElementById("brightness-val").textContent = e.target.value;
-});
-
-document.getElementById("cfg").addEventListener("submit", async e => {
-  e.preventDefault();
-  const f = new FormData(e.target);
-  const body = {
-    mode: f.get("mode"), palette: f.get("palette"), fit: f.get("fit"),
-    rotate: parseInt(f.get("rotate")), brightness: parseInt(f.get("brightness")),
-    cold_max: parseFloat(f.get("cold_max")), hot_min: parseFloat(f.get("hot_min")),
-    hot_max: parseFloat(f.get("hot_max")),
-  };
-  const msg = document.getElementById("cfg-msg");
-  msg.textContent = "applying, service is restarting...";
-  await fetch("/api/config", {method: "POST", body: JSON.stringify(body)});
-  setTimeout(() => { msg.textContent = "applied"; pollStatus(); }, 1500);
+  applyLiveDebounced();
 });
 
 document.getElementById("restart").addEventListener("click", async () => {
@@ -584,12 +630,13 @@ async function refreshPresetList(selectName) {
 
 async function loadPresetByName(name) {
   const msg = document.getElementById("preset-msg");
-  msg.textContent = `loading "${name}", service is restarting...`;
+  msg.textContent = `loading "${name}"...`;
   const r = await fetch("/api/presets/load", {method: "POST", body: JSON.stringify({name})});
   if (!r.ok) { msg.textContent = `couldn't load "${name}"`; return; }
   const result = await r.json();
   applyConfigToForm(result.config);
-  setTimeout(() => { msg.textContent = `loaded "${name}"`; pollStatus(); }, 1500);
+  msg.textContent = `loaded "${name}"`;
+  pollStatus();
 }
 
 document.getElementById("preset-save").addEventListener("click", async () => {

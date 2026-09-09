@@ -63,6 +63,10 @@ PREVIEW_JPEG = os.path.join(PREVIEW_DIR, "preview.jpg")
 PREVIEW_STATS = os.path.join(PREVIEW_DIR, "stats.json")
 PREVIEW_INTERVAL = 0.5
 
+# The dashboard writes here to change palette/mode/fit/rotate/brightness
+# without restarting this process -- polled once per render frame below.
+LIVE_CONFIG_FILE = os.path.join(PREVIEW_DIR, "live-config.json")
+
 # Fixed-threshold "body heat" mode: bypasses the percentile auto-range and
 # maps absolute temperature straight to color, so the cutoffs stay put
 # regardless of what's in the scene. Below COLD_MAX is a blue-white
@@ -132,6 +136,16 @@ def get_lut(name, gamma):
     if name in PALETTES:
         return build_lut(PALETTES[name], gamma)
     return build_cv2_lut(name, gamma)
+
+
+def compute_lut(mode, palette, gamma, lut_min, lut_max, cold_max, hot_min, hot_max):
+    """mode is 'auto', 'bodyheat', or 'colorwise' -- the live-reloadable
+    equivalent of the --palette/--bodyheat/--colorwise flags below."""
+    if mode == "colorwise":
+        return build_colorwise_lut(lut_min, lut_max, cold_max, hot_min, hot_max)
+    if mode == "bodyheat":
+        return build_bodyheat_lut(lut_min, lut_max, cold_max, hot_min, hot_max)
+    return get_lut(palette, gamma)
 
 
 def build_bodyheat_lut(lut_min=BODYHEAT_LUT_MIN_C, lut_max=BODYHEAT_LUT_MAX_C,
@@ -465,18 +479,24 @@ def main():
     p.add_argument("--stats", action="store_true")
     args = p.parse_args()
 
-    fixed_thresholds = args.bodyheat or args.colorwise
-    if args.colorwise:
-        lut = build_colorwise_lut(args.lut_min, args.lut_max,
-                                   args.cold_max, args.hot_min, args.hot_max)
-    elif args.bodyheat:
-        lut = build_bodyheat_lut(args.lut_min, args.lut_max,
-                                  args.cold_max, args.hot_min, args.hot_max)
-    else:
-        try:
-            lut = get_lut(args.palette, args.gamma)
-        except AttributeError:
-            sys.exit(f"unknown palette: {args.palette}")
+    mode = "colorwise" if args.colorwise else "bodyheat" if args.bodyheat else "auto"
+    try:
+        lut = compute_lut(mode, args.palette, args.gamma, args.lut_min, args.lut_max,
+                           args.cold_max, args.hot_min, args.hot_max)
+    except AttributeError:
+        sys.exit(f"unknown palette: {args.palette}")
+
+    live_cfg = {
+        "mode": mode, "palette": args.palette, "fit": args.fit, "rotate": args.rotate,
+        "brightness": args.brightness, "cold_max": args.cold_max,
+        "hot_min": args.hot_min, "hot_max": args.hot_max,
+    }
+    try:
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+        with open(LIVE_CONFIG_FILE, "w") as f:
+            json.dump(live_cfg, f)
+    except OSError:
+        pass
 
     print(f"starting sensor backend: {args.backend}")
     source = BACKENDS[args.backend](args.subpage_hz, args.i2c_freq)
@@ -493,7 +513,7 @@ def main():
     matrix = build_matrix(args)
     canvas = matrix.CreateFrameCanvas()
     pipeline = Pipeline(lut, args.fit, not args.no_blend, 1.0 / args.subpage_hz,
-                         mode="fixed" if fixed_thresholds else "agc",
+                         mode="fixed" if mode in ("bodyheat", "colorwise") else "agc",
                          fixed_lo=args.lut_min, fixed_hi=args.lut_max,
                          rotate=args.rotate)
 
@@ -502,10 +522,7 @@ def main():
     last_report = time.monotonic()
     last_reads = 0
     last_preview = 0.0
-    try:
-        os.makedirs(PREVIEW_DIR, exist_ok=True)
-    except OSError:
-        pass
+    last_live_mtime = 0.0
 
     print("running -- ctrl-c to stop")
     if args.preview:
@@ -516,6 +533,26 @@ def main():
         running = True
         while running:
             t0 = time.monotonic()
+
+            try:
+                mtime = os.stat(LIVE_CONFIG_FILE).st_mtime
+                if mtime != last_live_mtime:
+                    last_live_mtime = mtime
+                    with open(LIVE_CONFIG_FILE) as f:
+                        live_cfg.update(json.load(f))
+                    lut = compute_lut(live_cfg["mode"], live_cfg["palette"], args.gamma,
+                                       args.lut_min, args.lut_max, live_cfg["cold_max"],
+                                       live_cfg["hot_min"], live_cfg["hot_max"])
+                    pipeline.lut = lut
+                    pipeline.mode = "fixed" if live_cfg["mode"] in ("bodyheat", "colorwise") else "agc"
+                    pipeline.fit = live_cfg["fit"]
+                    pipeline.rotate_k = (live_cfg["rotate"] // 90) % 4
+                    try:
+                        matrix.brightness = live_cfg["brightness"]
+                    except AttributeError:
+                        pass
+            except (OSError, ValueError, KeyError, AttributeError):
+                pass
 
             prev, curr, t_curr = capture.snapshot()
             rgb = pipeline.render(prev, curr, t_curr, t0)

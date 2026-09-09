@@ -25,6 +25,8 @@ Useful flags:
 """
 
 import argparse
+import json
+import os
 import sys
 import threading
 import time
@@ -53,6 +55,13 @@ MEDIAN_FILTER = True     # 3x3 median on the raw array; kills salt-and-pepper no
 SHARPEN_AMOUNT = 0.35    # unsharp mask after upscale; 0 disables
 SHARPEN_RADIUS = 1.0
 RENDER_FPS_CAP = 60      # set to 0 to run flat out
+
+# Low-fps snapshot for the web dashboard (scripts/status_server.py reads
+# these). Written to tmpfs so it costs no SD-card wear.
+PREVIEW_DIR = "/run/thermal-matrix"
+PREVIEW_JPEG = os.path.join(PREVIEW_DIR, "preview.jpg")
+PREVIEW_STATS = os.path.join(PREVIEW_DIR, "stats.json")
+PREVIEW_INTERVAL = 0.5
 
 # Fixed-threshold "body heat" mode: bypasses the percentile auto-range and
 # maps absolute temperature straight to color, so the cutoffs stay put
@@ -492,6 +501,11 @@ def main():
     rendered = 0
     last_report = time.monotonic()
     last_reads = 0
+    last_preview = 0.0
+    try:
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+    except OSError:
+        pass
 
     print("running -- ctrl-c to stop")
     if args.preview:
@@ -509,6 +523,28 @@ def main():
             canvas.SetImage(Image.fromarray(rgb, "RGB"))
             canvas = matrix.SwapOnVSync(canvas)
             rendered += 1
+
+            if t0 - last_preview >= PREVIEW_INTERVAL:
+                last_preview = t0
+                try:
+                    tmp = PREVIEW_JPEG + ".tmp"
+                    Image.fromarray(rgb, "RGB").save(tmp, format="JPEG", quality=70)
+                    os.replace(tmp, PREVIEW_JPEG)
+                    tmp = PREVIEW_STATS + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump({
+                            "ts": time.time(),
+                            "scene_min": pipeline.scene_min,
+                            "scene_mean": pipeline.scene_mean,
+                            "scene_max": pipeline.scene_max,
+                            "mapped_lo": pipeline.lo,
+                            "mapped_hi": pipeline.hi,
+                            "sensor_reads": capture.reads,
+                            "sensor_errors": capture.errors,
+                        }, f)
+                    os.replace(tmp, PREVIEW_STATS)
+                except OSError:
+                    pass
 
             if args.preview:
                 size = PANEL * args.preview_scale

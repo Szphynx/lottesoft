@@ -5,7 +5,11 @@
 # (/var/lib/video-fracture/current.mp4 -- fetched by the existing
 # video-fracture-fetch.timer, unchanged) on a Joy-IT RB-MatrixCtrl + HUB75
 # panel, via its own live web control page. Nothing here touches the
-# existing video-fracture fetch/play-loop files or services.
+# existing video-fracture fetch/play-loop files or services. The control
+# page binds to the Tailscale IP only and requires a login (generated
+# below), same posture as scripts/status_server.py -- it can restart the
+# service, reboot the Pi, and pull code, so it doesn't get to be open on
+# the LAN with no auth.
 #
 # Uses the same controller/library as thermal_matrix.py (rgbmatrix +
 # Joy-IT RB-MatrixCtrl), so this Pi ends up with the identical driver
@@ -76,6 +80,14 @@ FLAGS="--led-rgb-sequence RGB --multiplexing 0 --row-address-type 0"
 EOF
 fi
 
+echo "== control page login (same scheme as scripts/status_server.py) =="
+AUTH_FILE=/etc/default/video-fracture-led-auth
+if [ ! -f "$AUTH_FILE" ]; then
+    GENERATED_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(9))')"
+    printf 'STATUS_USER=admin\nSTATUS_PASS=%s\n' "$GENERATED_PASS" > "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
+fi
+
 echo "== systemd service =="
 cat > /etc/systemd/system/video-fracture-led.service <<EOF
 [Unit]
@@ -85,6 +97,7 @@ After=network.target video-fracture-fetch.service
 [Service]
 Type=simple
 EnvironmentFile=$FLAGS_FILE
+EnvironmentFile=$AUTH_FILE
 WorkingDirectory=$REPO_DIR
 ExecStart=/bin/bash -c '/usr/bin/python3 $REPO_DIR/scripts/video-fracture-led/player.py \$FLAGS'
 Restart=on-failure
@@ -127,9 +140,15 @@ echo "done. now:"
 echo "  1. sudo reboot                                    # audio-disable needs this"
 echo "  2. sudo systemctl enable --now video-fracture-led"
 echo "  3. control page: http://\$(tailscale ip -4):8099/"
+echo "     login: cat $AUTH_FILE"
+echo
+echo "the control page is reachable from your tailnet only (not the open"
+echo "LAN), and requires that login -- same posture as scripts/status_server.py,"
+echo "since this page can restart the service, reboot the Pi, and pull code."
 echo
 echo "if the image looks wrong (color tint, scrambled/checkerboard), fix it"
 echo "live from the control page's 'panel hardware' section -- no SSH needed."
 echo
-echo "code auto-update (git pull, no auto-restart) and a Reboot button are"
-echo "both on the control page under 'system' -- nothing to enable by hand."
+echo "code auto-update (git pull, no auto-restart), a soft 'restart service'"
+echo "button, and a full 'Reboot this Pi' button are all on the control page --"
+echo "nothing to enable by hand."

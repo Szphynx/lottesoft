@@ -22,10 +22,17 @@ video on a second, LED-matrix output.
 Run with:
     sudo python3 scripts/video-fracture-led/player.py
 
-Control page: http://<tailscale-ip>:8099/
+Control page: http://<tailscale-ip>:8099/ -- HTTP Basic auth, login in
+/etc/default/video-fracture-led-auth (see scripts/video-fracture-led-install.sh).
+Binds to the Tailscale IP only (falls back to localhost if Tailscale isn't
+up), same posture as scripts/status_server.py -- this page can now reboot
+the Pi and pull code from GitHub, so it doesn't get to be open on the LAN
+with no login the way the WS2812/MAX7219 control pages are today.
 """
 
 import argparse
+import base64
+import hmac
 import json
 import os
 import re
@@ -45,6 +52,10 @@ CONFIG_FILE = "/var/lib/video-fracture/led-config.json"       # current/last-loa
 CONFIGS_DIR = "/var/lib/video-fracture/led-configs"            # named, explicitly-saved presets
 UPDATE_PENDING_FILE = "/var/lib/video-fracture/led-update-pending"  # written by auto-update.sh
 AUTOUPDATE_TIMER = "video-fracture-led-autoupdate.timer"
+SERVICE_NAME = "video-fracture-led"
+
+AUTH_USER = os.environ.get("STATUS_USER", "")
+AUTH_PASS = os.environ.get("STATUS_PASS", "")
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 
@@ -214,6 +225,27 @@ def reboot():
         return False
 
 
+def restart_after_reply():
+    """Runs in a background thread, called only after the /restart response
+    has already gone out -- the restart kills this very process, so the
+    reply has to be sent first. Same pattern as double_matrix.py's
+    _handle_restart(); this service already runs as root, so no sudo."""
+    time.sleep(0.2)
+    subprocess.Popen(["systemctl", "restart", SERVICE_NAME])
+
+
+def bind_addr():
+    """Tailscale IP if it's up, else localhost -- same as
+    scripts/status_server.py's bind_addr(), so this page is reachable from
+    the tailnet only, not the open LAN."""
+    try:
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
+                              text=True, timeout=3).stdout.strip()
+        return out or "127.0.0.1"
+    except (OSError, subprocess.SubprocessError):
+        return "127.0.0.1"
+
+
 class Preview:
     """Last frame sent to the panel, for the control page's live pixel
     preview -- a plain copy-under-lock, same tradeoff as media_matrix.py's
@@ -345,9 +377,18 @@ class VideoSource:
 PAGE = """<!doctype html>
 <meta charset="utf-8">
 <title>video-fracture-led</title>
-<body style="font:16px sans-serif;background:#111;color:#eee;padding:2rem;max-width:640px;margin:auto">
-<h1>video-fracture-led</h1>
-<div id="update_banner" hidden style="background:#3a2f00;border:1px solid #a87c00;border-radius:6px;padding:.75rem 1rem;margin-bottom:1rem">
+<body style="font:16px monospace;background:#111;color:#eee;
+             max-width:32rem;margin:2rem auto;padding:0 1rem">
+<h1 style="font-size:1.1rem">video-fracture-led
+  <span id="svcStatus" style="font-size:.7rem;padding:.15rem .5rem;border-radius:1rem;
+       vertical-align:middle;margin-left:.5rem;background:#2a4;color:#012">ONLINE</span>
+</h1>
+<button onclick="restartService()" title="systemctl restart video-fracture-led"
+        style="background:#622;color:#fdd;border:none;border-radius:4px;padding:.35rem .7rem;
+        cursor:pointer">restart service</button>
+<span id="restartMsg" style="font-size:.8rem;color:#888;margin-left:.5rem"></span>
+
+<div id="update_banner" hidden style="background:#3a2f00;border:1px solid #a87c00;border-radius:6px;padding:.75rem 1rem;margin:1rem 0">
   update pulled (<span id="update_sha"></span>) -- reboot to apply.
   <button id="banner_reboot_btn" style="margin-left:.5rem">Reboot now</button>
 </div>
@@ -496,8 +537,42 @@ for (const id of TEXT_FIELDS) {
   };
 }
 
+// Liveness badge, inferred from whether the regular polls succeed --
+// same pattern as double_matrix.py's setSvcStatus(): only flips to
+// OFFLINE after 2 consecutive failures (so one dropped request doesn't
+// flash it red), and shows a "back online" message when it recovers.
+// No separate health endpoint needed -- these polls already run anyway.
+let svcFails = 0, svcWasDown = false;
+function setSvcStatus(online) {
+  const el = document.getElementById('svcStatus');
+  if (online) {
+    svcFails = 0;
+    el.textContent = 'ONLINE'; el.style.background = '#2a4'; el.style.color = '#012';
+    if (svcWasDown) {
+      document.getElementById('restartMsg').textContent = 'back online';
+      svcWasDown = false;
+    }
+  } else if (++svcFails >= 2) {
+    el.textContent = 'OFFLINE'; el.style.background = '#a22'; el.style.color = '#fdd';
+    svcWasDown = true;
+  }
+}
+
+function restartService() {
+  if (!confirm('Restart the video-fracture-led service now?')) return;
+  document.getElementById('restartMsg').textContent = 'restarting...';
+  fetch('/restart', {method: 'POST'}).catch(() => {});
+}
+
 async function pollStatus() {
-  const s = await (await fetch('/status.json')).json();
+  let s;
+  try {
+    s = await (await fetch('/status.json')).json();
+    setSvcStatus(true);
+  } catch {
+    setSvcStatus(false);
+    return;
+  }
   document.getElementById('video').textContent = s.video || '(none found yet)';
   applying = true;
   for (const id of ALL_FIELDS) {
@@ -518,7 +593,14 @@ async function pollStatus() {
 }
 
 async function pollFrame() {
-  const f = await (await fetch('/frame.json')).json();
+  let f;
+  try {
+    f = await (await fetch('/frame.json')).json();
+    setSvcStatus(true);
+  } catch {
+    setSvcStatus(false);
+    return;
+  }
   if (f.w && f.h) {
     const img = ctx.createImageData(f.w, f.h);
     for (let i = 0; i < f.pixels.length; i++) {
@@ -594,7 +676,26 @@ class ControlHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        """Same scheme as scripts/status_server.py: HTTP Basic against
+        STATUS_USER/STATUS_PASS, constant-time compare. Empty AUTH_USER
+        (no /etc/default/video-fracture-led-auth yet) leaves it open --
+        matches status_server.py's own fallback, and fails safe towards
+        "can't reach it" rather than "locked out during setup"."""
+        if not AUTH_USER:
+            return True
+        expected = "Basic " + base64.b64encode(f"{AUTH_USER}:{AUTH_PASS}".encode()).decode()
+        return hmac.compare_digest(self.headers.get("Authorization", ""), expected)
+
+    def _unauthorized(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="video-fracture-led"')
+        self.end_headers()
+
     def do_GET(self):
+        if not self._authorized():
+            self._unauthorized()
+            return
         if self.path == "/":
             self._send(PAGE, "text/html; charset=utf-8")
         elif self.path == "/status.json":
@@ -622,6 +723,9 @@ class ControlHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode()) if length else {}
 
     def do_POST(self):
+        if not self._authorized():
+            self._unauthorized()
+            return
         try:
             data = self._read_json()
         except ValueError:
@@ -649,6 +753,13 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"ok": ok, "enabled": autoupdate_status()}), "application/json")
         elif self.path == "/reboot":
             self._send(json.dumps({"ok": reboot()}), "application/json")
+        elif self.path == "/restart":
+            # Reply first -- the restart kills this very process, so the
+            # actual systemctl call happens in a thread after the response
+            # is already on the wire (same pattern as double_matrix.py's
+            # _handle_restart).
+            self._send("restarting", "text/plain")
+            threading.Thread(target=restart_after_reply, daemon=True).start()
         else:
             self.send_response(404)
             self.end_headers()
@@ -661,7 +772,7 @@ def make_control_server(state, preview, source_path, port):
     ControlHandler.state = state
     ControlHandler.preview = preview
     ControlHandler.source_path = source_path
-    server = ThreadingHTTPServer(("0.0.0.0", port), ControlHandler)
+    server = ThreadingHTTPServer((bind_addr(), port), ControlHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -713,7 +824,7 @@ def main():
     source = VideoSource(args.video)
     make_control_server(state, preview, args.video, args.web_port)
 
-    print(f"running -- control page on :{args.web_port}, ctrl-c to stop")
+    print(f"running -- control page on http://{bind_addr()}:{args.web_port}/, ctrl-c to stop")
     frame_budget = 1.0 / args.fps_cap if args.fps_cap else 0.0
     try:
         while True:

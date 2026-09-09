@@ -61,6 +61,19 @@ echo "blacklist snd_bcm2835" > /etc/modprobe.d/blacklist-rgb-matrix.conf
 
 install -d -m 755 /var/lib/video-fracture
 
+echo "== config =="
+FLAGS_FILE=/etc/default/video-fracture-led
+if [ ! -f "$FLAGS_FILE" ]; then
+    cat > "$FLAGS_FILE" <<'EOF'
+# Panel calibration -- every HUB75 panel/chipset needs its own values here.
+# A blue/wrong-color tint means --led-rgb-sequence is wrong (try RBG, GRB,
+# BGR, ...). A scrambled/checkerboard image means --multiplexing is wrong
+# (try 1 through 17). After changing this file:
+#   sudo systemctl restart video-fracture-led
+FLAGS="--led-rgb-sequence RGB --multiplexing 0 --row-address-type 0"
+EOF
+fi
+
 echo "== systemd service =="
 cat > /etc/systemd/system/video-fracture-led.service <<EOF
 [Unit]
@@ -69,8 +82,9 @@ After=network.target video-fracture-fetch.service
 
 [Service]
 Type=simple
+EnvironmentFile=$FLAGS_FILE
 WorkingDirectory=$REPO_DIR
-ExecStart=/usr/bin/python3 $REPO_DIR/scripts/video-fracture-led/player.py
+ExecStart=/bin/bash -c '/usr/bin/python3 $REPO_DIR/scripts/video-fracture-led/player.py \$FLAGS'
 Restart=on-failure
 RestartSec=2
 
@@ -85,3 +99,6 @@ echo "done. now:"
 echo "  1. sudo reboot                                    # audio-disable needs this"
 echo "  2. sudo systemctl enable --now video-fracture-led"
 echo "  3. control page: http://\$(tailscale ip -4):8099/"
+echo
+echo "if the image looks wrong (color tint, scrambled/checkerboard), edit"
+echo "$FLAGS_FILE and restart the service -- see the comments in that file."

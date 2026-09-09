@@ -66,8 +66,10 @@ class State:
 
     def save(self):
         try:
-            with open(CONFIG_FILE, "w") as f:
+            tmp = CONFIG_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(self.values, f)
+            os.replace(tmp, CONFIG_FILE)
         except OSError:
             pass
 
@@ -76,10 +78,24 @@ class State:
             return dict(self.values)
 
     def apply(self, data):
+        """Bulk-update from a JSON dict (the whole `state` object the
+        control page keeps client-side, same pattern as media_matrix.py's
+        apply_wire) -- clamped/validated here rather than trusted from the
+        client, since a bad value (e.g. a NaN from a stale slider) would
+        otherwise reach the render loop and RGBMatrix calls directly."""
         with self.lock:
-            for key in DEFAULTS:
-                if key in data:
-                    self.values[key] = data[key]
+            if "brightness" in data:
+                self.values["brightness"] = max(1, min(100, int(data["brightness"])))
+            if "rotation" in data and int(data["rotation"]) in (0, 90, 180, 270):
+                self.values["rotation"] = int(data["rotation"])
+            if "fit" in data and data["fit"] in ("letterbox", "fill"):
+                self.values["fit"] = data["fit"]
+            if "scale_pct" in data:
+                self.values["scale_pct"] = max(50, min(200, int(data["scale_pct"])))
+            if "offset_x" in data:
+                self.values["offset_x"] = max(-64, min(64, int(data["offset_x"])))
+            if "offset_y" in data:
+                self.values["offset_y"] = max(-64, min(64, int(data["offset_y"])))
         self.save()
 
 
@@ -101,20 +117,43 @@ class Preview:
             return self.frame
 
 
-def build_matrix(gpio_mapping, gpio_slowdown, pwm_bits, brightness, panel):
-    """Same RGBMatrixOptions as thermal_matrix.py's build_matrix() -- single
-    64x64 panel, chain=1, parallel=1, root-owned (drop_privileges=False)."""
+def build_matrix(args, brightness):
+    """Same base RGBMatrixOptions as thermal_matrix.py's build_matrix() --
+    single 64x64 panel, chain=1, parallel=1, root-owned
+    (drop_privileges=False) -- plus the panel-identity options
+    thermal_matrix.py doesn't need to set because its panel happens to
+    match the library defaults.
+
+    A wrong color order (blue tint) or wrong multiplexing (checkerboard
+    of black squares, image scrambled) is a panel/wiring calibration
+    mismatch, not something the render loop or web page can cause --
+    every panel batch/chip needs its own values here, found by trying
+    the common options against the real hardware. Set them via
+    /etc/default/video-fracture-led (FLAGS=...) and restart the service;
+    no code change needed:
+        --led-rgb-sequence RBG   (or BGR, GRB, ... -- fixes color-swapped output)
+        --multiplexing 1         (try 1-17 -- fixes scrambled/checkerboard output)
+        --row-address-type 1     (some panels need 1-4 instead of the default 0)
+        --panel-type FM6126A     (some clone panels need an explicit init sequence)
+    """
     opts = RGBMatrixOptions()
-    opts.rows = panel
-    opts.cols = panel
+    opts.rows = args.panel
+    opts.cols = args.panel
     opts.chain_length = 1
     opts.parallel = 1
-    opts.hardware_mapping = gpio_mapping
-    opts.gpio_slowdown = gpio_slowdown
-    opts.pwm_bits = pwm_bits
+    opts.hardware_mapping = args.gpio_mapping
+    opts.gpio_slowdown = args.gpio_slowdown
+    opts.pwm_bits = args.pwm_bits
     opts.brightness = brightness
     opts.pwm_lsb_nanoseconds = 130
     opts.drop_privileges = False
+    opts.led_rgb_sequence = args.led_rgb_sequence
+    opts.multiplexing = args.multiplexing
+    opts.row_address_type = args.row_address_type
+    if args.panel_type:
+        opts.panel_type = args.panel_type
+    if args.pixel_mapper:
+        opts.pixel_mapper_config = args.pixel_mapper
     return RGBMatrix(options=opts)
 
 
@@ -199,6 +238,16 @@ PAGE = """<!doctype html>
 <h1>video-fracture-led</h1>
 <p>video: <b id="video">-</b></p>
 <canvas id="prev" width="64" height="64" style="width:256px;height:256px;image-rendering:pixelated;border:1px solid #444;background:#000"></canvas>
+<p style="color:#888;font-size:.8rem;margin-top:.5rem">
+  panel hardware: <span id="hw">-</span><br>
+  Wrong colors (e.g. blue tint) or a scrambled/checkerboard image is a
+  panel calibration mismatch, not something this page can fix live --
+  edit <code>/etc/default/video-fracture-led</code>
+  (<code>--led-rgb-sequence</code>, <code>--multiplexing</code>,
+  <code>--row-address-type</code>, <code>--panel-type</code>) and
+  <code>sudo systemctl restart video-fracture-led</code> to try different
+  values against the real hardware.
+</p>
 
 <div style="margin-top:1.5rem">
   <label>brightness <span id="brightness-v"></span></label><br>
@@ -234,27 +283,50 @@ PAGE = """<!doctype html>
 <script>
 const ctx = document.getElementById('prev').getContext('2d');
 const fields = ['brightness', 'rotation', 'fit', 'scale_pct', 'offset_x', 'offset_y'];
+const state = {};
 let applying = false;
+let debounceTimer;
 
-function post(partial) {
-  fetch('/update', {method: 'POST', body: JSON.stringify(partial)});
+// Whole-state POST, debounced 200ms -- same pattern as the double-panel
+// (media_matrix.py) control page: one consolidated request per pause in
+// dragging, instead of one request per field per input event, and no risk
+// of two field updates racing each other out of order.
+function send() {
+  fetch('/update', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                     body: JSON.stringify(state)});
+}
+function sendDebounced() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(send, 200);
 }
 
 for (const id of ['brightness', 'scale_pct', 'offset_x', 'offset_y']) {
   const el = document.getElementById(id);
   el.oninput = () => {
     document.getElementById(id + '-v').textContent = el.value;
-    if (!applying) post({[id]: Number(el.value)});
+    state[id] = Number(el.value);
+    if (!applying) sendDebounced();
   };
 }
-document.getElementById('rotation').onchange = e => post({rotation: Number(e.target.value)});
-document.getElementById('fit').onchange = e => post({fit: e.target.value});
+document.getElementById('rotation').onchange = e => {
+  state.rotation = Number(e.target.value);
+  if (!applying) sendDebounced();
+};
+document.getElementById('fit').onchange = e => {
+  state.fit = e.target.value;
+  if (!applying) sendDebounced();
+};
 
 async function pollStatus() {
   const s = await (await fetch('/status.json')).json();
   document.getElementById('video').textContent = s.video || '(none found yet)';
+  document.getElementById('hw').textContent =
+    `${s.hw.gpio_mapping}, rgb-sequence=${s.hw.led_rgb_sequence}, ` +
+    `multiplexing=${s.hw.multiplexing}, row-address-type=${s.hw.row_address_type}` +
+    (s.hw.panel_type ? `, panel-type=${s.hw.panel_type}` : '');
   applying = true;
   for (const id of ['brightness', 'rotation', 'fit', 'scale_pct', 'offset_x', 'offset_y']) {
+    state[id] = s[id];
     document.getElementById(id).value = s[id];
     const v = document.getElementById(id + '-v');
     if (v) v.textContent = s[id];
@@ -285,6 +357,7 @@ class ControlHandler(BaseHTTPRequestHandler):
     state: State = None
     preview: Preview = None
     source_path = None
+    hw_info = None
 
     def _send(self, body, content_type, code=200):
         body = body if isinstance(body, bytes) else body.encode()
@@ -300,6 +373,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         elif self.path == "/status.json":
             snap = self.state.snapshot()
             snap["video"] = os.path.basename(self.source_path) if os.path.exists(self.source_path) else None
+            snap["hw"] = self.hw_info
             self._send(json.dumps(snap), "application/json")
         elif self.path == "/frame.json":
             frame = self.preview.snapshot()
@@ -332,10 +406,11 @@ class ControlHandler(BaseHTTPRequestHandler):
         pass
 
 
-def make_control_server(state, preview, source_path, port):
+def make_control_server(state, preview, source_path, hw_info, port):
     ControlHandler.state = state
     ControlHandler.preview = preview
     ControlHandler.source_path = source_path
+    ControlHandler.hw_info = hw_info
     server = ThreadingHTTPServer(("0.0.0.0", port), ControlHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -353,17 +428,39 @@ def main():
     p.add_argument("--pwm-bits", type=int, default=8)
     p.add_argument("--web-port", type=int, default=8099)
     p.add_argument("--fps-cap", type=float, default=30.0)
+    p.add_argument("--led-rgb-sequence", default="RGB",
+                   help="color-channel order the panel actually expects, e.g. "
+                        "RBG/GRB/BGR -- wrong value shows as a color tint/swap")
+    p.add_argument("--multiplexing", type=int, default=0,
+                   help="0 for a normal/direct panel; some clone 64x64 panels "
+                        "need 1-17 -- wrong value shows as a scrambled/"
+                        "checkerboard image")
+    p.add_argument("--row-address-type", type=int, default=0,
+                   help="0 for most panels; some need 1-4 for correct row "
+                        "addressing")
+    p.add_argument("--panel-type", default="",
+                   help="explicit init sequence for some clone chipsets, "
+                        "e.g. FM6126A -- leave blank unless the panel needs it")
+    p.add_argument("--pixel-mapper", default="",
+                   help="e.g. 'Rotate:180' -- passed straight to "
+                        "RGBMatrixOptions.pixel_mapper_config")
     args = p.parse_args()
 
     state = State()
     preview = Preview()
 
-    matrix = build_matrix(args.gpio_mapping, args.gpio_slowdown, args.pwm_bits,
-                           state.snapshot()["brightness"], args.panel)
+    matrix = build_matrix(args, state.snapshot()["brightness"])
     canvas = matrix.CreateFrameCanvas()
 
     source = VideoSource(args.video)
-    make_control_server(state, preview, args.video, args.web_port)
+    hw_info = {
+        "gpio_mapping": args.gpio_mapping,
+        "led_rgb_sequence": args.led_rgb_sequence,
+        "multiplexing": args.multiplexing,
+        "row_address_type": args.row_address_type,
+        "panel_type": args.panel_type,
+    }
+    make_control_server(state, preview, args.video, hw_info, args.web_port)
 
     print(f"running -- control page on :{args.web_port}, ctrl-c to stop")
     frame_budget = 1.0 / args.fps_cap if args.fps_cap else 0.0

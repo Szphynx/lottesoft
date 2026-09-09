@@ -51,16 +51,28 @@ def run(*cmd, timeout=3):
         return ""
 
 
+def service_uptime():
+    """Hours since the service last became active, via the monotonic clock --
+    avoids parsing systemd's human timestamp, whose format shifts with locale
+    and timezone (e.g. a 'CEST' suffix instead of a numeric offset)."""
+    raw = run("systemctl", "show", SERVICE, "-p", "ActiveEnterTimestampMonotonic", "--value")
+    try:
+        active_since_us = int(raw)
+        with open("/proc/uptime") as f:
+            now_s = float(f.read().split()[0])
+    except (ValueError, TypeError, OSError, IndexError):
+        return ""
+    if active_since_us <= 0:
+        return ""
+    elapsed_h = (now_s - active_since_us / 1_000_000) / 3600
+    return f"{elapsed_h:.1f}h" if elapsed_h >= 0 else ""
+
+
 def service_info():
-    since = run("systemctl", "show", SERVICE, "-p", "ActiveEnterTimestamp", "--value")
-    uptime = ""
-    if since and since != "n/a":
-        started = time.mktime(time.strptime(since.split(" +")[0], "%a %Y-%m-%d %H:%M:%S"))
-        uptime = f"{(time.time() - started) / 3600:.1f}h"
     return {
         "host": run("hostname"),
         "active": run("systemctl", "is-active", SERVICE),
-        "uptime": uptime,
+        "uptime": service_uptime(),
     }
 
 
@@ -80,9 +92,21 @@ def preview_stats():
 
 
 def status_payload():
-    info = service_info()
-    info["camera"] = camera_detected()
-    info["preview"] = preview_stats()
+    """Each piece is independent -- one failing (a systemctl hiccup, a
+    missing i2c-tools binary) shouldn't blank the whole dashboard."""
+    info = {"host": "", "active": "unknown", "uptime": "", "camera": False, "preview": None}
+    try:
+        info.update(service_info())
+    except Exception:
+        pass
+    try:
+        info["camera"] = camera_detected()
+    except Exception:
+        pass
+    try:
+        info["preview"] = preview_stats()
+    except Exception:
+        pass
     return info
 
 
@@ -505,9 +529,21 @@ function setPill(el, ok, onText, offText) {
   el.className = "pill " + (ok ? "ok" : "bad");
 }
 
+function markUnreachable() {
+  setPill(document.getElementById("svc"), false, "online", "unreachable");
+  document.getElementById("svc-dot").className = "dot bad";
+  setPill(document.getElementById("cam"), false, "connected", "unreachable");
+  document.getElementById("uptime").textContent = "-";
+  document.getElementById("scene").textContent = "-";
+  document.getElementById("mapped").textContent = "-";
+}
+
 async function pollStatus() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
   try {
-    const r = await fetch("/api/status", {cache: "no-store"});
+    const r = await fetch("/api/status", {cache: "no-store", signal: controller.signal});
+    if (!r.ok) throw new Error("bad response");
     const s = await r.json();
     document.getElementById("host").textContent = "thermal-matrix - " + s.host;
     const online = s.active === "active";
@@ -524,7 +560,12 @@ async function pollStatus() {
       document.getElementById("scene").textContent = "-";
       document.getElementById("mapped").textContent = "-";
     }
-  } catch (e) { /* Pi rebooting or between requests -- just retry next tick */ }
+  } catch (e) {
+    // dashboard's own server (thermal-status) is down/unreachable, or timed out
+    markUnreachable();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function refreshPreview() {

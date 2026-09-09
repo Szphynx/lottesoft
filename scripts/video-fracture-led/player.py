@@ -3,9 +3,11 @@
 Loop the shared video-fracture video onto a HUB75 RGB LED matrix (Joy-IT
 RB-MatrixCtrl + rgbmatrix) -- the same controller/library thermal_matrix.py
 uses -- with a live web control page for image controls
-(brightness/rotation/fit/scale/position) and panel hardware calibration
-(led-rgb-sequence/multiplexing/row-address-type/panel-type/pixel-mapper),
-all real-time and all saveable/loadable as named presets. The current
+(hue/saturation/brightness/rotation/fit/scale/position) and, tucked away
+in a collapsed "panel hardware" section since this panel doesn't need
+them day to day, calibration knobs (led-rgb-sequence/row-address-type/
+panel-type/pixel-mapper) plus service uptime and video elapsed/remaining.
+All real-time and all saveable/loadable as named presets. The current
 state autosaves on every change and autoloads on startup, so whatever was
 last in effect (including the last preset you loaded) is what comes back
 after a restart/reboot -- no SSH needed for day-to-day calibration.
@@ -62,7 +64,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 # Fields that only change how an already-open frame is drawn -- applied
 # live every frame, no rebuild.
 IMAGE_FIELDS = {
-    "brightness": 60,     # 1-100
+    "hue": 0,              # -180..180 degrees, shifts the whole frame's hue
+    "saturation": 100,     # 0-200%, 100 = unchanged, 0 = grayscale
+    "brightness": 60,     # 1-100, panel hardware brightness
     "rotation": 0,        # 0/90/180/270
     "fit": "letterbox",   # letterbox (full frame, may letterbox) | fill (crop to fill)
     "scale_pct": 100,
@@ -74,9 +78,12 @@ IMAGE_FIELDS = {
 # library -- changing one of these can't be live-applied to the existing
 # RGBMatrix object, so the main loop tears it down and builds a fresh one
 # (see main()'s hw-change check) whenever any of these actually change.
+# multiplexing is deliberately not exposed on the control page -- this
+# panel doesn't need it (0, the default) -- but stays settable via
+# --multiplexing at first boot in case a different panel ever does.
 HW_FIELDS = {
     "led_rgb_sequence": "RGB",   # e.g. RGB/RBG/GRB/BGR -- wrong value = color tint/swap
-    "multiplexing": 0,            # 0-17 -- wrong value = scrambled/checkerboard image
+    "multiplexing": 0,            # 0-17, first-boot-only (see above)
     "row_address_type": 0,        # 0-4
     "panel_type": "",             # e.g. "FM6126A" for some clone chipsets, else blank
     "pixel_mapper": "",           # e.g. "Rotate:180", passed straight through
@@ -132,6 +139,10 @@ class State:
         client, since a bad value (e.g. a NaN from a stale slider) would
         otherwise reach the render loop and RGBMatrix calls directly."""
         with self.lock:
+            if "hue" in data:
+                self.values["hue"] = max(-180, min(180, int(data["hue"])))
+            if "saturation" in data:
+                self.values["saturation"] = max(0, min(200, int(data["saturation"])))
             if "brightness" in data:
                 self.values["brightness"] = max(1, min(100, int(data["brightness"])))
             if "rotation" in data and int(data["rotation"]) in (0, 90, 180, 270):
@@ -246,6 +257,24 @@ def bind_addr():
         return "127.0.0.1"
 
 
+def service_uptime():
+    """Seconds since video-fracture-led.service last (re)started, or None
+    if that's not knowable (not running under systemd, or never started) --
+    same approach as scripts/status_server.py's service_info()."""
+    try:
+        out = subprocess.run(["systemctl", "show", SERVICE_NAME, "-p", "ActiveEnterTimestamp",
+                               "--value"], capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out or out == "n/a":
+        return None
+    try:
+        started = time.mktime(time.strptime(out.split(" +")[0], "%a %Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+    return time.time() - started
+
+
 class Preview:
     """Last frame sent to the panel, for the control page's live pixel
     preview -- a plain copy-under-lock, same tradeoff as media_matrix.py's
@@ -322,6 +351,19 @@ def fit_frame(frame_bgr, fit, size):
     return canvas
 
 
+def adjust_hsb(frame, hue, saturation_pct):
+    """Hue shift (degrees) + saturation scale (%) on an RGB frame, via
+    HSV. No-op at defaults (hue=0, saturation=100) so this costs nothing
+    when unused. OpenCV's H channel is 0-179 (each unit = 2 degrees), so
+    a +-180 degree UI range maps to +-90 there."""
+    if hue == 0 and saturation_pct == 100:
+        return frame
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV).astype(np.int16)
+    hsv[..., 0] = (hsv[..., 0] + hue // 2) % 180
+    hsv[..., 1] = np.clip(hsv[..., 1] * (saturation_pct / 100.0), 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+
 def transform_frame(frame, rotation, scale_pct, offset_x, offset_y):
     """Rotate-about-center, scale, and X/Y pixel offset -- same knobs as
     media_matrix.py's transform_frame(), no-op when all at defaults."""
@@ -340,12 +382,19 @@ def transform_frame(frame, rotation, scale_pct, offset_x, offset_y):
 class VideoSource:
     """Loops `path` forever, transparently reopening it when its mtime
     changes -- i.e. whenever video-fracture-fetch.timer swaps in a new
-    file. No IPC needed since we just poll mtime once per frame."""
+    file. No IPC needed since we just poll mtime once per frame.
+
+    elapsed/duration (seconds, or None before a video's loaded) are
+    updated on every next_frame() call, read from the control-page HTTP
+    threads without a lock -- CPython attribute assignment is atomic and
+    this is a display-only value, so a rare read mid-update is harmless."""
 
     def __init__(self, path):
         self.path = path
         self.cap = None
         self.mtime = None
+        self.elapsed = None
+        self.duration = None
         self._open()
 
     def _open(self):
@@ -353,6 +402,9 @@ class VideoSource:
             self.cap.release()
         self.cap = cv2.VideoCapture(self.path) if os.path.exists(self.path) else None
         self.mtime = self._current_mtime()
+        fps = self.cap.get(cv2.CAP_PROP_FPS) if self.cap else 0
+        frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT) if self.cap else 0
+        self.duration = frame_count / fps if fps > 0 and frame_count > 0 else None
 
     def _current_mtime(self):
         try:
@@ -364,13 +416,17 @@ class VideoSource:
         if self._current_mtime() != self.mtime:
             self._open()
         if self.cap is None or not self.cap.isOpened():
+            self.elapsed = None
             return None
         ok, frame = self.cap.read()
         if not ok:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = self.cap.read()
             if not ok:
+                self.elapsed = None
                 return None
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.elapsed = self.cap.get(cv2.CAP_PROP_POS_FRAMES) / fps if fps > 0 else None
         return frame
 
 
@@ -392,10 +448,19 @@ PAGE = """<!doctype html>
   update pulled (<span id="update_sha"></span>) -- reboot to apply.
   <button id="banner_reboot_btn" style="margin-left:.5rem">Reboot now</button>
 </div>
-<p>video: <b id="video">-</b></p>
+<p>video: <b id="video">-</b> &middot; <b id="video_time">-</b></p>
+<p style="color:#888">service uptime: <b id="uptime">-</b></p>
 <canvas id="prev" width="64" height="64" style="width:256px;height:256px;image-rendering:pixelated;border:1px solid #444;background:#000"></canvas>
 
 <h2 style="margin-top:2rem;font-size:1rem;color:#aaa">image</h2>
+<div style="margin-top:1rem">
+  <label>hue <span id="hue-v"></span></label><br>
+  <input id="hue" type="range" min="-180" max="180" style="width:100%">
+</div>
+<div style="margin-top:1rem">
+  <label>saturation % <span id="saturation-v"></span></label><br>
+  <input id="saturation" type="range" min="0" max="200" style="width:100%">
+</div>
 <div style="margin-top:1rem">
   <label>brightness <span id="brightness-v"></span></label><br>
   <input id="brightness" type="range" min="1" max="100" style="width:100%">
@@ -427,35 +492,35 @@ PAGE = """<!doctype html>
   <input id="offset_y" type="range" min="-32" max="32" style="width:100%">
 </div>
 
-<h2 style="margin-top:2rem;font-size:1rem;color:#aaa">panel hardware</h2>
-<p style="color:#888;font-size:.8rem">
-  Wrong colors (tint/swap) or a scrambled/checkerboard image is a panel
-  calibration mismatch, not a video problem -- these apply live (the
-  panel briefly blanks while it rebuilds) so you can dial them in by eye.
-</p>
-<div style="margin-top:1rem">
-  <label>led-rgb-sequence</label><br>
-  <select id="led_rgb_sequence" style="width:100%">
-    <option>RGB</option><option>RBG</option><option>GRB</option>
-    <option>GBR</option><option>BRG</option><option>BGR</option>
-  </select>
-</div>
-<div style="margin-top:1rem">
-  <label>multiplexing <span id="multiplexing-v"></span></label><br>
-  <input id="multiplexing" type="range" min="0" max="17" style="width:100%">
-</div>
-<div style="margin-top:1rem">
-  <label>row-address-type <span id="row_address_type-v"></span></label><br>
-  <input id="row_address_type" type="range" min="0" max="4" style="width:100%">
-</div>
-<div style="margin-top:1rem">
-  <label>panel-type (blank unless needed, e.g. FM6126A)</label><br>
-  <input id="panel_type" type="text" style="width:100%;box-sizing:border-box">
-</div>
-<div style="margin-top:1rem">
-  <label>pixel-mapper (blank unless needed, e.g. Rotate:180)</label><br>
-  <input id="pixel_mapper" type="text" style="width:100%;box-sizing:border-box">
-</div>
+<details style="margin-top:2rem">
+  <summary style="font-size:1rem;color:#aaa;cursor:pointer">panel hardware (rarely needed)</summary>
+  <p style="color:#888;font-size:.8rem">
+    Wrong colors (tint/swap) or a scrambled/checkerboard image is a panel
+    calibration mismatch, not a video problem -- these apply live (the
+    panel briefly blanks while it rebuilds) so you can dial them in by eye.
+    This panel doesn't need multiplexing, so that's not here -- it's still
+    settable via --multiplexing at first boot if a different panel ever does.
+  </p>
+  <div style="margin-top:1rem">
+    <label>led-rgb-sequence</label><br>
+    <select id="led_rgb_sequence" style="width:100%">
+      <option>RGB</option><option>RBG</option><option>GRB</option>
+      <option>GBR</option><option>BRG</option><option>BGR</option>
+    </select>
+  </div>
+  <div style="margin-top:1rem">
+    <label>row-address-type <span id="row_address_type-v"></span></label><br>
+    <input id="row_address_type" type="range" min="0" max="4" style="width:100%">
+  </div>
+  <div style="margin-top:1rem">
+    <label>panel-type (blank unless needed, e.g. FM6126A)</label><br>
+    <input id="panel_type" type="text" style="width:100%;box-sizing:border-box">
+  </div>
+  <div style="margin-top:1rem">
+    <label>pixel-mapper (blank unless needed, e.g. Rotate:180)</label><br>
+    <input id="pixel_mapper" type="text" style="width:100%;box-sizing:border-box">
+  </div>
+</details>
 
 <h2 style="margin-top:2rem;font-size:1rem;color:#aaa">presets</h2>
 <p style="color:#888;font-size:.8rem">
@@ -488,7 +553,7 @@ PAGE = """<!doctype html>
 
 <script>
 const ctx = document.getElementById('prev').getContext('2d');
-const RANGE_FIELDS = ['brightness', 'scale_pct', 'offset_x', 'offset_y', 'multiplexing', 'row_address_type'];
+const RANGE_FIELDS = ['hue', 'saturation', 'brightness', 'scale_pct', 'offset_x', 'offset_y', 'row_address_type'];
 const SELECT_FIELDS = ['rotation', 'fit', 'led_rgb_sequence'];
 const TEXT_FIELDS = ['panel_type', 'pixel_mapper'];
 const ALL_FIELDS = [...RANGE_FIELDS, ...SELECT_FIELDS, ...TEXT_FIELDS];
@@ -564,6 +629,14 @@ function restartService() {
   fetch('/restart', {method: 'POST'}).catch(() => {});
 }
 
+function fmtDuration(totalSeconds) {
+  if (totalSeconds == null) return '-';
+  const s = Math.max(0, Math.round(totalSeconds));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
 async function pollStatus() {
   let s;
   try {
@@ -574,6 +647,14 @@ async function pollStatus() {
     return;
   }
   document.getElementById('video').textContent = s.video || '(none found yet)';
+  document.getElementById('uptime').textContent = fmtDuration(s.service_uptime);
+  if (s.video_elapsed != null && s.video_duration != null) {
+    const remaining = s.video_duration - s.video_elapsed;
+    document.getElementById('video_time').textContent =
+      `${fmtDuration(s.video_elapsed)} elapsed, ${fmtDuration(remaining)} remaining`;
+  } else {
+    document.getElementById('video_time').textContent = '';
+  }
   applying = true;
   for (const id of ALL_FIELDS) {
     state[id] = s[id];
@@ -667,6 +748,7 @@ class ControlHandler(BaseHTTPRequestHandler):
     state: State = None
     preview: Preview = None
     source_path = None
+    video_source: VideoSource = None
 
     def _send(self, body, content_type, code=200):
         body = body if isinstance(body, bytes) else body.encode()
@@ -703,6 +785,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             snap["video"] = os.path.basename(self.source_path) if os.path.exists(self.source_path) else None
             snap["update_pending"] = update_pending()
             snap["autoupdate_enabled"] = autoupdate_status()
+            snap["service_uptime"] = service_uptime()
+            snap["video_elapsed"] = self.video_source.elapsed
+            snap["video_duration"] = self.video_source.duration
             self._send(json.dumps(snap), "application/json")
         elif self.path == "/frame.json":
             frame = self.preview.snapshot()
@@ -768,10 +853,11 @@ class ControlHandler(BaseHTTPRequestHandler):
         pass
 
 
-def make_control_server(state, preview, source_path, port):
+def make_control_server(state, preview, video_source, port):
     ControlHandler.state = state
     ControlHandler.preview = preview
-    ControlHandler.source_path = source_path
+    ControlHandler.source_path = video_source.path
+    ControlHandler.video_source = video_source
     server = ThreadingHTTPServer((bind_addr(), port), ControlHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -822,7 +908,7 @@ def main():
     canvas = matrix.CreateFrameCanvas()
 
     source = VideoSource(args.video)
-    make_control_server(state, preview, args.video, args.web_port)
+    make_control_server(state, preview, source, args.web_port)
 
     print(f"running -- control page on http://{bind_addr()}:{args.web_port}/, ctrl-c to stop")
     frame_budget = 1.0 / args.fps_cap if args.fps_cap else 0.0
@@ -848,6 +934,7 @@ def main():
             frame = source.next_frame()
             if frame is not None:
                 rgb = fit_frame(frame, snap["fit"], args.panel)
+                rgb = adjust_hsb(rgb, snap["hue"], snap["saturation"])
                 rgb = transform_frame(rgb, snap["rotation"], snap["scale_pct"],
                                        snap["offset_x"], snap["offset_y"])
                 matrix.brightness = snap["brightness"]

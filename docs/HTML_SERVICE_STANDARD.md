@@ -17,8 +17,24 @@ Reference implementation: `scripts/video-fracture-led/player.py`.
 | 9 | Liveness badge | ONLINE/OFFLINE from existing polls. Flips OFFLINE after 2 consecutive failures. "back online" on recovery. |
 | 10 | Service uptime | `systemctl show <service> -p ActiveEnterTimestamp`. |
 | 11 | Page shell | `font:16px monospace;background:#111;color:#eee;max-width:32rem;margin:2rem auto;padding:0 1rem`. `<h1>` 1.1rem + inline badge. `<h2>` 1rem `#aaa`. Rare controls in collapsed `<details>`. |
-| 12 | `/status.json` fields | `host`, `active`, `service_uptime`, `cpu_temp_c` + service-specific. |
+| 12 | `/status.json` fields | `host`, `active`, `version`, `service_uptime`, `cpu_temp_c` + service-specific. `version` = `<branch>@<short-sha>`, computed once at start. |
 | 13 | PNG preview | `/preview.png` binary. Not JSON pixel arrays — fleet dashboard can't consume those. |
+
+## Minimum remote-readable set
+
+What a command center must be able to read from any node. Everything here is
+read-only — control is separate.
+
+| Field | Source | Status |
+|---|---|---|
+| Preview | `/preview.png` | ❌ only `main`. Others serve JSON pixels — unusable by a fleet view. |
+| Service running | `/status.json` `active` + endpoint answering at all | ✅ |
+| Version | `/status.json` `version` (`<branch>@<sha>`) | ✅ video-fracture-led only |
+| Uptime | `/status.json` `service_uptime` | ✅ where present |
+| Last seen | **Hub-side, not a Pi field.** Hub records the timestamp of each node's last successful poll/post. | n/a until hub exists |
+
+`last_seen` deliberately doesn't live on the Pi: a node that's down can't
+report that it's down. It has to be derived by whatever is polling.
 
 ## Current state
 
@@ -37,7 +53,7 @@ Reference implementation: `scripts/video-fracture-led/player.py`.
 | 9 Badge | ✅ | ❌ | ❌ | ✅ | ✅ |
 | 10 Uptime | ✅ | ✅ | ❌ | ❌ | ✅ |
 | 11 Shell | ⚠️ variant | ⚠️ variant | ✅ | ✅ | ✅ |
-| 12 status.json | ✅ | ⚠️ no cpu_temp | ❌ | ❌ | ⚠️ no host/active/cpu_temp |
+| 12 status.json | ⚠️ no version | ⚠️ no version/cpu_temp | ❌ | ❌ | ✅ |
 | 13 PNG preview | ✅ | ❌ | ❌ | ❌ | ❌ |
 
 ## Work needed, per branch
@@ -48,9 +64,9 @@ Reference implementation: `scripts/video-fracture-led/player.py`.
 
 **`caveman-ultra-ponytail-vshfzk`** (`double_matrix.py`): add bind_addr + auth, autosave-on-change, named presets, self-update, reboot btn, uptime, status.json fields, PNG preview.
 
-**`tailscale-rpi-install-itd96p`** (`video-fracture-led`): add PNG preview, add `host`/`active`/`cpu_temp_c` to status.json.
+**`tailscale-rpi-install-itd96p`** (`video-fracture-led`): add PNG preview. (status.json contract done.)
 
-**`main`**: add self-update. Align page shell.
+**`main`**: add self-update, add `version` to status.json. Align page shell.
 
 **`rpi3-multi-display-*`, `tailscale-matrix-led-fracture-2`, `bodyheat-color-mode-led`**: no control service of their own — only the stale status_server backport applies.
 

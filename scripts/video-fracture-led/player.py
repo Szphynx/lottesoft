@@ -38,6 +38,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -55,6 +56,7 @@ CONFIGS_DIR = "/var/lib/video-fracture/led-configs"            # named, explicit
 UPDATE_PENDING_FILE = "/var/lib/video-fracture/led-update-pending"  # written by auto-update.sh
 AUTOUPDATE_TIMER = "video-fracture-led-autoupdate.timer"
 SERVICE_NAME = "video-fracture-led"
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 AUTH_USER = os.environ.get("STATUS_USER", "")
 AUTH_PASS = os.environ.get("STATUS_PASS", "")
@@ -281,6 +283,32 @@ def service_uptime():
     return time.time() - started
 
 
+def software_version():
+    """'<branch>@<short-sha>' of the checked-out repo, so a command center
+    can tell which Pi is running which build. Computed once at import --
+    picking up a pull needs a restart anyway, and this is polled every
+    couple of seconds."""
+    try:
+        def git(*args):
+            return subprocess.run(["git", "-C", REPO_DIR, *args], capture_output=True,
+                                   text=True, timeout=3).stdout.strip()
+        sha, branch = git("rev-parse", "--short", "HEAD"), git("rev-parse", "--abbrev-ref", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"{branch}@{sha}" if sha else None
+
+
+VERSION = software_version()
+
+
+def cpu_temp_c():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return round(int(f.read().strip()) / 1000, 1)
+    except (OSError, ValueError):
+        return None
+
+
 class Preview:
     """Last frame sent to the panel, for the control page's live pixel
     preview -- a plain copy-under-lock, same tradeoff as media_matrix.py's
@@ -467,7 +495,7 @@ PAGE = """<!doctype html>
   <button id="banner_reboot_btn" style="margin-left:.5rem">Reboot now</button>
 </div>
 <p>video: <b id="video">-</b> &middot; <b id="video_time">-</b></p>
-<p style="color:#888">service uptime: <b id="uptime">-</b></p>
+<p style="color:#888">uptime: <b id="uptime">-</b> &middot; version: <b id="version">-</b> &middot; cpu: <b id="cpu">-</b></p>
 <canvas id="prev" width="64" height="64" style="width:256px;height:256px;image-rendering:pixelated;border:1px solid #444;background:#000"></canvas>
 
 <h2 style="margin-top:2rem;font-size:1rem;color:#aaa">image</h2>
@@ -680,6 +708,8 @@ async function pollStatus() {
   }
   document.getElementById('video').textContent = s.video || '(none found yet)';
   document.getElementById('uptime').textContent = fmtDuration(s.service_uptime);
+  document.getElementById('version').textContent = s.version || '-';
+  document.getElementById('cpu').textContent = s.cpu_temp_c != null ? s.cpu_temp_c + ' C' : '-';
   if (s.video_elapsed != null && s.video_duration != null) {
     const remaining = s.video_duration - s.video_elapsed;
     document.getElementById('video_time').textContent =
@@ -819,6 +849,14 @@ class ControlHandler(BaseHTTPRequestHandler):
             snap["video"] = os.path.basename(self.source_path) if os.path.exists(self.source_path) else None
             snap["update_pending"] = update_pending()
             snap["autoupdate_enabled"] = autoupdate_status()
+            # Shared contract fields (see docs/HTML_SERVICE_STANDARD.md) --
+            # "active" is a constant because this endpoint answering at all
+            # is what proves the service is up; no point shelling out to
+            # systemctl to ask about ourselves every poll.
+            snap["host"] = socket.gethostname()
+            snap["active"] = "active"
+            snap["version"] = VERSION
+            snap["cpu_temp_c"] = cpu_temp_c()
             snap["service_uptime"] = service_uptime()
             snap["video_elapsed"] = self.video_source.elapsed
             snap["video_duration"] = self.video_source.duration

@@ -57,6 +57,7 @@ UPDATE_PENDING_FILE = "/var/lib/video-fracture/led-update-pending"  # written by
 AUTOUPDATE_TIMER = "video-fracture-led-autoupdate.timer"
 SERVICE_NAME = "video-fracture-led"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PORT_BAND = 8100   # see docs/HTML_SERVICE_STANDARD.md -- band per service type
 
 AUTH_USER = os.environ.get("STATUS_USER", "")
 AUTH_PASS = os.environ.get("STATUS_PASS", "")
@@ -309,6 +310,19 @@ def cpu_temp_c():
         return None
 
 
+def default_web_port():
+    """PORT_BAND + the trailing number in the hostname: fracture4 -> 8104,
+    fracture5 -> 8105. Every Pi gets its own port with no central registry
+    to keep in sync, and the port itself says which Pi you're looking at.
+    Falls back to the bare band when the hostname has no trailing number
+    (or an implausibly large one). --web-port always overrides."""
+    match = re.search(r"(\d+)$", socket.gethostname())
+    if not match:
+        return PORT_BAND
+    number = int(match.group(1))
+    return PORT_BAND + number if number < 100 else PORT_BAND
+
+
 class Preview:
     """Last frame sent to the panel, for the control page's live pixel
     preview -- a plain copy-under-lock, same tradeoff as media_matrix.py's
@@ -478,12 +492,13 @@ class VideoSource:
 
 PAGE = """<!doctype html>
 <meta charset="utf-8">
-<title>video-fracture-led</title>
+<title>__HOST__ &middot; video-fracture-led</title>
 <body style="font:16px monospace;background:#111;color:#eee;
              max-width:32rem;margin:2rem auto;padding:0 1rem">
-<h1 style="font-size:1.1rem">video-fracture-led
+<h1 style="font-size:1.1rem">__HOST__
   <span id="svcStatus" style="font-size:.7rem;padding:.15rem .5rem;border-radius:1rem;
        vertical-align:middle;margin-left:.5rem;background:#2a4;color:#012">ONLINE</span>
+  <span style="font-size:.7rem;color:#888;font-weight:normal">video-fracture-led</span>
 </h1>
 <button onclick="restartService()" title="systemctl restart video-fracture-led"
         style="background:#622;color:#fdd;border:none;border-radius:4px;padding:.35rem .7rem;
@@ -843,7 +858,12 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._unauthorized()
             return
         if self.path == "/":
-            self._send(PAGE, "text/html; charset=utf-8")
+            # Hostname in the title/header so several of these open in
+            # tabs at once stay tellable apart (same convention as
+            # status_server.py). Hostnames are alnum/hyphen/dot, so there's
+            # nothing to escape here.
+            self._send(PAGE.replace("__HOST__", socket.gethostname()),
+                        "text/html; charset=utf-8")
         elif self.path == "/status.json":
             snap = self.state.snapshot()
             snap["video"] = os.path.basename(self.source_path) if os.path.exists(self.source_path) else None
@@ -945,7 +965,9 @@ def main():
                    help="'regular' for direct wiring, 'adafruit-hat' for a bonnet")
     p.add_argument("--gpio-slowdown", type=int, default=4)
     p.add_argument("--pwm-bits", type=int, default=8)
-    p.add_argument("--web-port", type=int, default=8099)
+    p.add_argument("--web-port", type=int, default=default_web_port(),
+                   help="defaults to 8100 + the hostname's trailing number "
+                        "(fracture4 -> 8104)")
     p.add_argument("--fps-cap", type=float, default=30.0)
     p.add_argument("--led-rgb-sequence", default="RGB",
                    help="first-boot seed only -- once the control page has "

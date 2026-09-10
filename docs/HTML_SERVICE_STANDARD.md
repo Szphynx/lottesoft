@@ -105,22 +105,38 @@ systemd service (`video-fracture-tft.service`) and is fine as-is.
 
 **`rpi3-multi-display-*`, `tailscale-matrix-led-fracture-2`, `bodyheat-color-mode-led`**: no control service of their own — only the stale status_server backport applies.
 
-## Port registry
+## Ports: band per service + host number
 
-| Port | Service | Status |
+Port = **service band + the trailing number in the hostname**.
+`fracture4` → `8104`, `fracture5` → `8105`. No registry to keep in sync,
+no collisions possible, and the port says which Pi you're on.
+`--web-port` always overrides. Hostname with no trailing number, or one
+≥100, falls back to the bare band.
+
+| Band | Service | Status |
 |---|---|---|
-| 8787 | `status_server.py` (per-Pi health, every Pi) | live |
-| 8098 | `media_matrix.py` (WS2812 double panel) | live |
-| 8099 | `double_matrix.py` (MAX7219 six-module) | live |
-| 8099 | `video-fracture-led/player.py` | live — **collides with above** |
-| 8101 | `video-fracture` HDMI looper | proposed, not built |
-| 8102 | `video-fracture-tft` | proposed, not built |
+| 8787 (fixed) | `status_server.py` | live — **stays fixed**, `main`'s `dashboard.html` defaults to it |
+| 8100 + N | `video-fracture-led` | live |
+| 8200 + N | `video-fracture` HDMI looper | not built |
+| 8300 + N | `video-fracture-tft` | not built |
+| 8400 + N | `media_matrix.py` | live on 8098, needs migrating |
+| 8500 + N | `double_matrix.py` | live on 8099, needs migrating |
+
+Resolves the old 8099 collision: `video-fracture-led` and `double_matrix`
+are now in different bands.
+
+## Page identity
+
+`<title>` and `<h1>` lead with the **hostname**, not the service name —
+several of these end up open in tabs at once and the hostname is the
+distinguishing part. Service name goes after, small and dim.
+`status_server.py` already does this; everything else should match.
 
 ## Conflicts
 
 | Conflict | Detail | Decision needed |
 |---|---|---|
-| Port 8099 | `double_matrix.py` and `video-fracture-led` both default to it. No live clash (different Pis) — breaks if ever co-hosted. | Move one. `video-fracture-led` → 8100 changes a live bookmarked URL. |
+| ~~Port 8099~~ | Resolved by the band scheme — `video-fracture-led` now 8100+N, `double_matrix` moves to 8500+N. | Done for video-fracture-led; double_matrix still to migrate. Live bookmarks change (`:8099` → `:8104` on fracture4). |
 | Autoupdate behaviour | `media_matrix` pulls + restarts silently; `video-fracture-led` pulls + waits for human. | Pick one. Notify-only recommended for live installations. |
 | Preset vs config-file | `media_matrix`/`double_matrix` use a single `state_file` + `/config.json` download. `video-fracture-led` uses autosaved current state + named presets dir. | Converge on the latter; keep `/config.json` download as export. |
 | Password in git | `video-fracture-led` auth password is hardcoded (`conejo`) in the install script, not generated per-Pi. | Fine for private repo; revisit if repo is shared. |

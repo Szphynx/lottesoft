@@ -64,8 +64,12 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 # Fields that only change how an already-open frame is drawn -- applied
 # live every frame, no rebuild.
 IMAGE_FIELDS = {
-    "hue": 0,              # -180..180 degrees, shifts the whole frame's hue
-    "saturation": 100,     # 0-200%, 100 = unchanged, 0 = grayscale
+    "tint": False,         # off: hue/saturation adjust the source's existing
+                           # color (no-op on grayscale source). on: colorize --
+                           # force every pixel to hue/saturation, using only
+                           # brightness from the source (works on grayscale).
+    "hue": 0,              # -180..180 degrees
+    "saturation": 100,     # 0-200%, meaning depends on tint (see adjust_hsb)
     "brightness": 60,     # 1-100, panel hardware brightness
     "rotation": 0,        # 0/90/180/270
     "fit": "letterbox",   # letterbox (full frame, may letterbox) | fill (crop to fill)
@@ -139,6 +143,8 @@ class State:
         client, since a bad value (e.g. a NaN from a stale slider) would
         otherwise reach the render loop and RGBMatrix calls directly."""
         with self.lock:
+            if "tint" in data:
+                self.values["tint"] = bool(data["tint"])
             if "hue" in data:
                 self.values["hue"] = max(-180, min(180, int(data["hue"])))
             if "saturation" in data:
@@ -351,16 +357,28 @@ def fit_frame(frame_bgr, fit, size):
     return canvas
 
 
-def adjust_hsb(frame, hue, saturation_pct):
-    """Hue shift (degrees) + saturation scale (%) on an RGB frame, via
-    HSV. No-op at defaults (hue=0, saturation=100) so this costs nothing
-    when unused. OpenCV's H channel is 0-179 (each unit = 2 degrees), so
-    a +-180 degree UI range maps to +-90 there."""
-    if hue == 0 and saturation_pct == 100:
+def adjust_hsb(frame, hue, saturation_pct, tint):
+    """Hue/saturation on an RGB frame, via HSV. Two modes:
+      - relative (tint=False, default): scales the frame's EXISTING
+        saturation and shifts its EXISTING hue. A no-op on truly
+        grayscale source, since there's no saturation there to scale --
+        that's not a bug, a 0-saturation pixel has no hue to shift either.
+      - tint (tint=True): colorize -- forces every pixel to the chosen
+        hue/saturation, keeping only the source's brightness (V) for
+        shading. This is how you add color to black & white footage (or
+        deliberately flatten already-colorful video to one tone).
+    No-op in relative mode at defaults (hue=0, saturation=100), so this
+    costs nothing when unused. OpenCV's H channel is 0-179 (each unit =
+    2 degrees), so the +-180 degree UI range maps to +-90 there."""
+    if not tint and hue == 0 and saturation_pct == 100:
         return frame
     hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV).astype(np.int16)
-    hsv[..., 0] = (hsv[..., 0] + hue // 2) % 180
-    hsv[..., 1] = np.clip(hsv[..., 1] * (saturation_pct / 100.0), 0, 255)
+    if tint:
+        hsv[..., 0] = (hue // 2) % 180
+        hsv[..., 1] = max(0, min(255, round(saturation_pct / 100 * 255)))
+    else:
+        hsv[..., 0] = (hsv[..., 0] + hue // 2) % 180
+        hsv[..., 1] = np.clip(hsv[..., 1] * (saturation_pct / 100.0), 0, 255)
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
 
@@ -453,6 +471,16 @@ PAGE = """<!doctype html>
 <canvas id="prev" width="64" height="64" style="width:256px;height:256px;image-rendering:pixelated;border:1px solid #444;background:#000"></canvas>
 
 <h2 style="margin-top:2rem;font-size:1rem;color:#aaa">image</h2>
+<div style="margin-top:1rem">
+  <label><input id="tint" type="checkbox"> colorize (tint)</label>
+  <p style="color:#888;font-size:.8rem;margin:.25rem 0 0">
+    Off: hue/saturation nudge whatever color the video already has (no
+    effect on black &amp; white source -- there's no saturation there to
+    adjust). On: forces the whole frame to the hue/saturation below,
+    using only its brightness for shading -- this is what colorizes
+    black &amp; white footage.
+  </p>
+</div>
 <div style="margin-top:1rem">
   <label>hue <span id="hue-v"></span></label><br>
   <input id="hue" type="range" min="-180" max="180" style="width:100%">
@@ -601,6 +629,10 @@ for (const id of TEXT_FIELDS) {
     if (!applying) sendDebounced();
   };
 }
+document.getElementById('tint').onchange = e => {
+  state.tint = e.target.checked;
+  if (!applying) sendDebounced();
+};
 
 // Liveness badge, inferred from whether the regular polls succeed --
 // same pattern as double_matrix.py's setSvcStatus(): only flips to
@@ -662,6 +694,8 @@ async function pollStatus() {
     const v = document.getElementById(id + '-v');
     if (v) v.textContent = s[id];
   }
+  state.tint = s.tint;
+  document.getElementById('tint').checked = !!s.tint;
   applying = false;
 
   const banner = document.getElementById('update_banner');
@@ -934,7 +968,7 @@ def main():
             frame = source.next_frame()
             if frame is not None:
                 rgb = fit_frame(frame, snap["fit"], args.panel)
-                rgb = adjust_hsb(rgb, snap["hue"], snap["saturation"])
+                rgb = adjust_hsb(rgb, snap["hue"], snap["saturation"], snap["tint"])
                 rgb = transform_frame(rgb, snap["rotation"], snap["scale_pct"],
                                        snap["offset_x"], snap["offset_y"])
                 matrix.brightness = snap["brightness"]

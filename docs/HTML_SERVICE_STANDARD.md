@@ -36,6 +36,39 @@ read-only — control is separate.
 `last_seen` deliberately doesn't live on the Pi: a node that's down can't
 report that it's down. It has to be derived by whatever is polling.
 
+## Services with no web page at all
+
+| Service | Where | Deployed | Control today |
+|---|---|---|---|
+| `video-fracture` (HDMI looper, mpv) | `tailscale-rpi-install-itd96p` | ~3-4 Pis | SSH only |
+| `video-fracture-tft` (SPI TFT looper, ffmpeg→fb) | `tailscale-rpi-install-itd96p` | 1 Pi (fracture5) | SSH: edit `/etc/default/video-fracture-tft`, restart service |
+
+Largest deployment in the fleet, zero visibility. Highest-value gap.
+
+**HDMI looper is cheap to do** — `play-loop.sh` already runs mpv with
+`--input-ipc-server=/tmp/mpv-fracture.sock`, which gives for free:
+
+| Standard requirement | mpv IPC |
+|---|---|
+| PNG preview | `screenshot-to-file <path> video` — captures the real HDMI output |
+| Realtime image control | `brightness`/`contrast`/`saturation`/`gamma`/`hue` properties, -100..100, live |
+| Elapsed/remaining | `time-pos` / `duration` |
+| Current file | `filename` |
+| Pause/seek | `pause`, `seek` |
+
+No re-encode, no new render loop — the page is a thin shell over the
+socket that already exists.
+
+**TFT variant is harder**: ffmpeg pipe to framebuffer, no IPC. Controls
+(`TFT_ROTATE_DEG`/`TFT_FPS`/`TFT_RED_TINT`) are env vars needing a service
+restart, so "realtime" means restart-on-change. Preview would come from
+reading `/dev/fb1` directly rather than from the player.
+
+**Wrinkle for both**: neither is a systemd service in the normal sense —
+HDMI looper is an XDG autostart desktop app, so `service_uptime` needs to
+come from process start time, not `ActiveEnterTimestamp`. TFT one *is* a
+systemd service (`video-fracture-tft.service`) and is fine as-is.
+
 ## Current state
 
 ✅ present · ⚠️ partial · ❌ missing · — n/a
@@ -66,9 +99,22 @@ report that it's down. It has to be derived by whatever is polling.
 
 **`tailscale-rpi-install-itd96p`** (`video-fracture-led`): add PNG preview. (status.json contract done.)
 
+**`tailscale-rpi-install-itd96p`** (`video-fracture` HDMI + TFT): build a control page from scratch — nothing exists. See "Services with no web page at all". Port assignment needed (8101/8102 suggested).
+
 **`main`**: add self-update, add `version` to status.json. Align page shell.
 
 **`rpi3-multi-display-*`, `tailscale-matrix-led-fracture-2`, `bodyheat-color-mode-led`**: no control service of their own — only the stale status_server backport applies.
+
+## Port registry
+
+| Port | Service | Status |
+|---|---|---|
+| 8787 | `status_server.py` (per-Pi health, every Pi) | live |
+| 8098 | `media_matrix.py` (WS2812 double panel) | live |
+| 8099 | `double_matrix.py` (MAX7219 six-module) | live |
+| 8099 | `video-fracture-led/player.py` | live — **collides with above** |
+| 8101 | `video-fracture` HDMI looper | proposed, not built |
+| 8102 | `video-fracture-tft` | proposed, not built |
 
 ## Conflicts
 

@@ -139,7 +139,7 @@ distinguishing part. Service name goes after, small and dim.
 | ~~Port 8099~~ | Resolved by the band scheme — `video-fracture-led` now 8100+N, `double_matrix` moves to 8500+N. | Done for video-fracture-led; double_matrix still to migrate. Live bookmarks change (`:8099` → `:8104` on fracture4). |
 | Autoupdate behaviour | `media_matrix` pulls + restarts silently; `video-fracture-led` pulls + waits for human. | Pick one. Notify-only recommended for live installations. |
 | Preset vs config-file | `media_matrix`/`double_matrix` use a single `state_file` + `/config.json` download. `video-fracture-led` uses autosaved current state + named presets dir. | Converge on the latter; keep `/config.json` download as export. |
-| Password in git | `video-fracture-led` auth password is hardcoded (`conejo`) in the install script, not generated per-Pi. | Fine for private repo; revisit if repo is shared. |
+| Credentials | Repo is **public**. Passwords are generated per-Pi into `/etc/default/<service>-auth` (600) and must never be committed. | Resolved — do not reintroduce literals. |
 | Backport vs divergence | Branches have unmerged, un-cross-pollinated work. Backporting `main`'s files may conflict with local edits. | Decide whether branches merge to `main` first, or files are copied over. |
 
 ## Future: Commander Lotte

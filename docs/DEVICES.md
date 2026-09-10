@@ -2,28 +2,37 @@
 
 Update list detail: `docs/HTML_SERVICE_STANDARD.md`.
 
-## Confirmed
+## Tailnet
 
-| Host | Hardware | Software | Web page | Port |
-|---|---|---|---|---|
-| `fracture4` | Pi + HUB75 64x64 (Joy-IT RB-MatrixCtrl) | `video-fracture` (HDMI) + `video-fracture-led` | led: ✅ · HDMI: ❌ | 8104 (was 8099) |
-| `fracture5` | Pi + SPI TFT panel | `video-fracture` (HDMI) + `video-fracture-tft` | ❌ none | — |
+> **This repo is public.** Tailnet addresses and per-device access details
+> are deliberately not recorded here — see the private inventory instead.
+> Enumerate live with `tailscale status` or the Tailscale admin console.
 
-## Named in branches, hostname unconfirmed
+All Pi 4 / `Linux 6.18.34+rpt-rpi-v8`, tailscale 1.102.3, SSH enabled.
 
-| Ref | Hardware | Software | Web page | Port |
-|---|---|---|---|---|
-| "fracture 2" (branch `tailscale-matrix-led-fracture-2`) | Pi 4 + HUB75 64x64 | `thermal_matrix.py` | status only | 8787 |
-| thermal cam (branch `bodyheat-color-mode-led`) | Pi 4 + MLX90640 + HUB75 64x64 | `thermal_matrix.py` | status only | 8787 |
-| WS2812 rig (branch `rp3-led-matrices`) | Pi 3 + 2× WS2812 32x8 | `media_matrix.py` | ✅ control | 8098 |
-| MAX7219 rig (branch `caveman-ultra-ponytail`) | Pi 3 + 6× MAX7219 8x32 SPI | `double_matrix.py` | ✅ control | 8099 |
-| multi-display (branches `rpi3-multi-display-*`) | Pi 3 + SPI displays + Pico OLED | `display_test.py`, `pico_oled_test.py` | ❌ none (test scripts) | — |
+| Machine | Role | Software | Target port |
+|---|---|---|---|
+| `fracture1` | ❓ unknown | ❓ | — |
+| `fracture1-thermal-cam` | thermal camera | `thermal_matrix.py` | 8787 fixed |
+| `fracture2-matrix-led-strips` | LED strips | ❓ `media_matrix.py`? | 8402 |
+| `fracture4-3-hdmivideo` | HDMI video looper | `video-fracture` | 8204 (not built) |
+| `fracture4-blue-belle` | ❓ unknown | ❓ | — |
+| `fracture5-tftvideo` | SPI TFT video looper | `video-fracture` + `-tft` | 8305 (not built) |
+| `fracture6-ledloop` | HUB75 video looper | `video-fracture-led` | 8106 |
+| `fracture6-securicam` | surveillance camera | ❓ not in this repo | — |
+| `fracture7-doublestrip` | MAX7219 double matrix | `double_matrix.py` | 8507 |
 
-Plus **1-2 more HDMI looper Pis** (user counts 3-4 total; only fracture4/fracture5 named in repo).
+Tailscale machine name ≠ Linux hostname. Port derives from the **Linux**
+hostname's first number (`fracture6-ledloop` → 8106, `fracture6` → 8106).
 
-Repo contains no device registry — the above is inferred from branch names
-and script comments. To make it authoritative: `tailscale status` on any
-node, or https://login.tailscale.com/admin/machines.
+### Unmapped branches
+
+| Branch | Hardware | Which machine? |
+|---|---|---|
+| `rp3-led-matrices` (`media_matrix.py`) | Pi 3 + 2× WS2812 32x8 | likely `fracture2-matrix-led-strips` — unconfirmed |
+| `bodyheat-color-mode-led` (`thermal_matrix.py`) | Pi 4 + MLX90640 + HUB75 | likely `fracture1-thermal-cam` |
+| `tailscale-matrix-led-fracture-2` (`thermal_matrix.py`) | Pi 4 + HUB75 | name says fracture2, but that machine reads as LED strips |
+| `rpi3-multi-display-*` | Pi 3 + SPI displays + Pico OLED | unknown — test scripts only, may not be deployed |
 
 ## What needs updating
 
@@ -103,8 +112,9 @@ sudo git config --global --add safe.directory ~/lottesoft
 on fracture4 (8100 + hostname number) the moment it restarts. Update
 bookmarks.
 
-**Auth appears on restart.** `video-fracture-led` now requires a login
-(`admin` / `conejo`) and binds tailnet-only. LAN access stops working.
+**Auth appears on restart.** `video-fracture-led` now requires a login and
+binds tailnet-only — LAN access stops working. Credentials are generated
+per-Pi: `sudo cat /etc/default/video-fracture-led-auth`.
 
 **Reboot required (not just restart)** when the update touches
 `/boot/firmware/config.txt` — i.e. re-running any install script that sets

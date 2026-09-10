@@ -311,12 +311,14 @@ def cpu_temp_c():
 
 
 def default_web_port():
-    """PORT_BAND + the trailing number in the hostname: fracture4 -> 8104,
-    fracture5 -> 8105. Every Pi gets its own port with no central registry
-    to keep in sync, and the port itself says which Pi you're looking at.
-    Falls back to the bare band when the hostname has no trailing number
-    (or an implausibly large one). --web-port always overrides."""
-    match = re.search(r"(\d+)$", socket.gethostname())
+    """PORT_BAND + the FIRST number in the hostname: fracture6 -> 8106,
+    fracture6-ledloop -> 8106, fracture4-3-hdmivideo -> 8104. Every Pi gets
+    its own port with no central registry to keep in sync, and the port
+    itself says which Pi you're looking at. First number, not last, because
+    hostnames here carry a role suffix after the number. Falls back to the
+    bare band when there's no number (or an implausible one).
+    --web-port always overrides."""
+    match = re.search(r"(\d+)", socket.gethostname())
     if not match:
         return PORT_BAND
     number = int(match.group(1))

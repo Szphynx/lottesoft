@@ -83,7 +83,9 @@ fi
 echo "== control page login (same scheme as scripts/status_server.py) =="
 AUTH_FILE=/etc/default/video-fracture-led-auth
 if [ ! -f "$AUTH_FILE" ]; then
-    printf 'STATUS_USER=admin\nSTATUS_PASS=conejo\n' > "$AUTH_FILE"
+    # Generated per-Pi, never committed -- this repo is public.
+    GENERATED_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(9))')"
+    printf 'STATUS_USER=admin\nSTATUS_PASS=%s\n' "$GENERATED_PASS" > "$AUTH_FILE"
     chmod 600 "$AUTH_FILE"
 fi
 

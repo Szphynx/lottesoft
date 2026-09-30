@@ -33,8 +33,8 @@ Run with:
     python3 fan_wall.py                     # web UI on :8099
     python3 fan_wall.py --media clip.mp4 --text "hello"
 
-Needs: python3-opencv python3-numpy python3-pil fonts-dejavu-core
-(install-fan-wall.sh does all of it plus the systemd service).
+Needs: python3-opencv python3-numpy python3-pil, fonts-dejavu-core fonts-vlgothic fonts-noto-cjk
+(install.sh does all of it plus the systemd service; run.sh starts it).
 """
 
 import argparse
@@ -54,7 +54,7 @@ from html import escape
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # Per-frame decay at full ("wet") trail -- a pixel fades to ~10% in about a
 # second at the 20-30fps the loop runs at.
@@ -83,8 +83,13 @@ def load_font(path, size, bold=False, italic=False):
             return ImageFont.truetype(candidate, size)
         except OSError:
             continue
-    sys.exit("no usable font found -- pass --font /path/to/font.ttf "
-              "(try: sudo apt install fonts-dejavu-core)")
+    # Don't take the whole wall down over a font: warn, use Pillow's own.
+    print("no usable font found -- using Pillow's built-in one (install fonts-dejavu-core, "
+          "or pass --font /path/to/font.ttf)")
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:  # Pillow < 10.1: fixed-size bitmap font only
+        return ImageFont.load_default()
 
 
 # Tried, in order, for any character the primary font doesn't actually
@@ -207,22 +212,25 @@ class ClipSource:
 
     def __init__(self, item):
         self.kind = item["kind"]
+        self.path = item["path"]
         self.start = max(0.0, item.get("start") or 0.0)
         self.end = item.get("end")
         self.loop = bool(item.get("loop"))
         self.cap = None
+        self.raw = self.fitted = self.key = None
 
         if self.kind == "image":
-            self.still = np.array(Image.open(item["path"]).convert("RGB"))
+            # exif_transpose: phone photos are stored sideways + a rotate tag
+            self.raw = np.array(ImageOps.exif_transpose(Image.open(self.path)).convert("RGB"))
             self.total_s = self.end if self.end and self.end > 0 else 5.0
             return
 
-        self.cap = cv2.VideoCapture(item["path"])
+        self._rewind()
         if not self.cap.isOpened():
-            raise RuntimeError(f"could not open {item['path']}")
-        if self.start:
-            self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start * 1000)
+            raise RuntimeError(f"could not open {self.path}")
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 0
+        # ponytail: missing/absurd fps metadata (some webm/gif/ts) -> assume 30
+        self.fps = fps if 1 <= fps <= 240 else 30.0
         frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
         natural = (frame_count / fps) if fps > 0 and frame_count > 0 else None
         if self.loop:
@@ -234,20 +242,47 @@ class ClipSource:
         else:
             self.total_s = float("inf")  # unknown length -- rely on EOF instead
 
-    def get_frame(self, fit, out_w, out_h, softness=1.0):
-        """Returns (frame, eof) -- eof means playback ended and won't loop."""
-        if self.kind == "image":
-            return fit_frame(self.still, fit, out_w, out_h, softness), False
-
-        ok, frame = self.cap.read()
-        if not ok:
-            if not self.loop:
-                return np.zeros((out_h, out_w, 3), dtype=np.uint8), True
+    def _rewind(self):
+        """(Re)open from the trim start. Reopening instead of seeking back
+        to 0: seeking is unreliable in some containers (gif, webm, ts)."""
+        if self.cap:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(self.path)
+        if self.start:
             self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start * 1000)
-            ok, frame = self.cap.read()
-            if not ok:
-                return np.zeros((out_h, out_w, 3), dtype=np.uint8), True
-        return fit_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), fit, out_w, out_h, softness), False
+        self.t, self.shown = 0.0, -1
+
+    def get_frame(self, fit, out_w, out_h, softness=1.0, dt=0.0):
+        """Returns (frame, eof) -- eof means playback ended and won't loop.
+        Video advances by its own clock, not one frame per call: 24, 25 or
+        60 fps files play at real speed on the 30 fps loop (frames held or
+        skipped; skipped ones are grabbed, not decoded). The fitted frame
+        is cached until the source frame or the fit settings change."""
+        key = (fit, out_w, out_h, softness)
+        fresh = False
+        if self.kind == "video":
+            self.t += dt
+            want = int(self.t * self.fps)
+            while self.shown < want:
+                if not self.cap.grab():
+                    if self.shown == -1 or not self.loop:  # empty clip, or the end
+                        last = self.fitted if self.fitted is not None and self.key == key \
+                            else np.zeros((out_h, out_w, 3), dtype=np.uint8)
+                        return last, True
+                    self._rewind()
+                    want = 0
+                    continue
+                self.shown += 1
+                fresh = True
+            if fresh:
+                ok, frame = self.cap.retrieve()
+                if ok:
+                    self.raw = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if self.raw is None:
+            return np.zeros((out_h, out_w, 3), dtype=np.uint8), False
+        if fresh or self.key != key:
+            self.fitted, self.key = fit_frame(self.raw, fit, out_w, out_h, softness), key
+        return self.fitted, False
 
     def close(self):
         if self.cap:
@@ -298,7 +333,7 @@ class QueuePlayer:
             self._reset()
             return np.zeros((out_h, canvas_w, 3), dtype=np.uint8)
 
-        if self.current_clip is None or self.current_id not in {it["id"] for it in queue}:
+        if self.current_id not in {it["id"] for it in queue}:
             self._switch_to(queue[0])
 
         self.elapsed += dt
@@ -313,9 +348,9 @@ class QueuePlayer:
                 self.transitioning = True
 
         blank = np.zeros((out_h, canvas_w, 3), dtype=np.uint8)
-        frame_a, eof_a = self.current_clip.get_frame(self.fit, canvas_w, out_h, self.softness) \
-            if self.current_clip else (blank, False)
-        done = eof_a or (self.current_clip and self.elapsed >= self.current_clip.total_s)
+        frame_a, eof_a = self.current_clip.get_frame(self.fit, canvas_w, out_h, self.softness, dt) \
+            if self.current_clip else (blank, True)  # unopenable item: skip it, don't stall
+        done = eof_a or self.elapsed >= self.current_clip.total_s
 
         cur_item = self._find(queue, self.current_id)
         frame_a = adjust_frame(frame_a, cur_item.get("brightness", 100) if cur_item else 100,
@@ -324,7 +359,7 @@ class QueuePlayer:
         if self.transitioning and self.next_clip:
             t = 1.0 - max(0.0, min(1.0, remaining / self.transition_s)) if self.transition_s else 1.0
             t = t * t * (3 - 2 * t)  # smoothstep ease in/out
-            frame_b, _ = self.next_clip.get_frame(self.fit, canvas_w, out_h, self.softness)
+            frame_b, _ = self.next_clip.get_frame(self.fit, canvas_w, out_h, self.softness, dt)
             next_item = self._find(queue, self.next_id)
             frame_b = adjust_frame(frame_b, next_item.get("brightness", 100) if next_item else 100,
                                     next_item.get("contrast", 100) if next_item else 100)
@@ -478,11 +513,28 @@ class TextScroller:
 
 
 
+# Decoding is OpenCV's FFmpeg backend (video) and Pillow (images); this list
+# only decides what the upload accepts -- every upload is test-decoded
+# anyway, so a codec the Pi's FFmpeg lacks is refused with a clear message.
 KIND_BY_EXT = {
-    ".mp4": "video", ".mov": "video", ".avi": "video", ".mkv": "video",
-    ".webm": "video", ".gif": "video",
-    ".jpg": "image", ".jpeg": "image", ".png": "image", ".bmp": "image", ".webp": "image",
+    **dict.fromkeys((".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm", ".gif", ".mpg", ".mpeg",
+                     ".ts", ".mts", ".m2ts", ".wmv", ".flv", ".3gp", ".ogv", ".mxf"), "video"),
+    **dict.fromkeys((".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"), "image"),
 }
+
+
+def probe_media(path, kind):
+    """None if `path` decodes as `kind`, else why not."""
+    try:
+        clip = ClipSource({"kind": kind, "path": path})
+    except (RuntimeError, OSError, ValueError, cv2.error) as e:
+        return str(e)
+    try:
+        if kind == "video" and not clip.cap.grab():
+            return "no decodable frames (codec missing from this Pi's FFmpeg?)"
+    finally:
+        clip.close()
+    return None
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 
@@ -709,6 +761,23 @@ def grid_test_canvas(w, h, p):
     return rgb
 
 
+def rev_pattern(geo, cells, t, dur, closing, rpm, color):
+    """Startup / close sequence: a bright head with a fading tail runs
+    round every fan's ring, in wiring order (LEDs 4-15 outer, 0-3 inner
+    -- both run round the ring). Startup: speed ramps 0 -> rpm, fading in,
+    then out into the content. Close: rpm -> 0 while fading to black.
+    Above ~900 rpm the 30 fps loop can't follow it (wagon-wheel effect)."""
+    u = min(1.0, t / dur)
+    turns = rpm / 60.0 * dur / 3.0 * ((1 - (1 - u) ** 3) if closing else u ** 3)  # integral of the speed ramp
+    fade = (1.0 - u) if closing else max(0.0, min(1.0, u / 0.15, (1.0 - u) / 0.15))
+    i = geo["led_at"][cells[:, 1], cells[:, 0]] % LEDS_PER_FAN
+    angle = np.where(i < 4, i / 4.0, (i - 4) / 12.0)
+    level = np.exp(-6.0 * ((turns - angle) % 1.0)) * fade
+    img = np.zeros((geo["h"], geo["w"], 3), dtype=np.uint8)
+    img[cells[:, 1], cells[:, 0]] = (level[:, None] * np.array(color, dtype=np.float32)).astype(np.uint8)
+    return img
+
+
 def color_correct(frame, snap):
     """Per-channel levels, percent. The LEDs aren't perceptually even --
     greens read brighter than reds/pinks at the same value -- so the usual
@@ -737,21 +806,25 @@ class State:
     """Live-editable settings shared between the render loop and the web
     server. `version` bumps only on changes that need a rebuild (text
     bitmap, queue); the calibration remap is rebuilt whenever its own
-    inputs change (see remap_key in main)."""
+    inputs change (see remap_key in main).
 
-    def __init__(self, args, geo, state_file=None):
+    Every field here except queue is also a command-line flag (see
+    parse_args): defaults below < saved settings file < flags given at
+    startup < live edits from the page."""
+
+    def __init__(self, geo, state_file=None, media=None):
         self.lock = threading.Lock()
         self.geo = geo
         self.state_file = state_file
-        self.text = args.text or ""
-        self.color = hex_to_rgb(args.text_color)
-        self.bold = args.bold
-        self.italic = args.italic
-        self.scroll_speed = args.scroll_speed
-        self.text_direction = args.text_direction
+        self.text = ""
+        self.color = (255, 255, 255)
+        self.bold = False
+        self.italic = False
+        self.scroll_speed = 20.0
+        self.text_direction = "left"
         self.text_stacked = False
         self.text_glyph_rotate = 0
-        self.brightness = args.brightness
+        self.brightness = 255
         self.trail_wet = 0
         self.media_brightness = 100.0
         self.media_contrast = 100.0
@@ -762,6 +835,14 @@ class State:
         self.cc_on = False
         self.cc_r = self.cc_g = self.cc_b = 100
         self.softness = 100
+        self.stats_on = False
+        self.seq_start_on = False   # rev the fans up at startup
+        self.seq_close_on = False   # spin them down on stop
+        self.seq_start_s = 3.0
+        self.seq_close_s = 2.0
+        self.seq_rpm = 480
+        self.seq_color = (255, 255, 255)
+        self.seq_test = None        # "start"/"close" from the page's test buttons; never saved
         self.fan_order = list(range(geo["fans"]))
         self.fan_rot = [0] * geo["fans"]
         self.fan_mirror = [False] * geo["fans"]
@@ -771,16 +852,12 @@ class State:
         self.calibrate = "off"
         self.cal_cluster = -1
         self.queue = []
-        if args.media:
-            self.queue.append({
-                "id": uuid.uuid4().hex[:8], "path": args.media, "kind": "video",
-                "name": os.path.basename(args.media),
-                "start": 0.0, "end": None, "loop": False,
-                "brightness": 100.0, "contrast": 100.0,
-            })
         self.version = 0
         if state_file and os.path.isfile(state_file):
             self._load(state_file)
+        if media:  # --media goes on the end of the saved queue
+            self.add_media(media, KIND_BY_EXT.get(os.path.splitext(media)[1].lower(), "video"),
+                           os.path.basename(media))
 
     def _load(self, path):
         try:
@@ -817,9 +894,15 @@ class State:
 
     def to_wire(self):
         snap = self.snapshot()
-        del snap["version"]
-        snap["color"] = "#%02x%02x%02x" % snap["color"]
+        del snap["version"], snap["seq_test"]
+        for key in ("color", "seq_color"):
+            snap[key] = "#%02x%02x%02x" % snap[key]
         return snap
+
+    def take_seq_test(self):
+        with self.lock:
+            seq, self.seq_test = self.seq_test, None
+            return seq
 
     def add_media(self, path, kind, name):
         with self.lock:
@@ -848,6 +931,13 @@ class State:
                         self.color, rebuild = color, True
                 except ValueError:
                     pass
+            if "seq_color" in data:
+                try:
+                    self.seq_color = hex_to_rgb(str(data["seq_color"]))
+                except ValueError:
+                    pass
+            if data.get("seq_test") in ("start", "close"):
+                self.seq_test = data["seq_test"]
             if data.get("text_direction") in ("left", "right", "up", "down") \
                     and data["text_direction"] != self.text_direction:
                 self.text_direction, rebuild = data["text_direction"], True
@@ -865,12 +955,15 @@ class State:
                                       ("media_pos_y", -9999, 9999, int),
                                       ("cc_r", 0, 200, int), ("cc_g", 0, 200, int),
                                       ("cc_b", 0, 200, int), ("softness", 0, 300, int),
+                                      ("seq_start_s", 0.5, 30, float),
+                                      ("seq_close_s", 0.5, 30, float),
+                                      ("seq_rpm", 30, 1800, int),
                                       ("active", 1, geo["pins"], int),
                                       ("cal_cluster", -1, geo["pins"] - 1, int)):
                 v = _clamp(data, key, lo, hi, cast)
                 if v is not None:
                     setattr(self, key, v)
-            for key in ("rotate180", "cc_on"):
+            for key in ("rotate180", "cc_on", "stats_on", "seq_start_on", "seq_close_on"):
                 if key in data:
                     setattr(self, key, bool(data[key]))
             if data.get("calibrate") in CAL_MODES:
@@ -941,6 +1034,7 @@ class TeensyLink:
         self.seq = 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.warned = False
+        self.errors = 0  # frames that failed to send, for the stats
 
     def send_frame(self, img):
         self.seq = (self.seq + 1) & 0xFF
@@ -949,9 +1043,72 @@ class TeensyLink:
                 self.sock.sendto(bytes((self.sync, self.seq, y)) + row.tobytes(), self.addr)
             self.warned = False
         except OSError as e:
+            self.errors += 1
             if not self.warned:  # cable out / wrong subnet: say so once, keep rendering
                 print(f"teensy link: {e}")
                 self.warned = True
+
+
+class Stats:
+    """Once-a-second numbers for the Stats tab, gathered only while stats
+    are on. The render loop just bumps counters (a few adds per frame);
+    the Teensy's own `fps N torn M` line is read from its USB serial by a
+    thread that blocks on the port, so it costs nothing between lines."""
+
+    def __init__(self, serial_path):
+        self.serial_path = serial_path
+        self.data = {}
+        self.teensy = None
+        self.reader = None
+        self.retry_at = 0.0
+        self.last = time.monotonic()
+        self._reset(self.last)
+
+    def _reset(self, now):
+        self.t0, self.frames, self.work, self.work_max = now, 0, 0.0, 0.0
+
+    def frame(self, now, work_s, link):
+        if now - self.last > 1.0:  # stats were off (or startup): start a fresh window
+            self._reset(now)
+        self.last = now
+        self.frames += 1
+        self.work += work_s
+        self.work_max = max(self.work_max, work_s)
+        if now - self.t0 >= 1.0:
+            n = max(1, self.frames)
+            self.data = {"pi_fps": round(self.frames / (now - self.t0), 1),
+                         "work_ms_avg": round(self.work / n * 1000, 1),
+                         "work_ms_max": round(self.work_max * 1000, 1),
+                         "send_errors": link.errors, "teensy": self.teensy}
+            print("stats", self.data, flush=True)  # one line a second in the journal
+            self._reset(now)
+        if self.reader is None and now >= self.retry_at and self.serial_path \
+                and os.path.exists(self.serial_path):
+            self.retry_at = now + 5.0  # a port that won't open is retried every 5 s, not every frame
+            self.reader = threading.Thread(target=self._read_serial, daemon=True)
+            self.reader.start()
+
+    def _read_serial(self):
+        try:
+            with open(self.serial_path, "rb", buffering=0) as port:
+                for line in port:
+                    m = re.match(rb"fps (\d+)\s+torn (\d+)", line.strip())
+                    if m:
+                        self.teensy = {"fps": int(m[1]), "torn": int(m[2]), "at": time.time()}
+        except OSError as e:
+            self.teensy = {"error": str(e)}
+        self.reader = None  # port gone (unplugged): retry on a later frame
+
+
+def pi_health():
+    """CPU temperature and load -- read on request only, Linux-only (None elsewhere)."""
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            temp = round(int(f.read()) / 1000, 1)
+    except (OSError, ValueError):
+        temp = None
+    load = os.getloadavg()[0] if hasattr(os, "getloadavg") else None
+    return {"cpu_temp_c": temp, "load_1m": load}
 
 
 # ---- web control -----------------------------------------------------------
@@ -974,7 +1131,7 @@ class Preview:
 
 
 class ControlHandler(http.server.BaseHTTPRequestHandler):
-    state = geo = upload_dir = preview = None  # bound by make_control_server
+    state = geo = upload_dir = preview = stats = startup = None  # bound by make_control_server
 
     def _send(self, body, content_type, code=200, extra_headers=None):
         body = body if isinstance(body, bytes) else body.encode()
@@ -999,6 +1156,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                        extra_headers={"Content-Disposition": 'attachment; filename="fan-wall-config.json"'})
         elif path == "/frame.json":
             self._send(json.dumps(self._frame_data()), "application/json")
+        elif path == "/stats.json":
+            on = self.state.snapshot()["stats_on"]
+            body = dict(self.stats.data, **pi_health(), on=True) if on else {"on": False}
+            self._send(json.dumps(body), "application/json")
         else:
             self.send_response(404)
             self.end_headers()
@@ -1067,6 +1228,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         dest = os.path.join(self.upload_dir, f"{uuid.uuid4().hex[:8]}{ext}")
         with open(dest, "wb") as f:
             f.write(content)
+        problem = probe_media(dest, kind)
+        if problem:
+            os.remove(dest)
+            self._send(f"can't play {filename}: {problem}", "text/plain", code=400)
+            return
         self.state.add_media(dest, kind, filename)
         self._send(_queue_item_row(self.state.snapshot()["queue"][-1]), "text/html; charset=utf-8")
 
@@ -1075,11 +1241,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 
     def _render_page(self):
         snap, g = self.state.snapshot(), self.geo
-        info = dict(pins=g["pins"], fans=g["fans"],
+        info = dict(pins=g["pins"], fans=g["fans"], startup=self.startup,
                     colors=["#%02x%02x%02x" % c for c in CLUSTER_COLORS])
         live = int((g["led_at"] >= 0).sum())
         return (PAGE.replace("__STATE__", json.dumps(self.state.to_wire()).replace("</", "<\\/"))
                     .replace("__GEO__", json.dumps(info))
+                    .replace("__EXTS__", ",".join(KIND_BY_EXT))
                     .replace("__QUEUE__", "".join(_queue_item_row(i) for i in snap["queue"]))
                     .replace("__SKETCH__", f"{g['w']}x{g['h']} frame, {g['grid_w']}x{g['grid_h']} "
                                            f"clusters of {g['cluster_w']}x{g['cluster_h']} fans, "
@@ -1107,10 +1274,13 @@ PAGE = r"""<!doctype html><meta charset="utf-8">
   <span id="svc" style="font-size:.6rem;padding:.15rem .5rem;border-radius:3px;background:#2a4;color:#012">ONLINE</span></h1>
 <p class="note">Live preview -- every live LED as sent to the Teensy (__SKETCH__), clusters outlined with their pin number.</p>
 <canvas id="preview" style="background:#000;border:1px solid #444;max-width:100%"></canvas>
+<p id="statsWarn" hidden style="background:#542;color:#fd9;padding:.4rem .6rem;border-radius:4px">
+  Stats are ON -- measuring and polling costs a little CPU and may lower the frame rate. Turn off in the Stats tab when done.</p>
 
 <nav>
   <button data-tab="cal">Calibration</button><button data-tab="content">Content</button>
-  <button data-tab="colour">Colour</button><button data-tab="settings">Settings</button>
+  <button data-tab="colour">Colour</button><button data-tab="seq">Startup / Close</button>
+  <button data-tab="stats">Stats</button><button data-tab="settings">Settings</button>
 </nav>
 
 <section data-tab="cal">
@@ -1158,7 +1328,7 @@ Click a tile to highlight that cluster.</p>
 <label>Scale <span id="v-media_scale"></span>%<input type="range" data-k="media_scale" min="10" max="400"></label>
 <label>Position X <span id="v-media_pos_x"></span><input type="range" data-k="media_pos_x" min="-84" max="84"></label>
 <label>Position Y <span id="v-media_pos_y"></span><input type="range" data-k="media_pos_y" min="-56" max="56"></label>
-<label class="btn">+ Add image/video<input type="file" accept="video/*,image/*" style="display:none" onchange="uploadFile(this)"></label>
+<label class="btn">+ Add image/video<input type="file" accept="video/*,image/*,__EXTS__" style="display:none" onchange="uploadFile(this)"></label>
 <div id="queue">__QUEUE__</div>
 </section>
 
@@ -1176,13 +1346,41 @@ Usual move: green down, red up. Applies to content only -- calibration and test 
 <button onclick="saveSettings()">Save settings</button> <span class="note saveMsg"></span>
 </section>
 
+<section data-tab="seq">
+<p class="note">Fan "rev": a light runs round every fan's ring, speeding up at startup and slowing down on close.
+Only runs when switched on here. Close runs on stop/restart of the service (not on a power cut).</p>
+<label><input type="checkbox" data-k="seq_start_on" style="display:inline"> Rev up at startup</label>
+<label>Startup length <span id="v-seq_start_s"></span> s<input type="range" data-k="seq_start_s" min="0.5" max="10" step="0.5"></label>
+<label><input type="checkbox" data-k="seq_close_on" style="display:inline"> Spin down on close</label>
+<label>Close length <span id="v-seq_close_s"></span> s<input type="range" data-k="seq_close_s" min="0.5" max="10" step="0.5"></label>
+<label>Top speed <span id="v-seq_rpm"></span> rpm<input type="range" data-k="seq_rpm" min="30" max="1800" step="30"></label>
+<p class="note">Above ~900 rpm the 30 fps output can't keep up and the spin may look like it runs backwards.</p>
+<label>Colour <input type="color" data-k="seq_color"></label>
+<button onclick="testSeq('start')">Test startup</button> <button onclick="testSeq('close')">Test close</button>
+<p><button onclick="saveSettings()">Save settings</button> <span class="note saveMsg"></span></p>
+</section>
+
+<section data-tab="stats">
+<label><input type="checkbox" data-k="stats_on" style="display:inline"> Enable stats</label>
+<p class="note">Off by default. While on, the render loop counts frames and times its work (a few additions per
+frame), the page asks for numbers once a second, the Teensy's USB serial is read if it's plugged into the Pi,
+and a line a second goes to the log. Small, but it can lower the frame rate on a busy Pi.</p>
+<pre id="statsBox" style="background:#000;padding:.6rem;border:1px solid #333">off</pre>
+</section>
+
 <section data-tab="settings">
 <label>Brightness <span id="v-brightness"></span>/255<input type="range" data-k="brightness" min="0" max="255"></label>
 <p class="note">Software level, under the sketch's own FastLED brightness and power cap.</p>
 <label>Active clusters <span id="v-active"></span><input type="range" data-k="active" min="1" id="activeRange"></label>
 <label><input type="checkbox" data-k="rotate180" style="display:inline"> Whole wall mounted upside down</label>
 <p><button onclick="saveSettings()">Save settings</button> <span class="note saveMsg"></span></p>
-<p class="note">Saved settings (everything: calibration, colour, content) come back on every start.</p>
+<p class="note">Saved settings (everything: calibration, colour, content, startup/close, stats) come back on every
+start. Every setting on this page is also a command-line flag (<code>./run.sh --help</code>): a flag given
+at startup (run.sh, or EXTRA_FLAGS in rotaryplay.conf) wins over the saved file, and the page can still
+change it afterwards.</p>
+<h2>Startup config</h2>
+<p class="note">Network and files -- set in rotaryplay.conf, applied on restart:</p>
+<pre id="startupBox" style="background:#000;padding:.6rem;border:1px solid #333"></pre>
 <a href="/config.json" download="fan-wall-config.json" class="btn" style="text-decoration:none">Download settings</a>
 <label class="btn" style="display:inline-block">Load settings<input type="file" accept="application/json" style="display:none" onchange="loadConfig(this)"></label>
 <p><button onclick="restartService()" style="background:#622;color:#fdd">restart service</button>
@@ -1401,6 +1599,35 @@ function poll() {
   }).catch(() => setSvc(false)).finally(() => setTimeout(poll, 150));
 }
 poll();
+
+document.getElementById('startupBox').textContent = Object.entries(GEO.startup)
+  .map(([k, v]) => k.padEnd(15) + v).join('\n');
+
+function testSeq(kind) {
+  fetch('/update', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(Object.assign({}, state, {seq_test: kind}))});
+}
+// Stats: polled once a second, and only while they're on.
+function pollStats() {
+  document.getElementById('statsWarn').hidden = !state.stats_on;
+  if (!state.stats_on) {
+    document.getElementById('statsBox').textContent = 'off';
+    return setTimeout(pollStats, 1000);
+  }
+  fetch('/stats.json').then(r => r.json()).then(s => {
+    const t = s.teensy;
+    const teensy = !t ? 'no USB serial line yet (Teensy USB not on this Pi?)'
+      : t.error ? 'serial: ' + t.error
+      : `${t.fps} fps shown, ${t.torn} torn ${t.torn ? '<- rows being lost' : ''}`;
+    document.getElementById('statsBox').textContent = s.pi_fps === undefined ? 'collecting...' :
+      `Pi render   ${s.pi_fps} fps\n` +
+      `frame work  ${s.work_ms_avg} ms avg, ${s.work_ms_max} ms max (budget ${(1000 / 30).toFixed(1)} ms at 30 fps)\n` +
+      `send errors ${s.send_errors}\n` +
+      `Teensy      ${teensy}\n` +
+      `CPU         ${s.cpu_temp_c ?? '?'} °C, load ${s.load_1m ?? '?'}`;
+  }).catch(() => {}).finally(() => setTimeout(pollStats, 1000));
+}
+pollStats();
 </script>
 """
 
@@ -1416,9 +1643,10 @@ def local_ip():
         s.close()
 
 
-def make_control_server(state, geo, port, upload_dir, preview):
+def make_control_server(state, geo, port, upload_dir, preview, stats, startup):
     handler = type("BoundControlHandler", (ControlHandler,), {
-        "state": state, "geo": geo, "upload_dir": upload_dir, "preview": preview})
+        "state": state, "geo": geo, "upload_dir": upload_dir, "preview": preview, "stats": stats,
+        "startup": startup})
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -1426,41 +1654,65 @@ def make_control_server(state, geo, port, upload_dir, preview):
 
 # ---- main ------------------------------------------------------------------
 
+# Settings whose flag takes a fixed set of values.
+FLAG_CHOICES = {"calibrate": CAL_MODES, "text_direction": ("left", "right", "up", "down"),
+                "text_glyph_rotate": (0, 90, 270)}
+
+
 def parse_args():
+    """Startup-only flags, plus one flag per page setting, generated from
+    State so the two can't drift: --brightness 120, --cc-on, --cc-g 70,
+    --calibrate fans, --seq-start-on, --stats-on, --fan-order '[0,1,2,3,4,5]'
+    ... A setting flag given at startup overrides the saved settings file;
+    the page can still change it live afterwards."""
     here = os.path.dirname(os.path.abspath(__file__))
-    p = argparse.ArgumentParser()
+    # --help added last, so it lists the setting flags too. No abbreviations:
+    # in the first pass --text would otherwise be read as --text-height.
+    p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     p.add_argument("--sketch", default=os.path.join(here, "teensy.ino"),
                    help="Teensy sketch the wall geometry and link settings are read from")
     p.add_argument("--teensy-ip", help="default: teensyIP from the sketch")
     p.add_argument("--teensy-port", type=int, help="default: LISTEN_PORT from the sketch")
-    p.add_argument("--media", help="video file to seed the queue with")
-    p.add_argument("--text", help="text to scroll")
+    p.add_argument("--teensy-serial", default="/dev/ttyACM0",
+                   help="Teensy USB serial, read for its fps/torn line while stats are on")
+    p.add_argument("--media", help="video/image file added to the end of the queue")
     p.add_argument("--text-height", type=int, default=14,
                    help="frame rows for the text strip when media is also playing "
                         "(default 14 = two fan rows)")
-    p.add_argument("--text-color", default="#ffffff")
-    p.add_argument("--font")
+    p.add_argument("--font", help="primary .ttf/.otf; CJK/kana fall back to VL Gothic / Noto CJK")
     p.add_argument("--font-size", type=int)
-    p.add_argument("--bold", action="store_true")
-    p.add_argument("--italic", action="store_true")
-    p.add_argument("--scroll-speed", type=float, default=20.0, help="frame px/second")
-    p.add_argument("--text-direction", default="left", choices=["left", "right", "up", "down"])
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
-    p.add_argument("--brightness", type=int, default=255,
-                   help="0-255 software level, under the sketch's FastLED brightness")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--web-port", type=int, default=8099, help="0 disables the control page")
     p.add_argument("--upload-dir", default=os.path.join(here, "uploads"))
     p.add_argument("--state-file", default=os.path.join(here, "fan_wall_state.json"),
                    help="written by Save settings, loaded on startup; '' disables")
     p.add_argument("--transition-s", type=float, default=0.6)
-    p.add_argument("--stats", action="store_true")
-    return p.parse_args()
+
+    known, _ = p.parse_known_args()
+    geo = load_sketch(known.sketch)
+    defaults = State(geo).to_wire()
+    g = p.add_argument_group("settings (the page's tabs; override the saved settings file)")
+    for key, val in defaults.items():
+        if key == "queue":
+            continue
+        flag, extra = "--" + key.replace("_", "-"), {"dest": key, "default": None}
+        if isinstance(val, bool):
+            g.add_argument(flag, action=argparse.BooleanOptionalAction, **extra)
+        elif isinstance(val, list):
+            g.add_argument(flag, type=json.loads, metavar="JSON", help=f"e.g. '{json.dumps(val)}'", **extra)
+        else:
+            g.add_argument(flag, type=type(val), choices=FLAG_CHOICES.get(key),
+                           help=f"default {val}", **extra)
+    p.add_argument("-h", "--help", action="help", help="show this help and exit")
+    args = p.parse_args()
+    args.settings = {k: getattr(args, k) for k in defaults
+                     if k != "queue" and getattr(args, k) is not None}
+    return args, geo
 
 
 def main():
-    args = parse_args()
-    geo = load_sketch(args.sketch)
+    args, geo = parse_args()
     W, H = geo["w"], geo["h"]
 
     def _on_sigterm(signum, frame):  # systemctl stop -> same cleanup as ctrl-c
@@ -1475,17 +1727,23 @@ def main():
         return TextScroller(snap["text"], fonts, W, text_h, snap["color"],
                             snap["text_direction"], snap["text_stacked"], snap["text_glyph_rotate"])
 
-    state = State(args, geo, args.state_file or None)
+    state = State(geo, args.state_file or None, args.media)
     if args.state_file and os.path.isfile(args.state_file):
         print(f"resumed saved settings from {args.state_file}")
+    state.apply_wire(args.settings)
     os.makedirs(args.upload_dir, exist_ok=True)
     player = QueuePlayer(lambda: state.snapshot()["queue"], args.fit, args.transition_s)
     link = TeensyLink(args.teensy_ip or geo["teensy_ip"], args.teensy_port or geo["teensy_port"],
                       geo["sync"])
     preview = Preview()
+    stats = Stats(args.teensy_serial)
     server = None
     if args.web_port:
-        server = make_control_server(state, geo, args.web_port, args.upload_dir, preview)
+        startup = {"teensy": f"{link.addr[0]}:{link.addr[1]}", "teensy serial": args.teensy_serial,
+                   "web port": args.web_port, "sketch": args.sketch,
+                   "settings file": args.state_file or "(saving off)", "uploads": args.upload_dir,
+                   "fps": args.fps, "flags given": " ".join(sys.argv[1:]) or "(none)"}
+        server = make_control_server(state, geo, args.web_port, args.upload_dir, preview, stats, startup)
         print(f"control panel: http://{local_ip()}:{args.web_port}/")
     print(f"sketch: {W}x{H} frame, {int((geo['led_at'] >= 0).sum())} live LEDs, "
           f"teensy {link.addr[0]}:{link.addr[1]}")
@@ -1493,13 +1751,17 @@ def main():
     built_version = remap_key = None
     scroll_offset = 0.0
     trail = np.zeros((H, W, 3), dtype=np.float32)
-    last_t = last_report = time.monotonic()
-    rendered = 0
+    last_t = time.monotonic()
+    # Startup / close sequence in progress: (kind, start time) or None.
+    seq = ("start", last_t) if state.snapshot()["seq_start_on"] else None
     try:
         while True:
             t0 = time.monotonic()
             dt, last_t = t0 - last_t, t0
             snap = state.snapshot()
+            test = state.take_seq_test()
+            if test:
+                seq = (test, t0)
 
             if snap["version"] != built_version:
                 has_media, has_text = bool(snap["queue"]), bool(snap["text"])
@@ -1519,7 +1781,13 @@ def main():
                                                        geo["led_at"][cells[led0, 1], cells[led0, 0]])]
                 remap_key = key
 
-            if snap["calibrate"] in WIRE_MODES:
+            seq_dur = snap["seq_start_s" if seq and seq[0] == "start" else "seq_close_s"]
+            if seq and t0 - seq[1] >= seq_dur:
+                seq = None
+            if seq:
+                send = rev_pattern(geo, cells, t0 - seq[1], seq_dur, seq[0] == "close",
+                                   snap["seq_rpm"], snap["seq_color"])
+            elif snap["calibrate"] in WIRE_MODES:
                 send = wire_pattern(geo, snap, cells, snap["calibrate"])
             else:
                 if snap["calibrate"] == "grid":
@@ -1551,12 +1819,11 @@ def main():
             out = send if snap["brightness"] == 255 else \
                 (send.astype(np.uint16) * snap["brightness"] // 255).astype(np.uint8)
             link.send_frame(out)
-            rendered += 1
 
-            if args.stats and t0 - last_report >= 1.0:
-                print(f"render {rendered / (t0 - last_report):5.1f} fps")
-                rendered, last_report = 0, t0
-            slack = 1.0 / args.fps - (time.monotonic() - t0)
+            work = time.monotonic() - t0
+            if snap["stats_on"]:
+                stats.frame(t0, work, link)
+            slack = 1.0 / args.fps - work
             if slack > 0:
                 time.sleep(slack)
     except KeyboardInterrupt:
@@ -1564,6 +1831,14 @@ def main():
     finally:
         if server:
             server.shutdown()
+        snap = state.snapshot()
+        if snap["seq_close_on"] and remap_key is not None:  # spin down, then dark
+            t_end = time.monotonic()
+            while (t := time.monotonic() - t_end) < snap["seq_close_s"]:
+                send = rev_pattern(geo, cells, t, snap["seq_close_s"], True,
+                                   snap["seq_rpm"], snap["seq_color"])
+                link.send_frame((send.astype(np.uint16) * snap["brightness"] // 255).astype(np.uint8))
+                time.sleep(1.0 / args.fps)
         link.send_frame(np.zeros((H, W, 3), dtype=np.uint8))
         print("\nstopped")
 

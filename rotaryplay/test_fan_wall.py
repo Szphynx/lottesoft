@@ -1,20 +1,20 @@
 """Self-check for fan_wall.py against teensy.ino and its spec: python test_fan_wall.py"""
 import os
 import socket
-import types
+import sys
+import tempfile
 
 import numpy as np
+from PIL import Image
 
 import fan_wall as fw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 geo = fw.load_sketch(os.path.join(HERE, "teensy.ino"))
-args = types.SimpleNamespace(text="", text_color="#ffffff", bold=False, italic=False,
-                             scroll_speed=20, text_direction="left", brightness=255, media=None)
 
 
 def fresh():
-    return fw.State(args, geo)
+    return fw.State(geo)
 
 
 # Sketch facts come through.
@@ -84,10 +84,10 @@ assert fw.color_correct(frame, snap)[0, 0].tolist() == [150, 50, 100]
 
 # Settings survive a save/load round trip.
 path = os.path.join(HERE, "_test_state.json")
-s = fw.State(args, geo, path)
+s = fw.State(geo, path)
 s.apply_wire({"cc_on": True, "cc_g": 70, "softness": 150, "fan_rot": [90, 0, 0, 0, 0, 0]})
 assert s.save()
-s2 = fw.State(args, geo, path)
+s2 = fw.State(geo, path)
 os.remove(path)
 assert (s2.cc_on, s2.cc_g, s2.softness, s2.fan_rot[0]) == (True, 70, 150, 90)
 
@@ -110,5 +110,90 @@ for _ in range(56):
     seqs.add(pkt[1])
     got[pkt[2]] = np.frombuffer(pkt[3:], np.uint8).reshape(84, 3)
 assert len(seqs) == 1 and (got == img).all()
+
+
+# Video formats: every container this OpenCV build can write here decodes,
+# plays at its own fps, and passes the upload probe.
+import cv2
+
+tmp = tempfile.mkdtemp()
+
+
+def write_clip(name, fourcc, fps, n=20):
+    path = os.path.join(tmp, name)
+    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, (160, 90))
+    if not vw.isOpened():
+        return None
+    for i in range(n):
+        vw.write(np.full((90, 160, 3), i * 10, np.uint8))  # frame index as brightness
+    vw.release()
+    return path if os.path.getsize(path) > 0 else None
+
+
+tested = []
+for name, fourcc in (("a.mp4", "mp4v"), ("a.mov", "mp4v"), ("a.m4v", "mp4v"), ("a.mkv", "mp4v"),
+                     ("a.avi", "MJPG"), ("b.avi", "XVID"), ("a.webm", "VP80"), ("a.ogv", "THEO")):
+    path = write_clip(name, fourcc, 25)
+    if path:
+        assert fw.probe_media(path, "video") is None, name
+        tested.append(name)
+gif = os.path.join(tmp, "a.gif")
+Image.new("RGB", (40, 30), (200, 0, 0)).save(gif, save_all=True, duration=40,
+                                              append_images=[Image.new("RGB", (40, 30), (0, 200, 0))])
+assert fw.probe_media(gif, "video") is None
+tested.append("a.gif")
+for ext in (".png", ".jpg", ".bmp", ".webp", ".tiff"):
+    path = os.path.join(tmp, "img" + ext)
+    Image.new("RGB", (40, 30), (0, 0, 200)).save(path)
+    assert fw.probe_media(path, "image") is None, ext
+    tested.append("img" + ext)
+assert all(ext in fw.KIND_BY_EXT for ext in (".mp4", ".mov", ".mkv", ".webm", ".ts", ".mpg", ".tiff"))
+print("formats decoded:", " ".join(tested))
+
+# A 25 fps clip plays at 25 fps on the 30 fps loop, not 30.
+clip = fw.ClipSource({"kind": "video", "path": os.path.join(tmp, "a.avi")})
+for _ in range(15):  # 0.5 s
+    clip.get_frame("fill", 84, 56, 0, 1 / 30)
+assert 11 <= clip.shown <= 13, clip.shown  # ~12.5 frames in 0.5 s at 25 fps
+clip.close()
+
+# Broken files: refused at upload, skipped (not stalled on) in the queue.
+bad = os.path.join(tmp, "bad.mp4")
+with open(bad, "wb") as f:
+    f.write(b"not a video" * 100)
+assert fw.probe_media(bad, "video")
+queue = [{"id": "bad", "kind": "video", "path": bad, "name": "bad"},
+         {"id": "ok", "kind": "video", "path": os.path.join(tmp, "a.avi"), "name": "ok"}]
+qp = fw.QueuePlayer(lambda: [dict(q) for q in queue], "fill")
+for _ in range(3):
+    qp.next_frame(1 / 30, 84, 56)
+assert qp.current_id == "ok"
+
+# Startup/close rev: dark at the start of startup and the end of close, lit mid-way.
+def rev(t, closing):
+    return fw.rev_pattern(geo, cells, t, 2.0, closing, 480, (255, 255, 255))
+assert rev(0, False).max() == 0 and rev(1.0, False).max() > 200
+assert rev(2.0, True).max() == 0 and rev(0.2, True).max() > 150
+
+# Every page setting is a flag; flags win over the saved settings file.
+path = os.path.join(tmp, "state.json")
+s = fw.State(geo, path)
+s.apply_wire({"brightness": 50, "cc_g": 70})
+assert s.save()
+sys.argv = ["fan_wall.py", "--brightness", "120", "--cc-on", "--calibrate", "fans",
+            "--fan-rot", "[90,0,0,0,0,0]", "--seq-start-on", "--stats-on", "--color", "#ff0000"]
+args, _ = fw.parse_args()
+s = fw.State(geo, path)
+s.apply_wire(args.settings)
+assert (s.brightness, s.cc_g, s.cc_on, s.calibrate, s.fan_rot[0], s.seq_start_on, s.stats_on,
+        s.color) == (120, 70, True, "fans", 90, True, True, (255, 0, 0))
+
+# Stats: numbers after a second, nothing collected before.
+st = fw.Stats(None)
+link = type("L", (), {"errors": 0})()
+t0 = st.last
+for k in range(31):
+    st.frame(t0 + k / 30, 0.004, link)
+assert st.data["pi_fps"] > 25 and st.data["work_ms_avg"] == 4.0
 
 print("ok")

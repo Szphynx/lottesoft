@@ -11,11 +11,13 @@ Everything for Rotaryplay lives in this `rotaryplay/` folder; nothing outside it
 
 | File | What it does |
 |---|---|
-| `teensy.ino` | Teensy 4.1 firmware. Receives row packets and maps pixels to LEDs (`XY()`, corner exemptions). Drives 16 pins through FastLED. Copied unchanged from Jaakko-cyber/84fan_teensy_udp. |
-| `pi_streamer_spec.md` | Protocol and geometry spec from the same repo, unchanged. It mentions `rpi_video_streamer.py`, which is obsolete and not included; `fan_wall.py` replaces it. |
-| `fan_wall.py` | Pi player plus web control page. Plays video/images, scrolling text, calibration, colour correction, and saved settings. Adapted from lottesoft `double_matrix.py`. |
-| `install-fan-wall.sh` | One-shot Pi setup: apt packages, static `eth0`, and the systemd service `fan-wall` (enabled and started). |
-| `test_fan_wall.py` | Self-check of `fan_wall.py` against `teensy.ino` and the spec. Prints `ok`. |
+| `install.sh` | One-shot Pi setup: packages and fonts, static `eth0`, optional Tailscale, and the systemd service `fan-wall` (enabled and started). |
+| `run.sh` | Starts the player with `rotaryplay.conf` applied. Extra arguments are passed through as flags. The service runs this script. |
+| `rotaryplay.conf` | Startup config: Teensy IP/port/serial, Pi interface and IP, web port, file locations, and `EXTRA_FLAGS`. |
+| `fan_wall.py` | Pi player and web control page. |
+| `teensy.ino` | Teensy 4.1 firmware, copied unchanged from Jaakko-cyber/84fan_teensy_udp. |
+| `pi_streamer_spec.md` | Protocol and geometry spec from the same repo, unchanged. It mentions `rpi_video_streamer.py`, which is obsolete and replaced by `fan_wall.py`. |
+| `test_fan_wall.py` | Self-check against `teensy.ino`, the spec, formats and flags. Prints `ok`. |
 
 ## Important data
 
@@ -61,62 +63,84 @@ Everything for Rotaryplay lives in this `rotaryplay/` folder; nothing outside it
 | Power cap | `setMaxPowerInVoltsAndMilliamps(5, 45000)`, 45 A of a 60 A supply |
 | Timing | needs FastLED **≥ 3.9.8**, which drives the 16 pins in parallel, about 3 ms per `show()` |
 | Pin order | 1, 0, 24, 25, 19, 18, 14, 15, 17, 16, 22, 23, 20, 21, 26, 27 (pin N-1 drives hub N) |
-| Serial | 115200 baud, prints `fps N torn M` every second. `torn` above 0 means rows are being lost. |
+| Serial | USB, 115200 baud, prints `fps N torn M` every second. `torn` above 0 means rows are being lost. |
 
-**Pi files** (created next to `fan_wall.py`):
+**Pi files** (in `rotaryplay/` unless moved in the conf):
 
 | Path | Contents |
 |---|---|
-| `fan_wall_state.json` | Saved settings: calibration, colour, text, queue. Written by **Save settings** and loaded at startup. |
+| `fan_wall_state.json` | Saved settings: every tab, plus the queue. Written by **Save settings** and loaded at startup. |
 | `uploads/` | Uploaded media |
-| `/etc/default/fan-wall` | Service flags (`FLAGS="..."`) |
-| `/etc/systemd/system/fan-wall.service` | The service unit. It runs as root. |
+| `/etc/systemd/system/fan-wall.service` | Service unit. Runs `run.sh` as root. |
 
 ## Install
 
 1. **Teensy:** open `teensy.ino` in the Arduino IDE (Teensyduino and FastLED ≥ 3.9.8), then upload.
-2. **Cable:** Pi `eth0` to the Teensy's Ethernet port.
+2. **Cable:** Pi `eth0` to the Teensy's Ethernet port. Optionally, also plug the Teensy's USB into the Pi so the Stats tab can read it.
 3. **Pi** (Raspberry Pi OS / Debian with NetworkManager):
    ```bash
    git clone -b Rotaryplay https://github.com/Szphynx/lottesoft
    cd lottesoft
-   sudo bash rotaryplay/install-fan-wall.sh
+   sudo bash rotaryplay/install.sh
    ```
-   Packages installed: `python3-opencv python3-numpy python3-pil fonts-dejavu-core fonts-vlgothic`.
+   - Different interface or address? Edit `ETH_IF` / `PI_IP` in `rotaryplay.conf` first.
+   - Remote access: export `TS_AUTHKEY` and run `sudo -E bash rotaryplay/install.sh`. It installs Tailscale and joins as `rotaryplay` (override with `TS_HOSTNAME`). Keep the key out of the repo.
+   - Safe to run again.
 
 ## Run
 
-- **As a service** (after install):
+- **Service:**
   ```bash
   sudo systemctl restart fan-wall
   journalctl -u fan-wall -f
+  sudo systemctl stop fan-wall
   ```
-  Change flags in `/etc/default/fan-wall`, then restart.
+  Restart after editing `rotaryplay.conf`. Stopping plays the close sequence if it's on.
 - **By hand:**
   ```bash
-  python3 rotaryplay/fan_wall.py --media clip.mp4 --text "hello" --stats
+  ./rotaryplay/run.sh
   ```
-- **Flags:**
-  - `--sketch` (default `teensy.ino` next to the script)
-  - `--teensy-ip`, `--teensy-port` (default: taken from the sketch)
-  - `--media`, `--text`, `--text-height 14`, `--text-color`, `--font`, `--font-size`, `--bold`, `--italic`, `--scroll-speed 20`, `--text-direction`
-  - `--fit fill|letterbox`, `--brightness 255`, `--fps 30`, `--web-port 8099` (0 disables the page)
-  - `--upload-dir`, `--state-file` (`''` disables saving), `--transition-s 0.6`, `--stats`
+  - `./rotaryplay/run.sh --calibrate fans --brightness 120` adds or overrides flags.
+  - `./rotaryplay/run.sh --help` lists every flag.
+  - Set `PYTHON=/path/to/python` to use a venv.
 - **Self-check** (needs numpy, opencv, pillow):
   ```bash
   cd rotaryplay
   python3 test_fan_wall.py
   ```
-- **First run on the wall:** go to Calibration, then run in order: `red`, `green`, `blue`, `row0`, `col0`, `probe`. `row0` and `col0` catch a rotated or mirrored frame. Keep the Teensy serial `torn 0`.
+- **First run on the wall:** go to Calibration, then run `red`, `green`, `blue`, `row0`, `col0`, `probe`. `row0` and `col0` catch a rotated or mirrored frame. Keep the Teensy's `torn` at 0 (Stats tab).
+
+### Settings, flags and the conf
+
+- **Every setting on the page's tabs is also a flag**, generated from the same code, so they can't drift. Some examples:
+  - `--brightness 120`
+  - `--cc-on --cc-g 70`
+  - `--calibrate fans`
+  - `--seq-start-on --seq-rpm 600`
+  - `--stats-on`
+  - `--text "hello"`
+  - `--fan-order '[0,1,2,3,4,5]'`
+
+  Booleans also have `--no-...` forms.
+- **Precedence:** built-in defaults < saved settings (`fan_wall_state.json`) < flags given at start (conf `EXTRA_FLAGS`, `run.sh` arguments) < live edits on the page.
+  - Note: a flag in `EXTRA_FLAGS` re-applies at every start, even over a value saved later from the page.
+- **Startup-only values** (network, files, ports, fps) live in `rotaryplay.conf` and need a restart. The Settings tab shows the values currently in use.
 
 ## Features
 
-- **Content:**
-  - Video and image queue with upload, per-item start/end/loop/brightness/contrast, and crossfade.
-  - Scrolling text: direction, stacked letters, glyph rotation, colour, bold/italic, trail, and font fallback for non-Latin characters.
+- **Content tab:**
+  - Video and image queue: upload, per-item start/end/loop/brightness/contrast, and crossfade.
+  - Scrolling text: direction, stacked letters, glyph rotation, colour, bold/italic, trail.
   - Media brightness, contrast, rotation, scale, and position.
-- **Live preview:** every live LED drawn as the wall shows it, with cluster outlines and numbers.
-- **Calibration** (Calibration tab):
+- **Video formats:** `.mp4 .m4v .mov .mkv .webm .avi .gif .mpg .mpeg .ts .mts .m2ts .wmv .flv .3gp .ogv .mxf`.
+  - Codec support is whatever the Pi's FFmpeg decodes: H.264, HEVC, VP8/9, MPEG-2/4, MJPEG and more.
+  - Every upload is test-decoded first; one the Pi can't decode is refused with the reason.
+  - Each video plays at its own frame rate (24, 25, 60 fps...), holding or skipping frames on the 30 fps output.
+  - A file that breaks later is skipped instead of stalling the queue.
+- **Image formats:** `.jpg .jpeg .png .bmp .webp .tif .tiff`. Phone photos are auto-rotated from their EXIF tag.
+- **Fonts:** DejaVu Sans (regular/bold/italic). Characters it lacks (Japanese, CJK, kana) fall back per character to VL Gothic, then Noto CJK. If no font is found at all, Pillow's built-in font is used instead of crashing.
+- **Live preview:** every LED drawn as the wall shows it, with cluster outlines and numbers.
+- **Calibration tab:**
   - Starts at the Teensy's own mapping; nothing is remapped by default.
   - Fan pattern: 6 tiles, drag to swap, R rotates a fan 90°, M mirrors it. One pattern applies to every cluster.
   - Cluster grid: 16 tiles, drag to swap. Clicking one highlights that cluster.
@@ -126,36 +150,47 @@ Everything for Rotaryplay lives in this `rotaryplay/` folder; nothing outside it
     - `clusters`: the white LED count is the cluster number (1-16).
     - `grid`: a colour gradient with a dot on top of each fan.
     - The spec's test sequence: solid R/G/B, row 0, column 0, probe.
-  - Wire modes (fans, clusters, and the tests) bypass the remap and show the raw wiring.
 - **Colour tab:**
   - Correction on/off, with R/G/B levels from 0 to 200%. It applies to content only.
-  - Softness: Gaussian blur before downsampling, where 100% is the spec's sigma of source width / 120.
+  - Softness: blur before downsampling, where 100% is the spec's sigma of source width / 120.
+- **Startup / Close tab:**
+  - Fan "rev": a light runs round every ring, speeding up at startup and spinning down on stop.
+  - Each is switched on separately. Length, top rpm and colour are adjustable, and there are test buttons.
+- **Stats tab:**
+  - Off by default. A warning banner shows while stats are on.
+  - Shows Pi render fps, per-frame work time (average and maximum), send errors, CPU temperature and load, and the Teensy's own `fps`/`torn` line read over USB serial.
+  - Cost while on: counters in the render loop, one poll a second, a serial read thread that blocks when idle, and one log line a second.
 - **Settings tab:**
   - Software brightness, active clusters (the first N pins), and a whole-wall 180° flip.
   - Save, download, or load settings, and restart the service.
+  - Shows the startup config in use.
 
 ## Missing features
 
-- Web page has no login. Keep it on a trusted network.
+- Web page has no login. Keep it on a trusted network or Tailscale.
 - Grid size can't be changed live; it's fixed by `teensy.ino` and the packet layout.
 - No per-cluster calibration exceptions. The fan pattern is shared, and in the 3-fan corner clusters a swap into an empty slot makes that fan go dark.
 - Fans rotate only in 90° steps (the ring allows 30°).
 - Colour correction is linear levels only: no gamma, no per-hue fix for pinks. No values are preset.
-- Settings are saved only when the Save button is pressed; changes are lost on restart otherwise.
+- Settings are saved only when the Save button is pressed.
+- Startup-only values (IPs, ports, files) are edited in `rotaryplay.conf`, not on the page.
+- No font picker on the page; the font is set with `--font` / `FONT=`.
 - Queue items can't be reordered in the UI. Removing an item leaves its file in `uploads/`.
-- The Teensy's `fps`/`torn` stats aren't shown on the page; they're on USB serial only.
 - Inputs are files only: no camera, HDMI, or network stream.
-- Dropped from `double_matrix.py`: boot/shutdown animations, auto-update from git, and Tailscale setup.
+- The close sequence doesn't run on a power cut or `kill -9`.
+- Dropped from `double_matrix.py`: auto-update from git.
 
 ## Untested
 
 - `teensy.ino` hasn't been compiled or flashed by me. Nothing has run on a real Pi, Teensy, or wall.
-- The Pi's frame rate is unmeasured. It was about 30 fps on a Windows PC with a 640×360 MJPG test clip. Video decoding plus blur on a Pi may be slower, so run with `--stats`.
-- `install-fan-wall.sh` has never been run (apt, nmcli, systemd).
+- `install.sh` has never run (apt, nmcli, Tailscale, systemd). `run.sh` was only run under Git Bash on Windows.
+- The Pi's frame rate is unmeasured; a Windows PC does about 29 fps with about 1.5 ms of work per frame. Big or HEVC/4K files may be too slow to decode on a Pi, so check the Stats tab.
+- Formats actually decoded in tests: mp4, mov, m4v, mkv, webm, avi (MJPG, XVID), gif, png, jpg, bmp, webp, tiff. Others depend on the Pi's FFmpeg build.
+- Reading the Teensy's USB serial (`/dev/ttyACM0`) is untested.
 - The restart button (`sudo systemctl restart fan-wall`) is untested.
 - Physical meaning of the calibration controls: whether R turns a fan the same way as the real fan, and what cluster/fan swaps look like on the wall.
-- Default font `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` is unverified on the Pi; testing used Arial on Windows.
-- Only an MJPG `.avi` clip was tested. Other formats depend on the Pi's OpenCV build.
+- What the rev animation looks like on real fans, and its direction, which follows the wiring order.
+- Fonts were tested with Pillow's fallback on Windows; the DejaVu, VL Gothic and Noto CJK paths are unverified on the Pi.
 - Large uploads (the limit is 200 MB) and long-running stability are untested.
 - The page was checked only in a Chromium-based browser.
 - `test_fan_wall.py` checks the Python copy of the Teensy's `XY()` against the spec, not against the running firmware.

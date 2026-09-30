@@ -30,7 +30,7 @@ else
         ipv4.method manual ipv4.addresses "$PI_IP" \
         ipv4.never-default yes ipv6.method disabled
 fi
-nmcli con up teensy-link || echo "$ETH_IF not up yet -- plug the Teensy in, it'll connect"
+nmcli --wait 10 con up teensy-link || echo "$ETH_IF not up yet -- plug the Teensy in, it'll connect"
 
 if [ -n "${TS_AUTHKEY:-}" ]; then
     # Remote access. The key only ever comes from the environment -- never

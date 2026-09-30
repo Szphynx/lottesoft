@@ -16,6 +16,7 @@ source "$DIR/rotaryplay.conf"
 chmod +x "$DIR/run.sh"
 
 echo "== packages =="
+dpkg --configure -a   # finish any install that was interrupted earlier, or apt refuses to run
 apt update
 apt install -y python3-opencv python3-numpy python3-pil \
     fonts-dejavu-core fonts-vlgothic fonts-noto-cjk

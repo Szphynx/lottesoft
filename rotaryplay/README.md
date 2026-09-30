@@ -1,4 +1,4 @@
-# fan_wall: Pi video/text player for the 84-fan Teensy wall
+# Rotaryplay: Pi video/text player for the 84-fan Teensy wall
 
     Raspberry Pi --eth0, UDP 5005--> Teensy 4.1 --16 data pins--> 16 Corsair RGB hubs --> 84 fans
 
@@ -6,6 +6,8 @@ The Pi renders an 84×56 RGB image and streams it. The Teensy maps pixels to LED
 `teensy.ino` is the source of truth; `fan_wall.py` reads the wall from it.
 
 ## Files
+
+Everything for Rotaryplay lives in this `rotaryplay/` folder; nothing outside it is used.
 
 | File | What it does |
 |---|---|
@@ -78,7 +80,7 @@ The Pi renders an 84×56 RGB image and streams it. The Teensy maps pixels to LED
    ```bash
    git clone -b Rotaryplay https://github.com/Szphynx/lottesoft
    cd lottesoft
-   sudo bash fan_wall/install-fan-wall.sh
+   sudo bash rotaryplay/install-fan-wall.sh
    ```
    Packages installed: `python3-opencv python3-numpy python3-pil fonts-dejavu-core fonts-vlgothic`.
 
@@ -92,7 +94,7 @@ The Pi renders an 84×56 RGB image and streams it. The Teensy maps pixels to LED
   Change flags in `/etc/default/fan-wall`, then restart.
 - **By hand:**
   ```bash
-  python3 fan_wall/fan_wall.py --media clip.mp4 --text "hello" --stats
+  python3 rotaryplay/fan_wall.py --media clip.mp4 --text "hello" --stats
   ```
 - **Flags:**
   - `--sketch` (default `teensy.ino` next to the script)
@@ -102,7 +104,7 @@ The Pi renders an 84×56 RGB image and streams it. The Teensy maps pixels to LED
   - `--upload-dir`, `--state-file` (`''` disables saving), `--transition-s 0.6`, `--stats`
 - **Self-check** (needs numpy, opencv, pillow):
   ```bash
-  cd fan_wall
+  cd rotaryplay
   python3 test_fan_wall.py
   ```
 - **First run on the wall:** go to Calibration, then run in order: `red`, `green`, `blue`, `row0`, `col0`, `probe`. `row0` and `col0` catch a rotated or mirrored frame. Keep the Teensy serial `torn 0`.

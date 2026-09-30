@@ -2,7 +2,7 @@
 # One-shot Pi setup: packages, static address on the Teensy link, systemd service.
 #
 # Run once, from the repo root:
-#   sudo bash fan_wall/install-fan-wall.sh
+#   sudo bash rotaryplay/install-fan-wall.sh
 #
 # Then:
 #   sudo systemctl status fan-wall     # is it running

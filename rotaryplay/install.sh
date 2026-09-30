@@ -2,8 +2,8 @@
 # One-shot Pi setup for Rotaryplay. Run from anywhere:
 #   sudo bash rotaryplay/install.sh
 # Uses ETH_IF / PI_IP from rotaryplay.conf. Safe to run again.
-# Optional remote access: set TS_AUTHKEY in the environment (sudo -E keeps
-# it) and Tailscale is installed and joined as "rotaryplay".
+# Asks for a Tailscale auth key (hidden; Enter skips), or takes TS_AUTHKEY
+# from the environment; with a key, Tailscale is installed and joined as "rotaryplay".
 #
 # Afterwards:
 #   sudo systemctl restart fan-wall    # after editing rotaryplay.conf
@@ -33,9 +33,16 @@ else
 fi
 nmcli --wait 10 con up teensy-link || echo "$ETH_IF not up yet -- plug the Teensy in, it'll connect"
 
-if [ -n "${TS_AUTHKEY:-}" ]; then
-    # Remote access. The key only ever comes from the environment -- never
-    # put it in this file, rotaryplay.conf or anything else in the repo.
+# Remote access. The key is asked for here (hidden) or taken from the
+# environment -- never put it in this file, rotaryplay.conf or anything else
+# in the repo.
+if [ -z "${TS_AUTHKEY:-}" ] && [ -t 0 ]; then
+    read -rsp "Tailscale auth key (paste, then Enter; just Enter to skip): " TS_AUTHKEY
+    echo
+fi
+if [ -z "${TS_AUTHKEY:-}" ]; then
+    echo "== tailscale: skipped (no key) =="
+else
     echo "== tailscale =="
     command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
     tailscale up --authkey "$TS_AUTHKEY" --hostname "${TS_HOSTNAME:-rotaryplay}"

@@ -84,7 +84,7 @@ Everything for Rotaryplay lives in this `rotaryplay/` folder; nothing outside it
    sudo bash rotaryplay/install.sh
    ```
    - Different interface or address? Edit `ETH_IF` / `PI_IP` in `rotaryplay.conf` first.
-   - Remote access: export `TS_AUTHKEY` and run `sudo -E bash rotaryplay/install.sh`. It installs Tailscale and joins as `rotaryplay` (override with `TS_HOSTNAME`). Keep the key out of the repo.
+   - Remote access: the installer asks for a Tailscale auth key (hidden; just Enter skips). With a key it installs Tailscale and joins as `rotaryplay` (override with `TS_HOSTNAME`). Keep the key out of the repo.
    - Safe to run again.
 
 ## Run

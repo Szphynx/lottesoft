@@ -175,6 +175,44 @@ def rev(t, closing):
 assert rev(0, False).max() == 0 and rev(1.0, False).max() > 200
 assert rev(2.0, True).max() == 0 and rev(0.2, True).max() > 150
 
+
+# Cluster test: only the chosen cluster lights; six fans in their own colours
+# with a white count of the chain number; one fan alone; whole-screen mode.
+snap = fresh().snapshot()
+snap.update(cal_cluster=5, cal_fan=-1)
+led = geo["led_at"][cells[:, 1], cells[:, 0]]
+pin, fan, i = led // 96, led % 96 // 16, led % 16
+img = fw.wire_pattern(geo, snap, cells, "cluster")
+lit = img[cells[:, 1], cells[:, 0]].any(axis=1)
+assert set(pin[lit].tolist()) == {5} and (lit == (pin == 5)).all()
+col = img[cells[:, 1], cells[:, 0]]
+for f in range(6):
+    sel = (pin == 5) & (fan == f)
+    assert (col[sel & (i < f + 1)] == 255).all()
+    assert (col[sel & (i >= f + 1)] == np.array(fw.FAN_COLORS[f]) // 2).all()
+snap["cal_fan"] = 2
+img = fw.wire_pattern(geo, snap, cells, "cluster")
+col = img[cells[:, 1], cells[:, 0]]
+one = (pin == 5) & (fan == 2)
+assert (col[~one] == 0).all() and one.sum() == 16
+assert (col[one & (i == 0)] == 255).all() and (col[one & (i > 0)] == fw.FAN_COLORS[2]).all()
+snap.update(cal_cluster=-1, cal_fan=-1)   # nothing picked yet -> cluster 1
+img = fw.wire_pattern(geo, snap, cells, "cluster")
+assert set(pin[img[cells[:, 1], cells[:, 0]].any(axis=1)].tolist()) == {0}
+
+frame = np.full((56, 84, 3), 200, np.uint8)
+snap.update(cal_cluster=6)
+out = fw.cluster_screen(frame, geo, snap)
+gy, gx = divmod(6, 4)
+inside = out[gy * 14:(gy + 1) * 14, gx * 21:(gx + 1) * 21]
+assert (inside == 200).all() and out.sum() == inside.sum()
+
+s = fresh()
+s.apply_wire({"cal_fan": 3, "cal_cluster": 9, "calibrate": "cluster", "viz": "b"})
+assert (s.cal_fan, s.cal_cluster, s.calibrate, s.viz) == (3, 9, "cluster", "b")
+s.apply_wire({"cal_fan": 9, "viz": "z", "calibrate": "clusterscreen"})
+assert (s.cal_fan, s.viz, s.calibrate) == (5, "b", "clusterscreen")  # out of range clamps, bad viz ignored
+
 # Every page setting is a flag; flags win over the saved settings file.
 path = os.path.join(tmp, "state.json")
 s = fw.State(geo, path)

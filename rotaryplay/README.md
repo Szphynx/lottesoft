@@ -139,17 +139,27 @@ Everything for Rotaryplay lives in this `rotaryplay/` folder; nothing outside it
   - A file that breaks later is skipped instead of stalling the queue.
 - **Image formats:** `.jpg .jpeg .png .bmp .webp .tif .tiff`. Phone photos are auto-rotated from their EXIF tag.
 - **Fonts:** DejaVu Sans (regular/bold/italic). Characters it lacks (Japanese, CJK, kana) fall back per character to VL Gothic, then Noto CJK. If no font is found at all, Pillow's built-in font is used instead of crashing.
-- **Live preview:** every LED drawn as the wall shows it, with cluster outlines and numbers.
-- **Calibration tab:**
+- **Live preview** with two visualizations, chosen above it (`--viz a|b`, saved with the settings):
+  - **A: LED grid:** every LED at its cell position, as the Teensy addresses it.
+  - **B: fan rings:** each fan drawn as a round fan, its 16 LEDs on a true circle (12 outer, 4 inner). It shows the fan as you'd see it, not a pixel grid.
+  - Both draw cluster outlines and pin numbers. Only the drawing differs; the data is the same.
+- **Calibration tab**, with two sub-tabs, **Wall** and **Cluster**:
   - Starts at the Teensy's own mapping; nothing is remapped by default.
-  - Fan pattern: 6 tiles, drag to swap, R rotates a fan 90°, M mirrors it. One pattern applies to every cluster.
-  - Cluster grid: 16 tiles, drag to swap. Clicking one highlights that cluster.
-  - Remapping is done on the Pi; the Teensy is never changed.
-  - Modes:
-    - `fans`: each cluster in its own colour, and the white LED count is the fan number (1-6).
-    - `clusters`: the white LED count is the cluster number (1-16).
-    - `grid`: a colour gradient with a dot on top of each fan.
-    - The spec's test sequence: solid R/G/B, row 0, column 0, probe.
+  - **Cluster sub-tab** (test one hub's six fans):
+    - Pick a cluster with the list or the « » buttons; only it lights, the rest is dark.
+    - **All 6 fans:** each fan in its own colour (1 red, 2 orange, 3 yellow, 4 green, 5 blue, 6 purple) with white LEDs counting its number.
+    - **Fan 1 to fan 6:** that one fan fully lit (all 16 LEDs) with LED 0 white, to check every LED and where the ring starts. A fan that stays dark is on the wrong port or unplugged.
+    - **Whole screen on this cluster:** the full picture (video, text) shrunk onto that one cluster, the rest dark.
+    - It uses the Teensy's own mapping, so it shows the real wiring of that hub.
+  - **Wall sub-tab**:
+    - Fan pattern: 6 tiles, drag to swap, R rotates a fan 90°, M mirrors it. One pattern applies to every cluster.
+    - Cluster grid: 16 tiles, drag to swap. Clicking one highlights that cluster.
+    - Remapping is done on the Pi; the Teensy is never changed.
+    - Modes:
+      - `fans`: each cluster in its own colour, and the white LED count is the fan number (1-6).
+      - `clusters`: the white LED count is the cluster number (1-16).
+      - `grid`: a colour gradient with a dot on top of each fan.
+      - The spec's test sequence: solid R/G/B, row 0, column 0, probe.
 - **Colour tab:**
   - Correction on/off, with R/G/B levels from 0 to 200%. It applies to content only.
   - Softness: blur before downsampling, where 100% is the spec's sigma of source width / 120.

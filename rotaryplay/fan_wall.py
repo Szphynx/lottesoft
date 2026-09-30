@@ -626,8 +626,12 @@ CLUSTER_COLORS = [tuple(round(v * 255) for v in colorsys.hsv_to_rgb(i * 0.618 % 
 
 # Calibration modes sent straight to the wire (the Teensy's own addressing,
 # no remap) vs. drawn on the canvas like content (remap applies).
-WIRE_MODES = ("fans", "clusters", "red", "green", "blue", "row0", "col0", "probe")
-CAL_MODES = ("off", "grid") + WIRE_MODES
+WIRE_MODES = ("fans", "clusters", "cluster", "red", "green", "blue", "row0", "col0", "probe")
+# "clusterscreen" is content, not a wire pattern: the whole picture shrunk onto one cluster.
+CAL_MODES = ("off", "grid", "clusterscreen") + WIRE_MODES
+
+# Per-fan colour for the single-cluster test (chain position 1..6).
+FAN_COLORS = [(255, 0, 0), (255, 128, 0), (255, 255, 0), (0, 255, 0), (0, 128, 255), (200, 0, 255)]
 
 
 def load_sketch(path):
@@ -727,7 +731,10 @@ def wire_pattern(geo, snap, cells, mode):
     (half level) plus a run of white LEDs from LED 0 in wiring order; the
     count is the fan's chain number (1-6) or the cluster's pin number
     (1-16), where the run starts shows how the ring is turned. The rest is
-    the spec's test sequence."""
+    the spec's test sequence. "cluster": only the chosen cluster (cal_cluster,
+    default 1) is lit, its six fans each in their own colour with a white
+    count of their chain number; with cal_fan set, only that fan, all 16 LEDs
+    on and LED 0 white."""
     img = np.zeros((geo["h"], geo["w"], 3), dtype=np.uint8)
     if mode in ("red", "green", "blue"):
         img[..., ("red", "green", "blue").index(mode)] = 255
@@ -737,6 +744,19 @@ def wire_pattern(geo, snap, cells, mode):
         img[:, 0] = 255
     elif mode == "probe":
         img[11, 3] = 255  # LED 0: first fan of hub 0
+    elif mode == "cluster":
+        led = geo["led_at"][cells[:, 1], cells[:, 0]]
+        pin, fan, i = led // geo["lpp"], (led % geo["lpp"]) // LEDS_PER_FAN, led % LEDS_PER_FAN
+        base = np.array(FAN_COLORS, dtype=np.uint8)[fan % len(FAN_COLORS)]
+        if snap["cal_fan"] >= 0:
+            col = base.copy()
+            col[i == 0] = 255
+            col[fan != snap["cal_fan"]] = 0
+        else:
+            col = base // 2
+            col[i < fan + 1] = 255
+        col[pin != max(0, snap["cal_cluster"])] = 0
+        img[cells[:, 1], cells[:, 0]] = col
     else:
         led = geo["led_at"][cells[:, 1], cells[:, 0]]
         pin, fan, i = led // geo["lpp"], (led % geo["lpp"]) // LEDS_PER_FAN, led % LEDS_PER_FAN
@@ -746,6 +766,17 @@ def wire_pattern(geo, snap, cells, mode):
             col[pin != snap["cal_cluster"]] //= 8
         img[cells[:, 1], cells[:, 0]] = col
     return img
+
+
+def cluster_screen(frame, geo, snap):
+    """Whole picture shrunk to one cluster's size and put where that cluster
+    really sits; everything else dark. Lets one cluster's six fans be judged
+    on real content."""
+    mw, mh = geo["mw"], geo["mh"]
+    gy, gx = divmod(snap["cluster_order"][max(0, snap["cal_cluster"])], geo["grid_w"])
+    out = np.zeros_like(frame)
+    out[gy * mh:(gy + 1) * mh, gx * mw:(gx + 1) * mw] = cv2.resize(frame, (mw, mh), interpolation=cv2.INTER_AREA)
+    return out
 
 
 def grid_test_canvas(w, h, p):
@@ -835,6 +866,7 @@ class State:
         self.cc_on = False
         self.cc_r = self.cc_g = self.cc_b = 100
         self.softness = 100
+        self.viz = "a"              # preview style: a = LED grid, b = fan rings
         self.stats_on = False
         self.seq_start_on = False   # rev the fans up at startup
         self.seq_close_on = False   # spin them down on stop
@@ -851,6 +883,7 @@ class State:
         self.rotate180 = False
         self.calibrate = "off"
         self.cal_cluster = -1
+        self.cal_fan = -1           # cluster test: one fan (0-5), -1 = all six
         self.queue = []
         self.version = 0
         if state_file and os.path.isfile(state_file):
@@ -959,13 +992,16 @@ class State:
                                       ("seq_close_s", 0.5, 30, float),
                                       ("seq_rpm", 30, 1800, int),
                                       ("active", 1, geo["pins"], int),
-                                      ("cal_cluster", -1, geo["pins"] - 1, int)):
+                                      ("cal_cluster", -1, geo["pins"] - 1, int),
+                                      ("cal_fan", -1, geo["fans"] - 1, int)):
                 v = _clamp(data, key, lo, hi, cast)
                 if v is not None:
                     setattr(self, key, v)
             for key in ("rotate180", "cc_on", "stats_on", "seq_start_on", "seq_close_on"):
                 if key in data:
                     setattr(self, key, bool(data[key]))
+            if data.get("viz") in ("a", "b"):
+                self.viz = data["viz"]
             if data.get("calibrate") in CAL_MODES:
                 self.calibrate = data["calibrate"]
 
@@ -1168,7 +1204,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         snap, g = self.state.snapshot(), self.geo
         out = {"w": g["w"], "h": g["h"], "p": g["fan_px"], "grid_w": g["grid_w"],
                "cw": g["mw"], "ch": g["mh"], "cluster_w": g["cluster_w"],
-               "calibrate": snap["calibrate"], "active": snap["active"],
+               "calibrate": snap["calibrate"], "viz": snap["viz"], "active": snap["active"],
                "clusters": chain_labels(snap["cluster_order"]),
                "fans": chain_labels(snap["fan_order"]),
                "fan_rot": snap["fan_rot"], "fan_mirror": snap["fan_mirror"],
@@ -1242,6 +1278,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     def _render_page(self):
         snap, g = self.state.snapshot(), self.geo
         info = dict(pins=g["pins"], fans=g["fans"], startup=self.startup,
+                    fan_colors=["#%02x%02x%02x" % c for c in FAN_COLORS],
                     colors=["#%02x%02x%02x" % c for c in CLUSTER_COLORS])
         live = int((g["led_at"] >= 0).sum())
         return (PAGE.replace("__STATE__", json.dumps(self.state.to_wire()).replace("</", "<\\/"))
@@ -1263,6 +1300,7 @@ PAGE = r"""<!doctype html><meta charset="utf-8">
   input[type=range]{width:100%} button,.btn{background:#234;color:#eee;border:none;border-radius:4px;
   padding:.35rem .7rem;cursor:pointer;display:inline-block;font:inherit}
   nav{margin:1rem 0 .5rem;border-bottom:1px solid #333}
+  nav.sub{margin:0 0 .8rem;border:0} nav.sub button{border-radius:4px;margin-right:.3rem}
   nav button{background:none;border-radius:4px 4px 0 0;padding:.45rem .9rem}
   nav button.on{background:#234}
   .tiles{display:inline-grid;gap:4px;margin:.4rem 0}
@@ -1273,6 +1311,8 @@ PAGE = r"""<!doctype html><meta charset="utf-8">
 <h1 style="font-size:1.1rem">Fan wall
   <span id="svc" style="font-size:.6rem;padding:.15rem .5rem;border-radius:3px;background:#2a4;color:#012">ONLINE</span></h1>
 <p class="note">Live preview -- every live LED as sent to the Teensy (__SKETCH__), clusters outlined with their pin number.</p>
+<p style="margin:.3rem 0">Visualization
+  <select data-k="viz"><option value="a">A: LED grid (as addressed)</option><option value="b">B: fan rings</option></select></p>
 <canvas id="preview" style="background:#000;border:1px solid #444;max-width:100%"></canvas>
 <p id="statsWarn" hidden style="background:#542;color:#fd9;padding:.4rem .6rem;border-radius:4px">
   Stats are ON -- measuring and polling costs a little CPU and may lower the frame rate. Turn off in the Stats tab when done.</p>
@@ -1284,11 +1324,34 @@ PAGE = r"""<!doctype html><meta charset="utf-8">
 </nav>
 
 <section data-tab="cal">
+<nav class="sub"><button data-sub="wall">Wall</button><button data-sub="cluster">Cluster</button></nav>
+
+<div data-sub="cluster">
+<p class="note">Test one cluster on its own: pick it, and only its 6 fans light. The Teensy's own mapping is used, so
+this shows the real wiring of that hub.</p>
+<p>Cluster
+  <button onclick="stepCluster(-1)">&laquo;</button>
+  <select data-k="cal_cluster" data-num id="calClusterSel" onchange="clusterMode()"></select>
+  <button onclick="stepCluster(1)">&raquo;</button></p>
+<p><button onclick="clusterMode(-1)">All 6 fans</button>
+  <span id="fanBtns"></span></p>
+<p class="note"><b>All 6 fans:</b> each fan its own colour (1 red, 2 orange, 3 yellow, 4 green, 5 blue, 6 purple)
+with white LEDs counting its number. <b>Single fan:</b> that fan fully lit, LED 0 white -- checks every LED of the
+ring and which end the ring starts. A fan that doesn't light is on the wrong port or unplugged.</p>
+<p><button onclick="clusterScreen()">Whole screen on this cluster</button>
+  <button onclick="setMode('off')">Back to content</button></p>
+<p class="note"><b>Whole screen:</b> the full picture (video, text) shrunk onto this one cluster, the rest dark --
+judge the six fans on real content.</p>
+</div>
+
+<div data-sub="wall">
 <label>Mode <select data-k="calibrate">
   <option value="off">off -- show content</option>
   <option value="fans">fans -- cluster colours, white LEDs = fan number (1-6)</option>
   <option value="clusters">clusters -- cluster colours, white LEDs = cluster number</option>
   <option value="grid">grid -- gradient + white dot on top of every fan</option>
+  <option value="cluster">cluster -- one cluster, its six fans (see the Cluster sub-tab)</option>
+  <option value="clusterscreen">clusterscreen -- whole picture on one cluster</option>
   <option value="red">test: all red</option><option value="green">test: all green</option>
   <option value="blue">test: all blue</option><option value="row0">test: row 0 only</option>
   <option value="col0">test: column 0 only</option><option value="probe">test: corner probe (3,11) = LED 0</option>
@@ -1308,6 +1371,7 @@ Click a tile to highlight that cluster.</p>
 <div id="clusterTiles" class="tiles"></div>
 <button onclick="state.cluster_order=state.cluster_order.map((_,i)=>i);send()">reset to Teensy</button>
 <p class="note">Grid size comes from teensy.ino -- change it there and restart.</p>
+</div>
 </section>
 
 <section data-tab="content">
@@ -1412,6 +1476,43 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b
 let startTab = 'cal';
 try { startTab = localStorage.getItem('tab') || 'cal'; } catch (e) {}
 showTab(startTab);
+
+// Calibration sub-tabs (Wall / Cluster), remembered per browser.
+function showSub(name) {
+  document.querySelectorAll('div[data-sub]').forEach(d => d.hidden = d.dataset.sub !== name);
+  document.querySelectorAll('nav.sub button').forEach(b => b.classList.toggle('on', b.dataset.sub === name));
+  try { localStorage.setItem('sub', name); } catch (e) {}
+}
+document.querySelectorAll('nav.sub button').forEach(b => b.onclick = () => showSub(b.dataset.sub));
+let startSub = 'wall';
+try { startSub = localStorage.getItem('sub') || 'wall'; } catch (e) {}
+showSub(startSub);
+
+// Cluster test: cluster picker, per-fan buttons, whole-screen mode.
+function setMode(mode) {
+  state.calibrate = mode;
+  document.querySelector('select[data-k=calibrate]').value = mode;
+  send();
+}
+function clusterMode(fan) {
+  if (fan !== undefined) state.cal_fan = fan;
+  if (state.cal_cluster < 0) state.cal_cluster = 0;
+  document.getElementById('calClusterSel').value = state.cal_cluster;
+  setMode('cluster');
+}
+function clusterScreen() {
+  if (state.cal_cluster < 0) state.cal_cluster = 0;
+  setMode('clusterscreen');
+}
+function stepCluster(d) {
+  state.cal_cluster = ((Math.max(0, state.cal_cluster) + d) % GEO.pins + GEO.pins) % GEO.pins;
+  document.getElementById('calClusterSel').value = state.cal_cluster;
+  state.calibrate === 'clusterscreen' ? send() : clusterMode();
+}
+document.getElementById('calClusterSel').innerHTML =
+  Array.from({length: GEO.pins}, (_, i) => `<option value="${i}">${i + 1}</option>`).join('');
+document.getElementById('fanBtns').innerHTML = Array.from({length: GEO.fans}, (_, i) =>
+  `<button onclick="clusterMode(${i})" style="color:${GEO.fan_colors[i]}">fan ${i + 1}</button>`).join(' ');
 
 // Every [data-k] control is bound to state[k]; a matching #v-k shows its value.
 const calSel = document.getElementById('calCluster');
@@ -1537,12 +1638,39 @@ function renderCalibration(d) {
 }
 
 const S = 6;  // preview px per frame cell
+// Visualization B: each fan as a round fan -- a ring outline with its 16 LEDs
+// on a true circle (12 outer, 4 inner) instead of at their 7x7 cell positions,
+// so it shows the fan you'd see, not a pixel grid.
+function drawRings(g, d) {
+  const p = d.p, half = (p - 1) / 2, R = p * S * 0.4, r0 = R * 0.38, dot = S * 0.5;
+  const seen = new Set();
+  for (let i = 0; i < d.leds.length; i += 5) {
+    const [x, y, r, gr, b] = d.leds.slice(i, i + 5);
+    const fx = Math.floor(x / p) * p, fy = Math.floor(y / p) * p;
+    const cx = (fx + half + .5) * S, cy = (fy + half + .5) * S;
+    const key = fx + ',' + fy;
+    if (!seen.has(key)) {
+      seen.add(key);
+      g.strokeStyle = '#2a2a2a';
+      g.beginPath();
+      g.arc(cx, cy, R + dot + 1, 0, 7);
+      g.stroke();
+    }
+    const dx = x - fx - half, dy = y - fy - half, a = Math.atan2(dy, dx);
+    const rad = Math.hypot(dx, dy) < 1.5 ? r0 : R;
+    g.fillStyle = r + gr + b ? `rgb(${r},${gr},${b})` : '#222';
+    g.beginPath();
+    g.arc(cx + Math.cos(a) * rad, cy + Math.sin(a) * rad, dot, 0, 7);
+    g.fill();
+  }
+}
 function drawPreview(d) {
   const cv = document.getElementById('preview');
   if (cv.width !== d.w * S || cv.height !== d.h * S) { cv.width = d.w * S; cv.height = d.h * S; }
   const g = cv.getContext('2d');
   g.fillStyle = '#000';
   g.fillRect(0, 0, cv.width, cv.height);
+  if (d.viz === 'b') drawRings(g, d); else
   for (let i = 0; i < d.leds.length; i += 5) {
     const [x, y, r, gr, b] = d.leds.slice(i, i + 5);
     g.fillStyle = r + gr + b ? `rgb(${r},${gr},${b})` : '#1c1c1c';
@@ -1655,7 +1783,7 @@ def make_control_server(state, geo, port, upload_dir, preview, stats, startup):
 # ---- main ------------------------------------------------------------------
 
 # Settings whose flag takes a fixed set of values.
-FLAG_CHOICES = {"calibrate": CAL_MODES, "text_direction": ("left", "right", "up", "down"),
+FLAG_CHOICES = {"calibrate": CAL_MODES, "viz": ("a", "b"), "text_direction": ("left", "right", "up", "down"),
                 "text_glyph_rotate": (0, 90, 270)}
 
 
@@ -1806,6 +1934,8 @@ def main():
                         frame[H - text_h:] = scroller.frame(scroll_offset)
                     trail = apply_trail(trail, frame, snap["trail_wet"])
                     frame = color_correct(trail.astype(np.uint8), snap)
+                    if snap["calibrate"] == "clusterscreen":
+                        frame = cluster_screen(frame, geo, snap)
                 if snap["rotate180"]:
                     frame = frame[::-1, ::-1]
                 # Each cell the Teensy addresses gets the canvas pixel where

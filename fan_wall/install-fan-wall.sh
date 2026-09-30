@@ -20,10 +20,13 @@ apt update
 apt install -y python3-opencv python3-numpy python3-pil fonts-dejavu-core fonts-vlgothic
 
 echo "== eth0 -> Teensy (192.168.60.0/24, same subnet as the sketch) =="
-# Pi gets .10, Teensy is .50. Wi-Fi stays the Pi's way onto the LAN.
+# Pi gets .20, Teensy is .50 (pi_streamer_spec.md). never-default matters:
+# without it this link steals the default route and the Pi loses internet
+# over Wi-Fi.
 if ! nmcli -t -f NAME con show | grep -qx teensy-link; then
     nmcli con add type ethernet ifname eth0 con-name teensy-link \
-        ipv4.method manual ipv4.addresses 192.168.60.10/24 ipv6.method ignore
+        ipv4.method manual ipv4.addresses 192.168.60.20/24 \
+        ipv4.never-default yes ipv6.method disabled
 fi
 nmcli con up teensy-link || echo "eth0 not up yet -- plug the Teensy in, it'll connect"
 

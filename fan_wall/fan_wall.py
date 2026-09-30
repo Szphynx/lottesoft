@@ -1,47 +1,40 @@
 #!/usr/bin/env python3
 """
-Video + scrolling text on the fan wall: Raspberry Pi renders, Teensy 4.1
+Video + scrolling text on the 84-fan wall: Raspberry Pi renders, Teensy 4.1
 drives the LEDs.
 
-    Pi --ethernet/UDP--> Teensy (teensy_globalxy_udp_control.ino)
-                           --16 data pins--> Corsair RGB hubs, one per cluster
-                                               --> 6 fans in series, 16 LEDs each
+    Pi --eth0, UDP 5005--> Teensy (teensy.ino) --16 pins--> Corsair hubs --> fans
 
-The wall's wiring is whatever the Teensy sketch says it is: this script
-reads kMatrixWidth/kMatrixHeight/kCols/kRows/kLEDS_PER_PANEL and XYTable
-straight out of the .ino at startup, so the two never drift. From that it
-knows the 16-LED fan pattern, how many fans each pin carries, and the
-default fan arrangement inside a cluster.
+The Teensy owns the LED addressing: the Pi sends a plain 84 x 56 RGB image,
+one 255-byte datagram per row (see pi_streamer_spec.md). Everything this
+script knows about the wall -- frame size, clusters, fans, the 16-LED ring,
+which cells are live, address/port/sync byte -- it reads out of teensy.ino
+at startup, so the sketch stays the source of truth.
 
-On top of that, calibration from the web page, two levels:
-    Fan pattern     how the fans of ONE cluster sit (which chain position is
-                    in which spot, plus per-fan rotation/mirror). Every
-                    cluster follows it -- configure one, all follow.
-    Cluster grid    which pin's cluster sits where in the wall. Grid size
-                    (clusters across/down, fans per cluster across/down) is
-                    set with the Apply button.
-    Calibration     every cluster in its own colour, plus a count of white
-                    LEDs per fan: "fans" counts the fan's chain position
-                    (1..6), "clusters" the cluster's pin number (1..16).
-                    Optionally one cluster highlighted. The preview labels
-                    every cluster and fan -- make the wall match it. "grid": a hue/brightness
-                    gradient with a white dot at the top of every fan -- any
-                    break in the gradient or a dot off the top is a wrong
-                    mapping.
+Web page on :8099, tabs:
+    Calibration  just in case. Starts at the Teensy's own mapping (no
+                 remap); if the wall disagrees, move fans/clusters and the
+                 Pi shifts pixels so they land right -- the Teensy never
+                 changes. Modes: "fans"/"clusters" (each cluster its own
+                 colour, white LED count = fan / cluster number, straight on
+                 the wire), "grid" (gradient + dot on top of every fan), and
+                 the spec's test sequence (solid R/G/B, row 0, column 0,
+                 corner probe).
+    Content      text, playback queue, media transforms.
+    Colour       colour correction on/off, R/G/B levels, softness (blur
+                 before downsampling).
+    Settings     brightness, active clusters, save/load, restart.
+Save settings stores everything; it's reloaded on startup.
 
 Video/text/queue/web UI come from lottesoft's double_matrix.py (MAX7219
-version), with the 1-bit output stage swapped for RGB-over-UDP.
-
-Frame packets to the Teensy: b"F" + uint16 LE byte offset + RGB bytes, in
-LED-buffer order (pin 0's 96 LEDs first). The Teensy shows the frame when
-the last chunk lands.
+version), with the 1-bit output stage swapped for the Teensy's RGB rows.
 
 Run with:
-    sudo python3 fan_wall.py                     # web UI on :8099
-    sudo python3 fan_wall.py --media clip.mp4 --text "hello"
+    python3 fan_wall.py                     # web UI on :8099
+    python3 fan_wall.py --media clip.mp4 --text "hello"
 
 Needs: python3-opencv python3-numpy python3-pil fonts-dejavu-core
-(scripts/install-fan-wall.sh does all of it plus the systemd service).
+(install-fan-wall.sh does all of it plus the systemd service).
 """
 
 import argparse
@@ -52,7 +45,6 @@ import os
 import re
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -145,15 +137,22 @@ def glyph_font_for(ch, fonts, notdef_sigs, dummy):
     return fonts[-1]
 
 
-def fit_frame(frame, fit, out_w, out_h):
+def fit_frame(frame, fit, out_w, out_h, softness=1.0):
     """Resize an RGB frame to out_w x out_h, either cropping to fill or
-    letterboxing to fit the whole frame."""
+    letterboxing to fit the whole frame. `softness` (1.0 = the spec's
+    sigma of source_width/120 at 84 px wide) blurs before downsampling --
+    16-LED rings alias into flicker otherwise; 0 turns it off."""
     h, w = frame.shape[:2]
     if fit == "fill":
         scale = max(out_w / w, out_h / h)
     else:  # letterbox
         scale = min(out_w / w, out_h / h)
     nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    if softness > 0:
+        if w > 4 * nw:  # ponytail: blur at 4x output size, not full source -- same look, far less CPU
+            frame = cv2.resize(frame, (4 * nw, max(1, round(h * 4 * nw / w))),
+                               interpolation=cv2.INTER_AREA)
+        frame = cv2.GaussianBlur(frame, (0, 0), softness * 0.7 * frame.shape[1] / nw)
     resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
 
     if fit == "fill":
@@ -235,10 +234,10 @@ class ClipSource:
         else:
             self.total_s = float("inf")  # unknown length -- rely on EOF instead
 
-    def get_frame(self, fit, out_w, out_h):
+    def get_frame(self, fit, out_w, out_h, softness=1.0):
         """Returns (frame, eof) -- eof means playback ended and won't loop."""
         if self.kind == "image":
-            return fit_frame(self.still, fit, out_w, out_h), False
+            return fit_frame(self.still, fit, out_w, out_h, softness), False
 
         ok, frame = self.cap.read()
         if not ok:
@@ -248,7 +247,7 @@ class ClipSource:
             ok, frame = self.cap.read()
             if not ok:
                 return np.zeros((out_h, out_w, 3), dtype=np.uint8), True
-        return fit_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), fit, out_w, out_h), False
+        return fit_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), fit, out_w, out_h, softness), False
 
     def close(self):
         if self.cap:
@@ -271,6 +270,7 @@ class QueuePlayer:
         self.next_clip = None
         self.transitioning = False
         self.elapsed = 0.0
+        self.softness = 1.0  # set from the live state each frame
 
     @staticmethod
     def _open(item):
@@ -313,7 +313,7 @@ class QueuePlayer:
                 self.transitioning = True
 
         blank = np.zeros((out_h, canvas_w, 3), dtype=np.uint8)
-        frame_a, eof_a = self.current_clip.get_frame(self.fit, canvas_w, out_h) \
+        frame_a, eof_a = self.current_clip.get_frame(self.fit, canvas_w, out_h, self.softness) \
             if self.current_clip else (blank, False)
         done = eof_a or (self.current_clip and self.elapsed >= self.current_clip.total_s)
 
@@ -324,7 +324,7 @@ class QueuePlayer:
         if self.transitioning and self.next_clip:
             t = 1.0 - max(0.0, min(1.0, remaining / self.transition_s)) if self.transition_s else 1.0
             t = t * t * (3 - 2 * t)  # smoothstep ease in/out
-            frame_b, _ = self.next_clip.get_frame(self.fit, canvas_w, out_h)
+            frame_b, _ = self.next_clip.get_frame(self.fit, canvas_w, out_h, self.softness)
             next_item = self._find(queue, self.next_id)
             frame_b = adjust_frame(frame_b, next_item.get("brightness", 100) if next_item else 100,
                                     next_item.get("contrast", 100) if next_item else 100)
@@ -563,68 +563,83 @@ def _queue_item_row(item):
 
 
 
-# ---- wall geometry, read from the Teensy sketch -----------------------------
+# ---- wall geometry, read from teensy.ino ------------------------------------
 
 LEDS_PER_FAN = 16  # Corsair LL-style fan: 4 inner + 12 outer LEDs
-NO_LED = 65535
 
 # Calibration colour per cluster (pin), golden-ratio hue steps so chain and
 # grid neighbours never look alike. Same list drives the wall and the page.
 CLUSTER_COLORS = [tuple(round(v * 255) for v in colorsys.hsv_to_rgb(i * 0.618 % 1, 1, 1))
                   for i in range(32)]
 
+# Calibration modes sent straight to the wire (the Teensy's own addressing,
+# no remap) vs. drawn on the canvas like content (remap applies).
+WIRE_MODES = ("fans", "clusters", "red", "green", "blue", "row0", "col0", "probe")
+CAL_MODES = ("off", "grid") + WIRE_MODES
+
 
 def load_sketch(path):
-    """Everything the wiring already says, read out of the .ino: one panel
-    (= one cluster = one pin) is kMatrixWidth x kMatrixHeight cells,
-    kCols x kRows of them, kLEDS_PER_PANEL LEDs each, and XYTable says
-    which LED of the pin's chain sits in which cell. From that: the fan
-    cell size, the 16-LED ring pattern inside it, and where each fan of
-    the chain sits in the cluster."""
+    """Everything the wall's wiring says, read out of teensy.ino: panel (=
+    cluster = one pin) size in cells, kCols x kRows of them,
+    kLEDS_PER_PANEL LEDs each, XYTable (which LED of the pin's chain sits in
+    which cell), network settings and sync byte. From that: fan cell size,
+    the 16-LED ring pattern, and `led_at` -- the Teensy's XY() for every
+    cell of the frame, -1 where no LED is lit."""
     with open(path, encoding="utf-8") as f:
         src = f.read()
 
     def const(name):
-        return int(re.search(rf"\b{name}\b\s*=?\s*(\d+)", src).group(1))
+        return int(re.search(rf"\b{name}\b\s*=?\s*(0x[0-9A-Fa-f]+|\d+)", src).group(1), 0)
 
-    body = re.search(r"XYTable\[\]\s*=\s*\{(.*?)\}", src, re.S).group(1)
-    table = [int(v) for v in re.findall(r"\d+", body)]
+    body = re.search(r"XYTable\[\]\s*=\s*\{(.*?)\};", src, re.S).group(1)
+    table = [None if t in ("NL", "65535") else int(t) for t in re.findall(r"\bNL\b|\d+", body)]
     mw, mh = const("kMatrixWidth"), const("kMatrixHeight")
-    leds_per_pin = const("kLEDS_PER_PANEL")
-    fans = leds_per_pin // LEDS_PER_FAN
+    cols, rows = const("kCols"), const("kRows")
+    lpp = const("kLEDS_PER_PANEL")
+    fans = lpp // LEDS_PER_FAN
+    if len(table) != mw * mh:
+        sys.exit(f"{path}: XYTable has {len(table)} cells, expected {mw}x{mh}")
 
     cells = {}
     for k, j in enumerate(table):
-        if j != NO_LED:
+        if j is not None:
             cells[divmod(j, LEDS_PER_FAN)] = (k % mw, k // mw)
-    origin = [(min(cells[f, i][0] for i in range(LEDS_PER_FAN)),
-               min(cells[f, i][1] for i in range(LEDS_PER_FAN))) for f in range(fans)]
-    cluster_w = len({ox for ox, _ in origin})
-    cluster_h = fans // cluster_w
+    cluster_w = len({min(cells[f, i][0] for i in range(LEDS_PER_FAN)) for f in range(fans)})
     p = mw // cluster_w
-    if p * cluster_w != mw or p * cluster_h != mh:
+    cluster_h = mh // p
+    if cluster_w * cluster_h != fans or p * cluster_w != mw or p * cluster_h != mh:
         sys.exit(f"{path}: XYTable fans don't tile the {mw}x{mh} panel in square cells")
-
-    fan_order, ring = [], None
+    ring = [(cells[0, i][0] % p, cells[0, i][1] % p) for i in range(LEDS_PER_FAN)]
     for f in range(fans):
-        col, row = origin[f][0] // p, origin[f][1] // p
-        fan_order.append(row * cluster_w + col)
-        r = [(cells[f, i][0] - col * p, cells[f, i][1] - row * p) for i in range(LEDS_PER_FAN)]
-        if ring is None:
-            ring = r
-        elif r != ring:
+        if [(cells[f, i][0] % p, cells[f, i][1] % p) for i in range(LEDS_PER_FAN)] != ring:
             sys.exit(f"{path}: fan {f + 1} has a different LED pattern than fan 1")
 
+    # teensy.ino XYPanel's corner exemptions, mirrored by hand -- they're
+    # code, not table data. test_fan_wall.py pins them to the spec (1344
+    # live LEDs, dead corners, the corner probe).
+    corners = "Corner exemptions" in src
+    half = lpp // 2
+    w, h = mw * cols, mh * rows
+    led_at = np.full((h, w), -1, dtype=np.int32)
+    for y in range(h):
+        for x in range(w):
+            j = table[(y % mh) * mw + x % mw]
+            if j is None:
+                continue
+            panel = (y // mh) * cols + x // mw
+            if corners and panel in (0, cols - 1):
+                if j < half:
+                    continue      # top fan row missing
+                j -= half         # bottom-row fans sit on ports 1-3
+            if corners and panel in ((rows - 1) * cols, rows * cols - 1) and j >= half:
+                continue          # bottom fan row missing
+            led_at[y, x] = panel * lpp + j
+
     ip = ".".join(re.search(r"teensyIP\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)", src).groups())
-    return dict(teensy_ip=ip, teensy_port=const("LISTEN_PORT"),
-                pins=const("kCols") * const("kRows"), leds_per_pin=leds_per_pin,
-                fans=fans, fan_px=p, ring=ring, cluster_w=cluster_w, cluster_h=cluster_h,
-                fan_order=fan_order, grid_w=const("kCols"), grid_h=const("kRows"))
-
-
-def canvas_size(geo, snap):
-    p = geo["fan_px"]
-    return snap["grid_w"] * snap["cluster_w"] * p, snap["grid_h"] * snap["cluster_h"] * p
+    return dict(teensy_ip=ip, teensy_port=const("LISTEN_PORT"), sync=const("SYNC_BYTE"),
+                pins=cols * rows, lpp=lpp, fans=fans, fan_px=p, ring=ring,
+                cluster_w=cluster_w, cluster_h=cluster_h, grid_w=cols, grid_h=rows,
+                mw=mw, mh=mh, w=w, h=h, led_at=led_at)
 
 
 def ring_cell(x, y, p, rot, mirror):
@@ -635,54 +650,50 @@ def ring_cell(x, y, p, rot, mirror):
     return x, y
 
 
-def build_led_map(geo, snap):
-    """LED-buffer index -> canvas (x, y); -1 where that LED shows nothing
-    (pins past the grid, or past `active`). Chain side: pin c, fan f,
-    LED i is buffer index (c * leds_per_pin + f * 16 + i), the same order
-    the Teensy's leds[] has. Wall side: cluster_order puts pin c at a grid
-    slot, fan_order puts fan f at a slot inside the cluster, fan_rot/
-    fan_mirror turn the ring -- the same fan pattern for every cluster."""
-    p, per_pin = geo["fan_px"], geo["leds_per_pin"]
-    cw, ch, gw = snap["cluster_w"], snap["cluster_h"], snap["grid_w"]
-    pos = np.full((geo["pins"] * per_pin, 2), -1, dtype=np.int32)
-    for c, slot in enumerate(snap["cluster_order"][:snap["active"]]):
-        gy, gx = divmod(slot, gw)
-        for f, fslot in enumerate(snap["fan_order"]):
-            fy, fx = divmod(fslot, cw)
-            ox, oy = (gx * cw + fx) * p, (gy * ch + fy) * p
-            for i, (x, y) in enumerate(geo["ring"]):
-                x, y = ring_cell(x, y, p, snap["fan_rot"][f], snap["fan_mirror"][f])
-                pos[c * per_pin + f * LEDS_PER_FAN + i] = (ox + x, oy + y)
-    return pos
+def build_remap(geo, snap):
+    """Every live cell as the Teensy addresses it -> where that LED really
+    sits on the wall, per calibration. cluster_order[s] / fan_order[s] =
+    the slot the cluster / fan the Teensy puts at slot s really occupies;
+    fan_rot / fan_mirror turn that fan's ring. One fan pattern for every
+    cluster. Defaults are identity: the Teensy's own mapping."""
+    p, mw, mh, cw, gw = geo["fan_px"], geo["mw"], geo["mh"], geo["cluster_w"], geo["grid_w"]
+    ys, xs = np.nonzero(geo["led_at"] >= 0)
+    real = np.empty((len(xs), 2), dtype=np.int32)
+    for k, (x, y) in enumerate(zip(xs, ys)):
+        lx, ly = x % mw, y % mh
+        g = (y // mh) * gw + x // mw
+        q = (ly // p) * cw + lx // p
+        rg, rq = snap["cluster_order"][g], snap["fan_order"][q]
+        rx, ry = ring_cell(lx % p, ly % p, p, snap["fan_rot"][q], snap["fan_mirror"][q])
+        real[k] = ((rg % gw) * mw + (rq % cw) * p + rx, (rg // gw) * mh + (rq // cw) * p + ry)
+    return np.stack([xs, ys], axis=1).astype(np.int32), real
 
 
-def sample_canvas(canvas, pos):
-    buf = np.zeros((len(pos), 3), dtype=np.uint8)
-    used = pos[:, 0] >= 0
-    buf[used] = canvas[pos[used, 1], pos[used, 0]]
-    return buf
-
-
-def chain_test_buffer(geo, snap, count):
-    """Chain-space pattern, no mapping involved -- what's on the wire:
-    every fan in its cluster's colour (half level), plus a count of white LEDs
-    starting at LED 0 in wiring order. count="fan": N = the fan's position
-    on the chain (1..6); count="cluster": N = the cluster's pin number
-    (1..16). The white run also shows where each ring starts and which way
-    it's wired. With a cluster picked, only that pin is bright. The preview
-    draws this through the current mapping -- when the wall matches the
-    preview, wiring and clustering are right."""
-    buf = np.zeros((geo["pins"], geo["fans"], LEDS_PER_FAN, 3), dtype=np.uint8)
-    for c in range(geo["pins"]):
-        buf[c] = [v // 2 for v in CLUSTER_COLORS[c]]
-        for f in range(geo["fans"]):
-            n = f + 1 if count == "fan" else c + 1
-            buf[c, f, :n] = 255
-    if snap["cal_cluster"] >= 0:
-        dim = np.arange(geo["pins"]) != snap["cal_cluster"]
-        buf[dim] //= 8
-    buf[snap["active"]:] = 0
-    return buf.reshape(-1, 3)
+def wire_pattern(geo, snap, cells, mode):
+    """A frame exactly as it goes on the wire, no calibration -- what the
+    wiring really does. fans/clusters: each fan in its cluster's colour
+    (half level) plus a run of white LEDs from LED 0 in wiring order; the
+    count is the fan's chain number (1-6) or the cluster's pin number
+    (1-16), where the run starts shows how the ring is turned. The rest is
+    the spec's test sequence."""
+    img = np.zeros((geo["h"], geo["w"], 3), dtype=np.uint8)
+    if mode in ("red", "green", "blue"):
+        img[..., ("red", "green", "blue").index(mode)] = 255
+    elif mode == "row0":
+        img[0] = 255
+    elif mode == "col0":
+        img[:, 0] = 255
+    elif mode == "probe":
+        img[11, 3] = 255  # LED 0: first fan of hub 0
+    else:
+        led = geo["led_at"][cells[:, 1], cells[:, 0]]
+        pin, fan, i = led // geo["lpp"], (led % geo["lpp"]) // LEDS_PER_FAN, led % LEDS_PER_FAN
+        col = np.array(CLUSTER_COLORS, dtype=np.uint8)[pin] // 2
+        col[i < (fan + 1 if mode == "fans" else pin + 1)] = 255
+        if snap["cal_cluster"] >= 0:
+            col[pin != snap["cal_cluster"]] //= 8
+        img[cells[:, 1], cells[:, 0]] = col
+    return img
 
 
 def grid_test_canvas(w, h, p):
@@ -696,6 +707,16 @@ def grid_test_canvas(w, h, p):
     rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     rgb[0::p, p // 2::p] = 255
     return rgb
+
+
+def color_correct(frame, snap):
+    """Per-channel levels, percent. The LEDs aren't perceptually even --
+    greens read brighter than reds/pinks at the same value -- so the usual
+    move is green down, red up. Also cuts power on green-heavy content."""
+    if not snap["cc_on"] or (snap["cc_r"], snap["cc_g"], snap["cc_b"]) == (100, 100, 100):
+        return frame
+    gain = np.array([snap["cc_r"], snap["cc_g"], snap["cc_b"]], dtype=np.float32) / 100.0
+    return np.clip(frame * gain, 0, 255).astype(np.uint8)
 
 
 def hex_to_rgb(value):
@@ -715,8 +736,8 @@ def _clamp(data, key, lo, hi, cast=float):
 class State:
     """Live-editable settings shared between the render loop and the web
     server. `version` bumps only on changes that need a rebuild (text
-    bitmap, canvas size); the LED map is rebuilt whenever its own inputs
-    change (see map_key in main)."""
+    bitmap, queue); the calibration remap is rebuilt whenever its own
+    inputs change (see remap_key in main)."""
 
     def __init__(self, args, geo, state_file=None):
         self.lock = threading.Lock()
@@ -738,13 +759,14 @@ class State:
         self.media_scale = 100.0
         self.media_pos_x = 0
         self.media_pos_y = 0
-        self.grid_w, self.grid_h = geo["grid_w"], geo["grid_h"]
-        self.cluster_w, self.cluster_h = geo["cluster_w"], geo["cluster_h"]
-        self.fan_order = list(geo["fan_order"])
+        self.cc_on = False
+        self.cc_r = self.cc_g = self.cc_b = 100
+        self.softness = 100
+        self.fan_order = list(range(geo["fans"]))
         self.fan_rot = [0] * geo["fans"]
         self.fan_mirror = [False] * geo["fans"]
-        self.cluster_order = list(range(self.grid_w * self.grid_h))
-        self.active = len(self.cluster_order)
+        self.cluster_order = list(range(geo["pins"]))
+        self.active = geo["pins"]
         self.rotate180 = False
         self.calibrate = "off"
         self.cal_cluster = -1
@@ -772,17 +794,18 @@ class State:
             self.queue = [q for q in queue if os.path.isfile(q.get("path", ""))]
 
     def save(self):
-        """Persist so `_load` restores it next boot. Called when "Save
-        config" is pressed, not on every edit."""
+        """Persist so `_load` restores it next start. Called from the page's
+        Save settings button, not on every edit."""
         if not self.state_file:
-            return
+            return False
         try:
             tmp = self.state_file + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self.to_wire(), f, indent=2)
             os.replace(tmp, self.state_file)
+            return True
         except OSError:
-            pass
+            return False
 
     def snapshot(self):
         with self.lock:
@@ -808,8 +831,8 @@ class State:
             self.version += 1
 
     def apply_wire(self, data):
-        """Bulk-update from a JSON dict -- the page's live edits or a loaded
-        config file. Missing or invalid fields keep their current value."""
+        """Bulk-update from a JSON dict -- the page's live edits or a saved
+        settings file. Missing or invalid fields keep their current value."""
         geo = self.geo
         with self.lock:
             rebuild = False
@@ -840,31 +863,18 @@ class State:
                                       ("media_scale", 10, 400, float),
                                       ("media_pos_x", -9999, 9999, int),
                                       ("media_pos_y", -9999, 9999, int),
+                                      ("cc_r", 0, 200, int), ("cc_g", 0, 200, int),
+                                      ("cc_b", 0, 200, int), ("softness", 0, 300, int),
+                                      ("active", 1, geo["pins"], int),
                                       ("cal_cluster", -1, geo["pins"] - 1, int)):
                 v = _clamp(data, key, lo, hi, cast)
                 if v is not None:
                     setattr(self, key, v)
-            if "rotate180" in data:
-                self.rotate180 = bool(data["rotate180"])
-            if data.get("calibrate") in ("off", "fans", "clusters", "grid"):
+            for key in ("rotate180", "cc_on"):
+                if key in data:
+                    setattr(self, key, bool(data[key]))
+            if data.get("calibrate") in CAL_MODES:
                 self.calibrate = data["calibrate"]
-
-            # Grid shape -- only as a full set, from the Apply button. Fans
-            # per cluster and the pin count are the sketch's, not ours.
-            shape_keys = ("grid_w", "grid_h", "cluster_w", "cluster_h")
-            if all(k in data for k in shape_keys):
-                try:
-                    gw, gh, cw, ch = (int(data[k]) for k in shape_keys)
-                except (TypeError, ValueError):
-                    gw = 0
-                if gw > 0 and gh > 0 and cw > 0 and ch > 0 and cw * ch == geo["fans"] \
-                        and gw * gh <= geo["pins"] \
-                        and (gw, gh, cw, ch) != (self.grid_w, self.grid_h, self.cluster_w, self.cluster_h):
-                    if gw * gh != len(self.cluster_order):
-                        self.cluster_order = list(range(gw * gh))
-                        self.active = gw * gh
-                    self.grid_w, self.grid_h, self.cluster_w, self.cluster_h = gw, gh, cw, ch
-                    rebuild = True
 
             # Orders only take a complete permutation -- a half-finished
             # edit never scrambles the wall.
@@ -887,9 +897,6 @@ class State:
                     self.fan_mirror = mir
             except (KeyError, TypeError):
                 pass
-            v = _clamp(data, "active", 1, len(self.cluster_order), int)
-            if v is not None:
-                self.active = v
 
             if "queue" in data and isinstance(data["queue"], list):
                 by_id = {item["id"]: item for item in self.queue}
@@ -923,20 +930,23 @@ class State:
 # ---- Teensy link -----------------------------------------------------------
 
 class TeensyLink:
-    # ponytail: fixed chunk size, 4 packets per 1536-LED frame; lower it if
-    # blink_control.py --test shows the Teensy dropping packets.
-    CHUNK = 1152
+    """teensy.ino's protocol: one datagram per row -- sync byte, frame
+    sequence number, row index, the row's RGB bytes. Same sequence number on
+    every row of a frame; the Teensy shows a frame once all rows are in, or
+    the next sequence number arrives, or 120 ms pass."""
 
-    def __init__(self, ip, port):
+    def __init__(self, ip, port, sync):
         self.addr = (ip, port)
+        self.sync = sync
+        self.seq = 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.warned = False
 
-    def send_frame(self, data):
+    def send_frame(self, img):
+        self.seq = (self.seq + 1) & 0xFF
         try:
-            for off in range(0, len(data), self.CHUNK):
-                self.sock.sendto(b"F" + struct.pack("<H", off) + data[off:off + self.CHUNK],
-                                 self.addr)
+            for y, row in enumerate(img):
+                self.sock.sendto(bytes((self.sync, self.seq, y)) + row.tobytes(), self.addr)
             self.warned = False
         except OSError as e:
             if not self.warned:  # cable out / wrong subnet: say so once, keep rendering
@@ -947,16 +957,16 @@ class TeensyLink:
 # ---- web control -----------------------------------------------------------
 
 class Preview:
-    """The LED buffer just sent (before brightness) plus where each LED
-    sits on the canvas, for the page's fan-ring emulator."""
+    """Colour of every live LED just sent (before brightness) and where it
+    really sits on the wall, for the page's fan-ring emulator."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.data = None
 
-    def update(self, buf, pos, w, h):
+    def update(self, colors, real, fan_labels):
         with self.lock:
-            self.data = (buf, pos, w, h)
+            self.data = (colors, real, fan_labels)
 
     def snapshot(self):
         with self.lock:
@@ -985,7 +995,6 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         if path in ("/", ""):
             self._send(self._render_page(), "text/html; charset=utf-8")
         elif path == "/config.json":
-            self.state.save()
             self._send(json.dumps(self.state.to_wire(), indent=2), "application/json",
                        extra_headers={"Content-Disposition": 'attachment; filename="fan-wall-config.json"'})
         elif path == "/frame.json":
@@ -995,20 +1004,19 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def _frame_data(self):
-        snap = self.state.snapshot()
-        p = self.geo["fan_px"]
-        out = {"p": p, "grid_w": snap["grid_w"], "grid_h": snap["grid_h"],
-               "cw": snap["cluster_w"] * p, "ch": snap["cluster_h"] * p,
-               "cluster_w": snap["cluster_w"], "calibrate": snap["calibrate"],
-               "clusters": chain_labels(snap["cluster_order"]), "active": snap["active"],
+        snap, g = self.state.snapshot(), self.geo
+        out = {"w": g["w"], "h": g["h"], "p": g["fan_px"], "grid_w": g["grid_w"],
+               "cw": g["mw"], "ch": g["mh"], "cluster_w": g["cluster_w"],
+               "calibrate": snap["calibrate"], "active": snap["active"],
+               "clusters": chain_labels(snap["cluster_order"]),
                "fans": chain_labels(snap["fan_order"]),
                "fan_rot": snap["fan_rot"], "fan_mirror": snap["fan_mirror"],
-               "cal_cluster": snap["cal_cluster"], "w": 0, "h": 0, "leds": []}
+               "cal_cluster": snap["cal_cluster"], "leds": [], "fan_labels": []}
         data = self.preview.snapshot()
         if data:
-            buf, pos, out["w"], out["h"] = data
-            used = pos[:, 0] >= 0
-            out["leds"] = np.concatenate([pos[used], buf[used]], axis=1).reshape(-1).tolist()
+            colors, real, fan_labels = data
+            out["leds"] = np.concatenate([real, colors], axis=1).reshape(-1).tolist()
+            out["fan_labels"] = fan_labels
         return out
 
     def do_POST(self):
@@ -1021,6 +1029,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
             self.state.apply_wire(data)
             self._send("ok", "text/plain")
+        elif self.path == "/save":
+            ok = self.state.save()
+            self._send("saved" if ok else "not saved (--state-file disabled or not writable)",
+                       "text/plain", code=200 if ok else 500)
         elif self.path == "/upload":
             self._handle_upload()
         elif self.path == "/restart":
@@ -1062,25 +1074,30 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def _render_page(self):
-        snap = self.state.snapshot()
-        g = self.geo
-        info = dict(pins=g["pins"], fans=g["fans"], sketch_fan_order=g["fan_order"],
+        snap, g = self.state.snapshot(), self.geo
+        info = dict(pins=g["pins"], fans=g["fans"],
                     colors=["#%02x%02x%02x" % c for c in CLUSTER_COLORS])
+        live = int((g["led_at"] >= 0).sum())
         return (PAGE.replace("__STATE__", json.dumps(self.state.to_wire()).replace("</", "<\\/"))
                     .replace("__GEO__", json.dumps(info))
                     .replace("__QUEUE__", "".join(_queue_item_row(i) for i in snap["queue"]))
-                    .replace("__SKETCH__", f"{g['pins']} pins x {g['fans']} fans x {LEDS_PER_FAN} LEDs"))
+                    .replace("__SKETCH__", f"{g['w']}x{g['h']} frame, {g['grid_w']}x{g['grid_h']} "
+                                           f"clusters of {g['cluster_w']}x{g['cluster_h']} fans, "
+                                           f"{live} live LEDs"))
 
 
 PAGE = r"""<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fan wall control</title>
 <style>
-  body{font:15px monospace;background:#111;color:#eee;max-width:40rem;margin:1.5rem auto;padding:0 1rem}
-  h2{font-size:1rem;margin:1.4rem 0 .4rem;border-top:1px solid #333;padding-top:1rem}
+  body{font:15px monospace;background:#111;color:#eee;max-width:44rem;margin:1.5rem auto;padding:0 1rem}
+  h2{font-size:1rem;margin:1.2rem 0 .4rem}
   .note{color:#888;font-size:.8rem} label{display:block;margin:.35rem 0}
   input[type=range]{width:100%} button,.btn{background:#234;color:#eee;border:none;border-radius:4px;
-  padding:.35rem .7rem;cursor:pointer;display:inline-block} input[type=number]{width:4rem}
+  padding:.35rem .7rem;cursor:pointer;display:inline-block;font:inherit}
+  nav{margin:1rem 0 .5rem;border-bottom:1px solid #333}
+  nav button{background:none;border-radius:4px 4px 0 0;padding:.45rem .9rem}
+  nav button.on{background:#234}
   .tiles{display:inline-grid;gap:4px;margin:.4rem 0}
   .tile{position:relative;width:64px;height:44px;box-sizing:border-box;border:2px solid #6cf;border-radius:4px;
   background:#123;cursor:grab;display:flex;align-items:center;justify-content:center;user-select:none;font:bold 16px monospace}
@@ -1088,38 +1105,42 @@ PAGE = r"""<!doctype html><meta charset="utf-8">
 </style>
 <h1 style="font-size:1.1rem">Fan wall
   <span id="svc" style="font-size:.6rem;padding:.15rem .5rem;border-radius:3px;background:#2a4;color:#012">ONLINE</span></h1>
-<button onclick="restartService()" style="background:#622;color:#fdd">restart service</button>
-<span id="restartMsg" class="note"></span>
-<p class="note">Live preview -- every fan's 16 LEDs as sent to the Teensy (__SKETCH__), clusters outlined with their pin number.</p>
+<p class="note">Live preview -- every live LED as sent to the Teensy (__SKETCH__), clusters outlined with their pin number.</p>
 <canvas id="preview" style="background:#000;border:1px solid #444;max-width:100%"></canvas>
 
-<h2>Calibration</h2>
+<nav>
+  <button data-tab="cal">Calibration</button><button data-tab="content">Content</button>
+  <button data-tab="colour">Colour</button><button data-tab="settings">Settings</button>
+</nav>
+
+<section data-tab="cal">
 <label>Mode <select data-k="calibrate">
-  <option value="off">off -- show media/text</option>
+  <option value="off">off -- show content</option>
   <option value="fans">fans -- cluster colours, white LEDs = fan number (1-6)</option>
   <option value="clusters">clusters -- cluster colours, white LEDs = cluster number</option>
-  <option value="grid">grid -- gradient + white dot on top of every fan</option></select></label>
+  <option value="grid">grid -- gradient + white dot on top of every fan</option>
+  <option value="red">test: all red</option><option value="green">test: all green</option>
+  <option value="blue">test: all blue</option><option value="row0">test: row 0 only</option>
+  <option value="col0">test: column 0 only</option><option value="probe">test: corner probe (3,11) = LED 0</option>
+</select></label>
 <label>Highlight cluster <select data-k="cal_cluster" data-num id="calCluster"></select></label>
-<p class="note">Each cluster has its own colour; the white LEDs count up from LED 0 in wiring order, so the
-count is the number and where it starts shows how the ring is turned. Same colours and numbers on the
-preview and the tiles below. <span id="legend"></span></p>
-<p class="note">1. <b>Fan pattern</b> (one cluster, every cluster follows): in "fans" mode, drag tiles so each
-fan number sits where it is on the wall. <b>R</b> turns that fan 90&deg;, <b>M</b> mirrors it -- until the white
-run starts and turns the same way as on the preview.</p>
+<p class="note">Starts at the Teensy's own mapping -- no remap. Only touch the tiles if the wall disagrees with the
+preview: the Pi then shifts pixels so they land right, the Teensy stays as it is. Each cluster has its own colour;
+the white LEDs count up from LED 0 in wiring order, so the count is the number and where it starts shows how the
+ring is turned. <span id="legend"></span></p>
+<p class="note">1. <b>Fan pattern</b> (one cluster, every cluster follows; the 3-fan corner clusters use the
+matching half): in "fans" mode, drag tiles so each fan number sits where it is on the wall. <b>R</b> turns that
+fan 90&deg;, <b>M</b> mirrors it.</p>
 <div id="fanTiles" class="tiles"></div>
-<button onclick="resetFans()">reset to sketch</button>
+<button onclick="resetFans()">reset to Teensy</button>
 <p class="note">2. <b>Cluster grid</b>: drag tiles until each pin's cluster sits where it is on the wall.
 Click a tile to highlight that cluster.</p>
 <div id="clusterTiles" class="tiles"></div>
-<button onclick="state.cluster_order=state.cluster_order.map((_,i)=>i);send()">reset clusters</button>
-<p class="note">3. <b>Grid size</b> -- clusters across x down, fans per cluster across x down
-(fans per cluster and pin count come from the sketch).</p>
-<label>Clusters <input type="number" id="gw" min="1"> x <input type="number" id="gh" min="1">
-&nbsp; Fans/cluster <input type="number" id="cw" min="1"> x <input type="number" id="ch" min="1">
-<button onclick="applyGrid()">Apply</button> <span id="gridMsg" class="note"></span></label>
-<label>Active clusters <span id="v-active"></span><input type="range" data-k="active" min="1" id="activeRange"></label>
-<label><input type="checkbox" data-k="rotate180"> Whole wall mounted upside down</label>
+<button onclick="state.cluster_order=state.cluster_order.map((_,i)=>i);send()">reset to Teensy</button>
+<p class="note">Grid size comes from teensy.ino -- change it there and restart.</p>
+</section>
 
+<section data-tab="content">
 <h2>Text</h2>
 <label><input type="text" data-k="text" style="width:100%;padding:.4rem"></label>
 <label>Colour <input type="color" data-k="color"> &nbsp;
@@ -1130,23 +1151,43 @@ Click a tile to highlight that cluster.</p>
   &nbsp; <input type="checkbox" data-k="text_stacked" style="display:inline"> Stack letters
   &nbsp; Rotate letters <select data-k="text_glyph_rotate" data-num><option>0</option><option>90</option><option>270</option></select></label>
 <label>Trail <span id="v-trail_wet"></span><input type="range" data-k="trail_wet" min="0" max="100"></label>
-
 <h2>Media</h2>
 <label>Brightness <span id="v-media_brightness"></span>%<input type="range" data-k="media_brightness" min="0" max="200"></label>
 <label>Contrast <span id="v-media_contrast"></span>%<input type="range" data-k="media_contrast" min="0" max="200"></label>
 <label>Rotation <span id="v-media_rotation"></span>&deg;<input type="range" data-k="media_rotation" min="-180" max="180"></label>
 <label>Scale <span id="v-media_scale"></span>%<input type="range" data-k="media_scale" min="10" max="400"></label>
-<label>Position X <span id="v-media_pos_x"></span><input type="range" data-k="media_pos_x" min="-100" max="100"></label>
-<label>Position Y <span id="v-media_pos_y"></span><input type="range" data-k="media_pos_y" min="-100" max="100"></label>
+<label>Position X <span id="v-media_pos_x"></span><input type="range" data-k="media_pos_x" min="-84" max="84"></label>
+<label>Position Y <span id="v-media_pos_y"></span><input type="range" data-k="media_pos_y" min="-56" max="56"></label>
 <label class="btn">+ Add image/video<input type="file" accept="video/*,image/*" style="display:none" onchange="uploadFile(this)"></label>
 <div id="queue">__QUEUE__</div>
+</section>
 
-<h2>Output</h2>
+<section data-tab="colour">
+<label><input type="checkbox" data-k="cc_on" style="display:inline"> Colour correction on</label>
+<p class="note">The LEDs aren't perceptually even: greens read brighter than reds and pinks at the same value.
+Usual move: green down, red up. Applies to content only -- calibration and test patterns stay raw.</p>
+<label>Red <span id="v-cc_r"></span>%<input type="range" data-k="cc_r" min="0" max="200"></label>
+<label>Green <span id="v-cc_g"></span>%<input type="range" data-k="cc_g" min="0" max="200"></label>
+<label>Blue <span id="v-cc_b"></span>%<input type="range" data-k="cc_b" min="0" max="200"></label>
+<button onclick="state.cc_r=state.cc_g=state.cc_b=100;send();setTimeout(()=>location.reload(),200)">reset levels</button>
+<h2>Softness</h2>
+<label>Blur before downsampling <span id="v-softness"></span>%<input type="range" data-k="softness" min="0" max="300"></label>
+<p class="note">100% = the spec's starting point (sigma = source width / 120). Too little shimmers, too much is mush.</p>
+<button onclick="saveSettings()">Save settings</button> <span class="note saveMsg"></span>
+</section>
+
+<section data-tab="settings">
 <label>Brightness <span id="v-brightness"></span>/255<input type="range" data-k="brightness" min="0" max="255"></label>
-<p class="note">Software level, on top of the sketch's FastLED.setBrightness cap.</p>
-<a href="/config.json" download="fan-wall-config.json" class="btn" style="text-decoration:none">Save config</a>
-<label class="btn" style="display:inline-block">Load config<input type="file" accept="application/json" style="display:none" onchange="loadConfig(this)"></label>
-<p class="note">Save also makes it the config the wall resumes with after a reboot.</p>
+<p class="note">Software level, under the sketch's own FastLED brightness and power cap.</p>
+<label>Active clusters <span id="v-active"></span><input type="range" data-k="active" min="1" id="activeRange"></label>
+<label><input type="checkbox" data-k="rotate180" style="display:inline"> Whole wall mounted upside down</label>
+<p><button onclick="saveSettings()">Save settings</button> <span class="note saveMsg"></span></p>
+<p class="note">Saved settings (everything: calibration, colour, content) come back on every start.</p>
+<a href="/config.json" download="fan-wall-config.json" class="btn" style="text-decoration:none">Download settings</a>
+<label class="btn" style="display:inline-block">Load settings<input type="file" accept="application/json" style="display:none" onchange="loadConfig(this)"></label>
+<p><button onclick="restartService()" style="background:#622;color:#fdd">restart service</button>
+<span id="restartMsg" class="note"></span></p>
+</section>
 
 <script>
 const state = __STATE__;
@@ -1156,12 +1197,29 @@ function send() {
   fetch('/update', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(state)});
 }
 function sendDebounced() { clearTimeout(debounceTimer); debounceTimer = setTimeout(send, 200); }
+function saveSettings() {
+  clearTimeout(debounceTimer);
+  fetch('/update', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(state)})
+    .then(() => fetch('/save', {method: 'POST'})).then(r => r.text())
+    .then(msg => document.querySelectorAll('.saveMsg').forEach(el => el.textContent = msg));
+}
+
+// Tabs; the open one is remembered per browser.
+function showTab(name) {
+  document.querySelectorAll('section[data-tab]').forEach(s => s.hidden = s.dataset.tab !== name);
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  try { localStorage.setItem('tab', name); } catch (e) {}
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+let startTab = 'cal';
+try { startTab = localStorage.getItem('tab') || 'cal'; } catch (e) {}
+showTab(startTab);
 
 // Every [data-k] control is bound to state[k]; a matching #v-k shows its value.
 const calSel = document.getElementById('calCluster');
 calSel.innerHTML = '<option value="-1">all</option>' +
   Array.from({length: GEO.pins}, (_, i) => `<option value="${i}">${i + 1}</option>`).join('');
-document.getElementById('activeRange').max = state.cluster_order.length;
+document.getElementById('activeRange').max = GEO.pins;
 document.querySelectorAll('[data-k]').forEach(el => {
   const k = el.dataset.k, out = document.getElementById('v-' + k);
   if (el.type === 'checkbox') el.checked = state[k]; else el.value = state[k];
@@ -1175,21 +1233,11 @@ document.querySelectorAll('[data-k]').forEach(el => {
     live ? sendDebounced() : send();
   });
 });
-['gw', 'gh', 'cw', 'ch'].forEach((id, i) =>
-  document.getElementById(id).value = state[['grid_w', 'grid_h', 'cluster_w', 'cluster_h'][i]]);
 document.getElementById('legend').innerHTML = GEO.colors.slice(0, GEO.pins)
   .map((c, i) => `<span style="color:${c}">&#9679;${i + 1}</span>`).join(' ');
 
-function applyGrid() {
-  const v = ['gw', 'gh', 'cw', 'ch'].map(id => parseInt(document.getElementById(id).value));
-  if (v[2] * v[3] !== GEO.fans) return gridMsg.textContent = `fans/cluster must multiply to ${GEO.fans}`;
-  if (v[0] * v[1] > GEO.pins) return gridMsg.textContent = `at most ${GEO.pins} clusters (one per pin)`;
-  [state.grid_w, state.grid_h, state.cluster_w, state.cluster_h] = v;
-  fetch('/update', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(state)}).then(() => location.reload());
-}
 function resetFans() {
-  state.fan_order = GEO.sketch_fan_order.slice();
+  state.fan_order = state.fan_order.map((_, i) => i);
   state.fan_rot = state.fan_rot.map(() => 0);
   state.fan_mirror = state.fan_mirror.map(() => false);
   send();
@@ -1226,8 +1274,8 @@ function uploadFile(input) {
   input.value = '';
 }
 
-// Drag-to-swap tile grid (from double_matrix): labels[slot] = 1-based chain
-// position sitting in that slot; state[key][chainPos] = slot.
+// Drag-to-swap tile grid (from double_matrix): labels[slot] = 1-based
+// Teensy slot now shown in that slot; state[key][teensySlot] = slot.
 let dragging = null;
 function renderTiles(elId, key, cols, labels, decorate) {
   const el = document.getElementById(elId);
@@ -1290,7 +1338,7 @@ function renderCalibration(d) {
   renderTiles('clusterTiles', 'cluster_order', d.grid_w, d.clusters, clDeco);
 }
 
-const S = 6;  // preview px per canvas cell
+const S = 6;  // preview px per frame cell
 function drawPreview(d) {
   const cv = document.getElementById('preview');
   if (cv.width !== d.w * S || cv.height !== d.h * S) { cv.width = d.w * S; cv.height = d.h * S; }
@@ -1304,9 +1352,9 @@ function drawPreview(d) {
     g.arc(x * S + S / 2, y * S + S / 2, S / 2 - .5, 0, 7);
     g.fill();
   }
-  // Cluster outline + number in its calibration colour; while calibrating,
-  // every fan also gets its chain number at its centre.
-  const cal = d.calibrate !== 'off', F = d.p * S;
+  // Cluster outline + pin number in its calibration colour; while
+  // calibrating, every fan also gets its chain number in its cell's corner
+  // (no LED there).
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   g.lineWidth = 2;
@@ -1319,14 +1367,14 @@ function drawPreview(d) {
     g.font = 'bold 14px monospace';
     g.fillStyle = on ? GEO.colors[pin - 1] : '#666';
     g.fillText(pin, x + 11, y + 11);
-    if (!cal || !on) return;
-    g.font = 'bold 12px monospace';
-    g.fillStyle = '#fff';
-    d.fans.forEach((fan, fslot) => g.fillText(fan,  // corner of the fan cell: no LED there
-      x + (fslot % d.cluster_w) * F + F - 7, y + Math.floor(fslot / d.cluster_w) * F + F - 7));
   });
   g.setLineDash([]);
   g.lineWidth = 1;
+  if (d.calibrate === 'off') return;
+  g.font = 'bold 12px monospace';
+  g.fillStyle = '#fff';
+  const F = d.p * S;
+  d.fan_labels.forEach(([x, y, n]) => g.fillText(n, x * S + F - 7, y * S + F - 7));
 }
 
 let fails = 0;
@@ -1381,30 +1429,30 @@ def make_control_server(state, geo, port, upload_dir, preview):
 def parse_args():
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser()
-    p.add_argument("--sketch", default=os.path.join(here, "teensy_globalxy_udp_control.ino"),
-                   help="Teensy sketch the wall geometry is read from")
+    p.add_argument("--sketch", default=os.path.join(here, "teensy.ino"),
+                   help="Teensy sketch the wall geometry and link settings are read from")
     p.add_argument("--teensy-ip", help="default: teensyIP from the sketch")
     p.add_argument("--teensy-port", type=int, help="default: LISTEN_PORT from the sketch")
     p.add_argument("--media", help="video file to seed the queue with")
     p.add_argument("--text", help="text to scroll")
     p.add_argument("--text-height", type=int, default=14,
-                   help="canvas rows for the text strip when media is also playing "
+                   help="frame rows for the text strip when media is also playing "
                         "(default 14 = two fan rows)")
     p.add_argument("--text-color", default="#ffffff")
     p.add_argument("--font")
     p.add_argument("--font-size", type=int)
     p.add_argument("--bold", action="store_true")
     p.add_argument("--italic", action="store_true")
-    p.add_argument("--scroll-speed", type=float, default=20.0, help="canvas px/second")
+    p.add_argument("--scroll-speed", type=float, default=20.0, help="frame px/second")
     p.add_argument("--text-direction", default="left", choices=["left", "right", "up", "down"])
     p.add_argument("--fit", default="fill", choices=["letterbox", "fill"])
     p.add_argument("--brightness", type=int, default=255,
-                   help="0-255 software level, under the sketch's FastLED cap")
+                   help="0-255 software level, under the sketch's FastLED brightness")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--web-port", type=int, default=8099, help="0 disables the control page")
     p.add_argument("--upload-dir", default=os.path.join(here, "uploads"))
     p.add_argument("--state-file", default=os.path.join(here, "fan_wall_state.json"),
-                   help="saved by the page's Save button, resumed on startup; '' disables")
+                   help="written by Save settings, loaded on startup; '' disables")
     p.add_argument("--transition-s", type=float, default=0.6)
     p.add_argument("--stats", action="store_true")
     return p.parse_args()
@@ -1413,45 +1461,38 @@ def parse_args():
 def main():
     args = parse_args()
     geo = load_sketch(args.sketch)
-    args.teensy_ip = args.teensy_ip or geo["teensy_ip"]
-    args.teensy_port = args.teensy_port or geo["teensy_port"]
+    W, H = geo["w"], geo["h"]
 
     def _on_sigterm(signum, frame):  # systemctl stop -> same cleanup as ctrl-c
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, _on_sigterm)
 
-    def compute_geometry(snap):
-        canvas_w, canvas_h = canvas_size(geo, snap)
-        has_media, has_text = bool(snap["queue"]), bool(snap["text"])
-        if has_media and has_text:
-            text_h = min(args.text_height, canvas_h - 1)
-        else:
-            text_h = 0 if has_media else canvas_h
-        return canvas_w, canvas_h, text_h, canvas_h - text_h
-
-    def rebuild_scroller(snap, canvas_w, text_h):
+    def rebuild_scroller(snap, text_h):
         if text_h <= 0 or not snap["text"]:
             return None
         size = args.font_size or max(8, text_h - 2)
         fonts = [load_font(args.font, size, snap["bold"], snap["italic"])] + load_fallback_fonts(size)
-        return TextScroller(snap["text"], fonts, canvas_w, text_h, snap["color"],
+        return TextScroller(snap["text"], fonts, W, text_h, snap["color"],
                             snap["text_direction"], snap["text_stacked"], snap["text_glyph_rotate"])
 
     state = State(args, geo, args.state_file or None)
     if args.state_file and os.path.isfile(args.state_file):
-        print(f"resumed saved config from {args.state_file}")
+        print(f"resumed saved settings from {args.state_file}")
     os.makedirs(args.upload_dir, exist_ok=True)
     player = QueuePlayer(lambda: state.snapshot()["queue"], args.fit, args.transition_s)
-    link = TeensyLink(args.teensy_ip, args.teensy_port)
+    link = TeensyLink(args.teensy_ip or geo["teensy_ip"], args.teensy_port or geo["teensy_port"],
+                      geo["sync"])
     preview = Preview()
     server = None
     if args.web_port:
         server = make_control_server(state, geo, args.web_port, args.upload_dir, preview)
         print(f"control panel: http://{local_ip()}:{args.web_port}/")
-    print(f"sketch: {geo['pins']} pins x {geo['fans']} fans, teensy {args.teensy_ip}:{args.teensy_port}")
+    print(f"sketch: {W}x{H} frame, {int((geo['led_at'] >= 0).sum())} live LEDs, "
+          f"teensy {link.addr[0]}:{link.addr[1]}")
 
-    built_version = map_key = None
+    built_version = remap_key = None
     scroll_offset = 0.0
+    trail = np.zeros((H, W, 3), dtype=np.float32)
     last_t = last_report = time.monotonic()
     rendered = 0
     try:
@@ -1461,47 +1502,55 @@ def main():
             snap = state.snapshot()
 
             if snap["version"] != built_version:
-                canvas_w, canvas_h, text_h, video_h = compute_geometry(snap)
-                scroller = rebuild_scroller(snap, canvas_w, text_h)
-                trail = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+                has_media, has_text = bool(snap["queue"]), bool(snap["text"])
+                text_h = min(args.text_height, H - 1) if has_media and has_text \
+                    else (0 if has_media else H)
+                video_h = H - text_h
+                scroller = rebuild_scroller(snap, text_h)
                 built_version = snap["version"]
-            key = tuple(str(snap[k]) for k in ("grid_w", "grid_h", "cluster_w", "cluster_h",
-                                               "fan_order", "fan_rot", "fan_mirror",
-                                               "cluster_order", "active"))
-            if key != map_key:
-                pos = build_led_map(geo, snap)
-                map_key = key
+            key = tuple(str(snap[k]) for k in ("cluster_order", "fan_order", "fan_rot", "fan_mirror"))
+            if key != remap_key:
+                cells, real = build_remap(geo, snap)
+                cell_pin = geo["led_at"][cells[:, 1], cells[:, 0]] // geo["lpp"]
+                led0 = geo["led_at"][cells[:, 1], cells[:, 0]] % LEDS_PER_FAN == 0
+                p = geo["fan_px"]
+                fan_labels = [[int(rx // p * p), int(ry // p * p), int(led % geo["lpp"] // LEDS_PER_FAN + 1)]
+                              for (rx, ry), led in zip(real[led0],
+                                                       geo["led_at"][cells[led0, 1], cells[led0, 0]])]
+                remap_key = key
 
-            if snap["calibrate"] in ("fans", "clusters"):
-                buf = chain_test_buffer(geo, snap, snap["calibrate"][:-1])
+            if snap["calibrate"] in WIRE_MODES:
+                send = wire_pattern(geo, snap, cells, snap["calibrate"])
             else:
                 if snap["calibrate"] == "grid":
-                    frame = grid_test_canvas(canvas_w, canvas_h, geo["fan_px"])
+                    frame = grid_test_canvas(W, H, geo["fan_px"])
                 else:
-                    frame = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+                    player.softness = snap["softness"] / 100.0
+                    frame = np.zeros((H, W, 3), dtype=np.uint8)
                     if video_h > 0:
                         frame[:video_h] = player.next_frame(
-                            dt, canvas_w, video_h, snap["media_brightness"], snap["media_contrast"],
+                            dt, W, video_h, snap["media_brightness"], snap["media_contrast"],
                             snap["media_rotation"], snap["media_scale"],
                             snap["media_pos_x"], snap["media_pos_y"])
                     if scroller:
                         sign = -1.0 if snap["text_direction"] in ("right", "down") else 1.0
                         scroll_offset += sign * dt * snap["scroll_speed"]
-                        frame[canvas_h - text_h:] = scroller.frame(scroll_offset)
+                        frame[H - text_h:] = scroller.frame(scroll_offset)
                     trail = apply_trail(trail, frame, snap["trail_wet"])
-                    # ponytail: only 16 of a fan's 49 cells hold an LED, so a
-                    # 1px text stroke can fall between them -- a 3x3 max
-                    # spreads it onto the ring. Supersample the canvas if
-                    # video looks too blocky.
-                    frame = cv2.dilate(trail.astype(np.uint8), np.ones((3, 3), np.uint8))
+                    frame = color_correct(trail.astype(np.uint8), snap)
                 if snap["rotate180"]:
-                    frame = np.ascontiguousarray(frame[::-1, ::-1])
-                buf = sample_canvas(frame, pos)
+                    frame = frame[::-1, ::-1]
+                # Each cell the Teensy addresses gets the canvas pixel where
+                # its LED really is -- identity until calibration says otherwise.
+                send = np.zeros((H, W, 3), dtype=np.uint8)
+                send[cells[:, 1], cells[:, 0]] = frame[real[:, 1], real[:, 0]]
+            if snap["active"] < geo["pins"]:
+                send[cells[cell_pin >= snap["active"], 1], cells[cell_pin >= snap["active"], 0]] = 0
 
-            preview.update(buf, pos, canvas_w, canvas_h)
-            out = buf if snap["brightness"] == 255 else \
-                (buf.astype(np.uint16) * snap["brightness"] // 255).astype(np.uint8)
-            link.send_frame(out.tobytes())
+            preview.update(send[cells[:, 1], cells[:, 0]], real, fan_labels)
+            out = send if snap["brightness"] == 255 else \
+                (send.astype(np.uint16) * snap["brightness"] // 255).astype(np.uint8)
+            link.send_frame(out)
             rendered += 1
 
             if args.stats and t0 - last_report >= 1.0:
@@ -1515,7 +1564,7 @@ def main():
     finally:
         if server:
             server.shutdown()
-        link.send_frame(bytes(geo["pins"] * geo["leds_per_pin"] * 3))
+        link.send_frame(np.zeros((H, W, 3), dtype=np.uint8))
         print("\nstopped")
 
 
